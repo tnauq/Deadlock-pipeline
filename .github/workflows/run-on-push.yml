@@ -1,6 +1,8 @@
 name: Deadlock pipeline
 
 on:
+  push:
+    branches: [main, master]
   workflow_dispatch:
     inputs:
       min_badge:
