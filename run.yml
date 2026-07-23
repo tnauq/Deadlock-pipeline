@@ -1,0 +1,60 @@
+name: Deadlock pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      min_badge:
+        description: "Lobby floor (average badge, 0-116)"
+        required: false
+        default: "100"
+      lookback_days:
+        description: "Days of match history to scan"
+        required: false
+        default: "90"
+      recency_window:
+        description: "Hero must appear in the player's last N games"
+        required: false
+        default: "25"
+      players_per_hero:
+        description: "Candidates kept per hero"
+        required: false
+        default: "10"
+      missing_items_fallback:
+        description: "When the newest qualifying game has no item data"
+        required: false
+        default: "step_back"
+        type: choice
+        options:
+          - step_back
+          - drop
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run pipeline
+        env:
+          MIN_BADGE: ${{ inputs.min_badge }}
+          LOOKBACK_DAYS: ${{ inputs.lookback_days }}
+          RECENCY_WINDOW: ${{ inputs.recency_window }}
+          PLAYERS_PER_HERO: ${{ inputs.players_per_hero }}
+          MISSING_ITEMS_FALLBACK: ${{ inputs.missing_items_fallback }}
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+        run: python3 deadlock_pipeline.py
+
+      - name: Upload CSVs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deadlock-output
+          path: output/
+          if-no-files-found: error
+          retention-days: 30
