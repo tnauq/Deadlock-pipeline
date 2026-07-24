@@ -1,0 +1,87 @@
+name: Deadlock pipeline
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      regions:
+        description: "Regions (comma separated)"
+        required: false
+        default: "NAmerica,Europe"
+      per_region:
+        description: "Qualifying players taken per region per hero"
+        required: false
+        default: "10"
+      min_badge:
+        description: "Badge floor; 0 trusts the ladder, 113 tightens"
+        required: false
+        default: "0"
+      recency_window:
+        description: "Hero must appear in the player's last N games"
+        required: false
+        default: "25"
+      min_hero_matches:
+        description: "Games on the hero required inside that window"
+        required: false
+        default: "1"
+      leaderboard_depth:
+        description: "Ladder entries read per hero per region (backfill depth)"
+        required: false
+        default: "60"
+      snapshots:
+        description: "Net-worth snapshots in souls (comma separated)"
+        required: false
+        default: "4800,9600,14400,20800"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Show repo contents
+        run: |
+          echo "--- working dir ---"
+          pwd
+          echo "--- root listing ---"
+          ls -la
+          echo "--- python files anywhere ---"
+          find . -name "*.py" -not -path "./.git/*"
+          echo "--- python version ---"
+          python3 --version
+
+      - name: Run pipeline
+        env:
+          REGIONS: ${{ inputs.regions }}
+          PER_REGION: ${{ inputs.per_region }}
+          MIN_BADGE: ${{ inputs.min_badge }}
+          RECENCY_WINDOW: ${{ inputs.recency_window }}
+          MIN_HERO_MATCHES: ${{ inputs.min_hero_matches }}
+          LEADERBOARD_DEPTH: ${{ inputs.leaderboard_depth }}
+          SNAPSHOTS: ${{ inputs.snapshots }}
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+        run: |
+          SCRIPT=$(find . -maxdepth 2 -name '*.py' -not -path './.git/*' | head -1)
+          if [ -z "$SCRIPT" ]; then
+            echo "::error::No .py file found in the repository."
+            ls -la
+            exit 1
+          fi
+          echo "Running: $SCRIPT"
+          python3 "$SCRIPT"
+
+      - name: Upload CSVs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deadlock-output
+          path: output/
+          if-no-files-found: error
+          retention-days: 30
