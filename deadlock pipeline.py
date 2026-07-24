@@ -2,9 +2,9 @@
 """
 Deadlock tier-list + item-frequency pipeline.
 
-Candidates are the top 10 qualifying players from each of the NAmerica and
-Europe hero ladders (Valve's own leaderboard, passed through by deadlock-api).
-Ratings and item data come from SQL.
+Candidates are the top qualifying players from each region's hero ladder
+(Valve's own leaderboard, passed through by deadlock-api). Ratings and item
+data come from SQL.
 
 Outputs (./output/):
     tierlist.csv         heroes ranked by the top MMR in their sampled pool
@@ -42,10 +42,11 @@ def _env(name, default, cast=int):
 REGIONS = [r.strip() for r in
            (os.environ.get("REGIONS") or "NAmerica,Europe").split(",") if r.strip()]
 
-PER_REGION = _env("PER_REGION", 10)             # qualifying players per region per hero
-LEADERBOARD_DEPTH = _env("LEADERBOARD_DEPTH", 60)  # ladder entries read, to backfill
-MIN_BADGE = _env("MIN_BADGE", 0)                # 0 = trust the ladder; 113 to tighten
-RECENCY_WINDOW = _env("RECENCY_WINDOW", 25)     # hero must appear in last N games
+PER_REGION = _env("PER_REGION", 10)              # qualifying players per region per hero
+LEADERBOARD_DEPTH = _env("LEADERBOARD_DEPTH", 40)  # ladder entries read, for backfill
+SQL_BADGE_FLOOR = _env("SQL_BADGE_FLOOR", 110)   # an account must reach this lobby badge
+POOL_PER_HERO = _env("POOL_PER_HERO", 500)       # rows SQL returns per hero
+RECENCY_WINDOW = _env("RECENCY_WINDOW", 25)
 MIN_HERO_MATCHES = _env("MIN_HERO_MATCHES", 1)
 LOOKBACK_DAYS = _env("LOOKBACK_DAYS", 90)
 EMA_WINDOW = _env("EMA_WINDOW", 50)
@@ -54,6 +55,7 @@ EMA_ALPHA = 2.0 / (EMA_WINDOW + 1)
 SNAPSHOTS = [int(x) for x in
              (os.environ.get("SNAPSHOTS") or "4800,9600,14400,20800").split(",")]
 
+MAX_URL = _env("MAX_URL", 6000)                  # encoded-URL ceiling; Cloudflare 414s well above
 SQL_PAUSE_S = _env("SQL_PAUSE_S", 35)
 OUT_DIR = "output"
 
@@ -71,12 +73,12 @@ TARGET_BUILDS = PER_REGION * len(REGIONS)
 
 
 def _get(url, tries=3):
-    req = urllib.request.Request(url, headers={"User-Agent": "deadlock-pipeline/3.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "deadlock-pipeline/4.0"})
     if API_KEY:
         req.add_header("X-API-Key", API_KEY)
     for attempt in range(tries):
         try:
-            with urllib.request.urlopen(req, timeout=180) as r:
+            with urllib.request.urlopen(req, timeout=300) as r:
                 return json.loads(r.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             if e.code in (429, 500, 502, 503) and attempt < tries - 1:
@@ -86,17 +88,28 @@ def _get(url, tries=3):
     raise RuntimeError("unreachable")
 
 
-def sql(query):
+_sql_calls = [0]
+
+
+def sql(query, label=""):
     url = BASE + "/v1/sql?format=json&query=" + urllib.parse.quote(query)
-    print("  [sql] %d chars ..." % len(query), file=sys.stderr)
+    if len(url) > MAX_URL:
+        raise SystemExit("Query URL is %d chars (limit %d) — %s would 414. "
+                         "Reduce the batch size." % (len(url), MAX_URL, label or "query"))
+    if _sql_calls[0]:
+        print("  [sql] pausing %ds for the rate limit" % SQL_PAUSE_S, file=sys.stderr)
+        time.sleep(SQL_PAUSE_S)
+    _sql_calls[0] += 1
+    print("  [sql] #%d %s (%d char url)" % (_sql_calls[0], label, len(url)), file=sys.stderr)
     try:
         rows = _get(url)
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "replace")[:1000]
-        raise SystemExit("SQL failed (%s):\n%s\n\nQuery:\n%s" % (e.code, body, query))
+        body = e.read().decode("utf-8", "replace")[:800]
+        raise SystemExit("SQL failed (%s) on %s:\n%s\n\nQuery:\n%s"
+                         % (e.code, label, body, query[:2000]))
     if isinstance(rows, dict):
         rows = rows.get("data", rows.get("rows", []))
-    print("  [sql] %d rows" % len(rows), file=sys.stderr)
+    print("  [sql] -> %d rows" % len(rows), file=sys.stderr)
     return rows
 
 
@@ -116,12 +129,18 @@ def load_assets():
             continue
         heroes[int(hid)] = h.get("name") or ("hero_%s" % hid)
 
-    items, component_of, unmapped = {}, defaultdict(set), set()
-    for it in _get(BASE + "/v1/assets/items"):
-        iid = it.get("id")
-        if iid is None or it.get("type") != "upgrade":   # shop items only
-            continue
-        iid = int(iid)
+    raw = [it for it in _get(BASE + "/v1/assets/items")
+           if it.get("type") == "upgrade" and it.get("id") is not None]
+
+    by_class = {}
+    for it in raw:
+        cn = it.get("class_name")
+        if cn:
+            by_class[cn] = int(it["id"])
+
+    items, component_of, unmapped, unresolved = {}, defaultdict(set), set(), 0
+    for it in raw:
+        iid = int(it["id"])
         slot = (it.get("item_slot_type") or "").lower()
         cat = _CATEGORY_MAP.get(slot)
         if slot and cat is None:
@@ -130,20 +149,25 @@ def load_assets():
                       "cat": cat,
                       "cost": int(it.get("cost") or 0),
                       "tier": it.get("item_tier")}
+        # component_items is an array of CLASS NAMES per the spec
         for comp in (it.get("component_items") or []):
-            # component_items may be ids or class names; keep ints only
-            if isinstance(comp, int):
-                component_of[comp].add(iid)
-            elif isinstance(comp, dict) and isinstance(comp.get("id"), int):
-                component_of[comp["id"]].add(iid)
+            cid = by_class.get(comp) if isinstance(comp, str) else (
+                comp if isinstance(comp, int) else None)
+            if cid is None:
+                unresolved += 1
+            else:
+                component_of[cid].add(iid)
 
     if unmapped:
         print("  [assets] UNMAPPED slot types: %s" % sorted(unmapped), file=sys.stderr)
-    print("  [assets] %d heroes, %d shop items, %d with a parent"
-          % (len(heroes), len(items), len(component_of)), file=sys.stderr)
+    print("  [assets] %d heroes, %d shop items, %d with a parent (%d component names "
+          "unresolved)" % (len(heroes), len(items), len(component_of), unresolved),
+          file=sys.stderr)
     if not component_of:
-        print("  [assets] WARNING: no component_items linkage found — upgraded "
-              "items may be double-counted in soul spend", file=sys.stderr)
+        sample = next((it for it in raw if it.get("component_items")), None)
+        print("  [assets] WARNING: no component linkage. Sample item keys: %s"
+              % (sorted(sample.keys())[:20] if sample else "none had component_items"),
+              file=sys.stderr)
     return heroes, items, component_of
 
 
@@ -153,7 +177,6 @@ def load_assets():
 
 
 def fetch_ladders(heroes):
-    """-> ladder[(hero_id, region)] = ordered list of entry dicts."""
     ladder = {}
     for hid in sorted(heroes):
         total = 0
@@ -162,8 +185,7 @@ def fetch_ladders(heroes):
             try:
                 payload = _get(url)
             except urllib.error.HTTPError as e:
-                print("  [lb] %s hero %d -> HTTP %s" % (region, hid, e.code),
-                      file=sys.stderr)
+                print("  [lb] %s hero %d -> HTTP %s" % (region, hid, e.code), file=sys.stderr)
                 ladder[(hid, region)] = []
                 continue
             entries = payload.get("entries", []) if isinstance(payload, dict) else payload
@@ -173,12 +195,12 @@ def fetch_ladders(heroes):
                              "account_name": e.get("account_name", ""),
                              "badge_level": e.get("badge_level")
                                             or e.get("ranked_rank") or 0,
-                             "ids": [int(a) for a in
-                                     (e.get("possible_account_ids") or [])]})
+                             "ids": {int(a) for a in
+                                     (e.get("possible_account_ids") or [])}})
             ladder[(hid, region)] = rows
             total += len(rows)
-        print("  [lb] hero %-3d %-22s %d entries"
-              % (hid, heroes[hid][:22], total), file=sys.stderr)
+        print("  [lb] hero %-3d %-22s %d entries" % (hid, heroes[hid][:22], total),
+              file=sys.stderr)
     return ladder
 
 
@@ -186,31 +208,35 @@ def fetch_ladders(heroes):
 # SQL
 # --------------------------------------------------------------------------
 
-Q_PLAYERS = """
-WITH recent AS (
-    SELECT
-        account_id,
-        hero_id,
-        match_id,
-        start_time,
+# No account-id list: an IN clause of ~90k ids produced a 908KB URL and a 414.
+# Instead SQL picks the elite population itself and Python intersects with the
+# ladder afterwards, which also prunes most of the ambiguous name matches.
+Q_POOL = """
+WITH elite AS (
+    SELECT DISTINCT account_id
+    FROM match_player
+    WHERE match_mode = 'Ranked' AND game_mode = 'Normal'
+      AND start_time >= now() - INTERVAL {lookback} DAY
+      AND greatest(average_badge_team0, average_badge_team1) >= {floor}
+),
+recent AS (
+    SELECT account_id, hero_id, match_id, start_time,
         if(team = 'Team0', average_badge_team0, average_badge_team1) AS team_badge,
         row_number() OVER (PARTITION BY account_id ORDER BY start_time DESC) AS rn
     FROM match_player
-    WHERE account_id IN ({accounts})
-      AND match_mode = 'Ranked'
-      AND game_mode  = 'Normal'
+    WHERE account_id IN (SELECT account_id FROM elite)
+      AND match_mode = 'Ranked' AND game_mode = 'Normal'
       AND start_time >= now() - INTERVAL {lookback} DAY
       AND average_badge_team0 IS NOT NULL
       AND average_badge_team1 IS NOT NULL
 ),
 mmr AS (
-    SELECT account_id, sum(score * w) / sum(w) AS mmr, count() AS rated_matches
+    SELECT account_id, sum(score * w) / sum(w) AS mmr
     FROM (
         SELECT account_id,
                (intDiv(team_badge, 10) - 1) * 6 + (team_badge % 10) AS score,
                pow({keep}, rn - 1) AS w
-        FROM recent
-        WHERE rn <= {ema_window}
+        FROM recent WHERE rn <= {ema}
     )
     GROUP BY account_id
 ),
@@ -220,17 +246,17 @@ hero_recent AS (
            min(rn)                AS best_rn,
            argMin(match_id, rn)   AS last_match_id,
            argMin(start_time, rn) AS last_played
-    FROM recent
-    WHERE rn <= {recency}
+    FROM recent WHERE rn <= {recency}
     GROUP BY account_id, hero_id
 )
 SELECT h.account_id AS account_id, h.hero_id AS hero_id, m.mmr AS mmr,
-       m.rated_matches AS rated_matches, h.hero_matches AS hero_matches,
-       h.best_rn AS best_rn, h.last_match_id AS last_match_id,
-       h.last_played AS last_played
+       h.hero_matches AS hero_matches, h.best_rn AS best_rn,
+       h.last_match_id AS last_match_id, h.last_played AS last_played
 FROM hero_recent AS h
 INNER JOIN mmr AS m USING (account_id)
-WHERE h.hero_matches >= {min_hero_matches}
+WHERE h.hero_matches >= {minhero}
+ORDER BY hero_id ASC, mmr DESC
+LIMIT {pool} BY hero_id
 """
 
 Q_ITEMS = """
@@ -242,20 +268,30 @@ ARRAY JOIN
     items.net_worth_at_buy AS nwb,
     items.game_time_s      AS bought,
     items.sold_time_s      AS sold
-WHERE (match_id, account_id) IN ({pairs})
+WHERE match_id IN ({mids}) AND account_id IN ({aids})
 """
 
 
-def query_players(account_ids):
-    return sql(Q_PLAYERS.format(
-        accounts=",".join(str(a) for a in sorted(account_ids)),
-        lookback=LOOKBACK_DAYS, keep=repr(1.0 - EMA_ALPHA), ema_window=EMA_WINDOW,
-        recency=RECENCY_WINDOW, min_hero_matches=MIN_HERO_MATCHES))
+def query_pool():
+    return sql(Q_POOL.format(lookback=LOOKBACK_DAYS, floor=SQL_BADGE_FLOOR,
+                             keep=repr(1.0 - EMA_ALPHA), ema=EMA_WINDOW,
+                             recency=RECENCY_WINDOW, minhero=MIN_HERO_MATCHES,
+                             pool=POOL_PER_HERO), "candidate pool")
 
 
 def query_items(pairs):
-    lit = ",".join("(%d,%d)" % (m, a) for m, a in pairs)
-    return sql(Q_ITEMS.format(pairs=lit))
+    """Chunked so no single URL exceeds MAX_URL."""
+    rows, chunk, i = [], max(20, MAX_URL // 40), 0
+    while i < len(pairs):
+        part = pairs[i:i + chunk]
+        q = Q_ITEMS.format(mids=",".join(str(m) for m, _ in part),
+                           aids=",".join(str(a) for _, a in part))
+        if len(urllib.parse.quote(q)) > MAX_URL and chunk > 20:
+            chunk = max(20, chunk // 2)
+            continue
+        rows.extend(sql(q, "items %d-%d of %d" % (i + 1, i + len(part), len(pairs))))
+        i += len(part)
+    return rows
 
 
 # --------------------------------------------------------------------------
@@ -264,15 +300,14 @@ def query_items(pairs):
 
 
 def snapshot_holdings(purchases, component_of):
-    """purchases: (item_id, net_worth_at_buy, game_time_s, sold_time_s).
+    """(item_id, net_worth_at_buy, game_time_s, sold_time_s) -> {label: held set}.
 
-    Returns {label: set(item_id)} of items HELD at each net-worth mark, with
-    components suppressed where the item they build into is also held — an 800
-    upgraded to a 1600 is 1600 spent, not 2400.
+    An item counts at a threshold if bought at or below that net worth and not
+    sold by the time it was reached. Components are suppressed when the item
+    they build into is also held: an 800 upgraded to a 1600 is 1600, not 2400.
     """
     def prune(held):
-        return {i for i in held
-                if not (component_of.get(i, set()) & held)}
+        return {i for i in held if not (component_of.get(i, set()) & held)}
 
     out = {}
     for t in SNAPSHOTS:
@@ -301,41 +336,36 @@ def main():
     print("[2/5] ladders (%s), depth %d, target %d per region"
           % (", ".join(REGIONS), LEADERBOARD_DEPTH, PER_REGION), file=sys.stderr)
     ladder = fetch_ladders(heroes)
-    all_ids = {a for rows in ladder.values() for r in rows for a in r["ids"]}
-    print("  [lb] %d candidate account ids" % len(all_ids), file=sys.stderr)
-    if not all_ids:
-        raise SystemExit("No ladder entries. Check REGIONS.")
+    n_ids = len({a for rows in ladder.values() for r in rows for a in r["ids"]})
+    print("  [lb] %d distinct candidate ids across all entries" % n_ids, file=sys.stderr)
 
-    print("[3/5] rating + recency query", file=sys.stderr)
-    stats = {(int(r["account_id"]), int(r["hero_id"])): r
-             for r in query_players(all_ids)}
+    print("[3/5] candidate pool query (badge floor %d)" % SQL_BADGE_FLOOR, file=sys.stderr)
+    stats = {}
+    for r in query_pool():
+        stats[(int(r["account_id"]), int(r["hero_id"]))] = r
+    print("  [pool] %d (account,hero) rows" % len(stats), file=sys.stderr)
 
-    # ---- resolve each ladder entry to one account -----------------------
-    # ambiguity is broken by games on THIS hero inside the window
-    for rows in ladder.values():
+    # resolve each ladder entry to one account: of the possible ids, keep the one
+    # with the most games on THIS hero inside the window
+    for (hid, _rg), rows in ladder.items():
         for r in rows:
-            scored = [(int(stats[(a, r["hero_id"])]["hero_matches"]), a)
-                      for a in r["ids"] if (a, r["hero_id"]) in stats]
+            scored = [(int(stats[(a, hid)]["hero_matches"]), a)
+                      for a in r["ids"] if (a, hid) in stats]
             r["account_id"] = max(scored)[1] if scored else None
-            r["dropped_ids"] = [a for a in r["ids"] if a != r["account_id"]]
+            r["ambiguous"] = len(scored) > 1
 
-    # ---- cross-hero ownership: most games inside the window -------------
     played = defaultdict(dict)
     for (hid, _rg), rows in ladder.items():
         for r in rows:
-            if r["account_id"] is None:
-                continue
-            s = stats[(r["account_id"], hid)]
-            played[r["account_id"]][hid] = int(s["hero_matches"])
+            if r["account_id"] is not None:
+                played[r["account_id"]][hid] = int(stats[(r["account_id"], hid)]["hero_matches"])
 
     home = {}
     for aid, counts in played.items():
         top = max(counts.values())
-        tied = sorted(h for h, n in counts.items() if n == top)
-        home[aid] = tied[0]
+        home[aid] = sorted(h for h, n in counts.items() if n == top)[0]
 
-    # ---- fill the per-region quota in ladder order ----------------------
-    chosen = defaultdict(list)     # hero_id -> selected candidate dicts
+    chosen = defaultdict(list)
     for (hid, region), rows in sorted(ladder.items()):
         taken = 0
         for r in rows:
@@ -343,15 +373,13 @@ def main():
                 break
             base = {"hero_id": hid, "region": region, "ladder_pos": r["ladder_pos"],
                     "account_name": r["account_name"], "badge_level": r["badge_level"]}
-            if r["account_id"] is None:
+            aid = r["account_id"]
+            if aid is None:
                 excluded.append(dict(base, reason=(
                     "no account id (likely private)" if not r["ids"]
-                    else "hero not in player's last %d games" % RECENCY_WINDOW)))
+                    else "no candidate id in the elite pool, or hero not in last %d games"
+                         % RECENCY_WINDOW)))
                 continue
-            if MIN_BADGE and r["badge_level"] and r["badge_level"] < MIN_BADGE:
-                excluded.append(dict(base, reason="below badge floor %d" % MIN_BADGE))
-                continue
-            aid = r["account_id"]
             if home[aid] != hid:
                 excluded.append(dict(base, reason="duplicate; assigned to %s (%d games)"
                                      % (heroes.get(home[aid], home[aid]),
@@ -366,21 +394,22 @@ def main():
                                     best_rn=int(s["best_rn"]),
                                     last_match_id=int(s["last_match_id"]),
                                     last_played=s["last_played"],
-                                    ambiguous=bool(r["dropped_ids"])))
+                                    ambiguous=r["ambiguous"]))
             taken += 1
 
     wanted = [(c["last_match_id"], c["account_id"])
               for lst in chosen.values() for c in lst]
-
     print("[4/5] item query (%d player-matches)" % len(wanted), file=sys.stderr)
-    time.sleep(SQL_PAUSE_S)
-    item_rows = query_items(wanted)
+    item_rows = query_items(wanted) if wanted else []
 
-    # ---- aggregate -------------------------------------------------------
     print("[5/5] aggregating", file=sys.stderr)
+    keep = {(m, a) for m, a in wanted}
     per_build = defaultdict(list)
     for r in item_rows:
-        per_build[(int(r["hero_id"]), int(r["match_id"]), int(r["account_id"]))].append(
+        key = (int(r["match_id"]), int(r["account_id"]))
+        if key not in keep:          # the IN-pair filter is done here, not in SQL
+            continue
+        per_build[(int(r["hero_id"]),) + key].append(
             (int(r["item_id"]), int(r["net_worth_at_buy"] or 0),
              int(r["game_time_s"] or 0), int(r["sold_time_s"] or 0)))
 
@@ -429,8 +458,7 @@ def main():
         per_reg = {rg: sum(1 for c in lst if c["region"] == rg) for rg in REGIONS}
         tier.append({"hero_id": hid, "hero": heroes.get(hid, ""),
                      "top_mmr": round(by_mmr[0]["mmr"], 4),
-                     "median_mmr": round(
-                         sorted(c["mmr"] for c in lst)[len(lst) // 2], 4),
+                     "median_mmr": round(sorted(c["mmr"] for c in lst)[len(lst) // 2], 4),
                      "players": len(lst), "builds_sampled": n,
                      "thin": "YES" if n < TARGET_BUILDS else "",
                      "by_region": " ".join("%s=%d" % (r, per_reg[r]) for r in REGIONS),
@@ -460,8 +488,8 @@ def main():
     if thin:
         print("  [warn] thin heroes (<%d builds): %s"
               % (TARGET_BUILDS, ", ".join(thin[:12])), file=sys.stderr)
-    print("\nDone. %d heroes, %d builds, %d item rows."
-          % (len(tier), sum(builds.values()), len(freq)), file=sys.stderr)
+    print("\nDone. %d heroes, %d builds, %d item rows, %d SQL calls."
+          % (len(tier), sum(builds.values()), len(freq), _sql_calls[0]), file=sys.stderr)
 
 
 def write(name, rows, cols):
