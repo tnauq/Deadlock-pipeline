@@ -470,14 +470,15 @@ def main():
     for (hid, snap), counter in holds.items():
         n = builds[hid] or 1
         for iid, c in counter.items():
+            if c < 2:                      # exclude single-instance items
+                continue
             m = items.get(iid, {})
             freq.append({"hero_id": hid, "hero": heroes.get(hid, ""), "snapshot": snap,
                          "item_id": iid, "item": m.get("name", "item_%d" % iid),
                          "category": m.get("cat") or "?", "tier": m.get("tier"),
                          "icon_url": m.get("icon", ""),
-                         "builds_with_item": c, "builds": n,
-                         "pct": round(100.0 * c / n, 1)})
-    freq.sort(key=lambda d: (d["hero"], SNAPSHOT_ORDER.index(d["snapshot"]), -d["pct"]))
+                         "count": c, "of_builds": n})
+    freq.sort(key=lambda d: (d["hero"], SNAPSHOT_ORDER.index(d["snapshot"]), -d["count"]))
 
     splits = []
     for (hid, snap), cats in souls.items():
@@ -537,7 +538,7 @@ def main():
            "last_match_id", "last_played", "ambiguous"])
     write("item_frequency.csv", freq,
           ["hero_id", "hero", "snapshot", "item_id", "item", "category", "tier",
-           "builds_with_item", "builds", "pct", "icon_url"])
+           "count", "of_builds", "icon_url"])
     write("hero_splits.csv", splits,
           ["hero_id", "hero", "snapshot", "split", "weak", "V_pct", "G_pct", "S_pct"])
     write("excluded.csv", excluded,
