@@ -52,6 +52,13 @@ LOOKBACK_DAYS = _env("LOOKBACK_DAYS", 90)
 EMA_WINDOW = _env("EMA_WINDOW", 50)
 EMA_ALPHA = 2.0 / (EMA_WINDOW + 1)
 
+# Live data has NO rows with match_mode = 'Ranked', so that filter is off by
+# default. Set MATCH_MODE to e.g. Unranked to reinstate one.
+MATCH_MODE = os.environ.get("MATCH_MODE") or ""
+GAME_MODE = os.environ.get("GAME_MODE") or "Normal"
+MODE_SQL = ("match_mode = '%s' AND " % MATCH_MODE if MATCH_MODE else "") + \
+           ("game_mode = '%s' AND " % GAME_MODE if GAME_MODE else "")
+
 SNAPSHOTS = [int(x) for x in
              (os.environ.get("SNAPSHOTS") or "4800,9600,14400,20800").split(",")]
 
@@ -215,8 +222,7 @@ Q_POOL = """
 WITH elite AS (
     SELECT DISTINCT account_id
     FROM match_player
-    WHERE match_mode = 'Ranked' AND game_mode = 'Normal'
-      AND start_time >= now() - INTERVAL {lookback} DAY
+    WHERE {mode}start_time >= now() - INTERVAL {lookback} DAY
       AND greatest(average_badge_team0, average_badge_team1) >= {floor}
 ),
 recent AS (
@@ -225,8 +231,7 @@ recent AS (
         row_number() OVER (PARTITION BY account_id ORDER BY start_time DESC) AS rn
     FROM match_player
     WHERE account_id IN (SELECT account_id FROM elite)
-      AND match_mode = 'Ranked' AND game_mode = 'Normal'
-      AND start_time >= now() - INTERVAL {lookback} DAY
+      AND {mode}start_time >= now() - INTERVAL {lookback} DAY
       AND average_badge_team0 IS NOT NULL
       AND average_badge_team1 IS NOT NULL
 ),
@@ -276,7 +281,7 @@ def query_pool():
     return sql(Q_POOL.format(lookback=LOOKBACK_DAYS, floor=SQL_BADGE_FLOOR,
                              keep=repr(1.0 - EMA_ALPHA), ema=EMA_WINDOW,
                              recency=RECENCY_WINDOW, minhero=MIN_HERO_MATCHES,
-                             pool=POOL_PER_HERO), "candidate pool")
+                             pool=POOL_PER_HERO, mode=MODE_SQL), "candidate pool")
 
 
 def query_items(pairs):
