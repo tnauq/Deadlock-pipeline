@@ -490,7 +490,8 @@ def main():
                      "thin": "YES" if n < TARGET_BUILDS else "",
                      "by_region": " ".join("%s=%d" % (r, per_reg[r]) for r in REGIONS),
                      "top_account_id": by_mmr[0]["account_id"]})
-    tier.sort(key=lambda d: -d["top_mmr"])
+    # ranked by pooled elite win rate: badge saturates at the top, win rate does not
+    tier.sort(key=lambda d: -(d["elite_winrate"] or 0))
     for i, t in enumerate(tier, 1):
         t["rank"] = i
 
