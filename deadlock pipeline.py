@@ -226,7 +226,7 @@ WITH elite AS (
       AND greatest(average_badge_team0, average_badge_team1) >= {floor}
 ),
 recent AS (
-    SELECT account_id, hero_id, match_id, start_time,
+    SELECT account_id, hero_id, match_id, start_time, won,
         if(team = 'Team0', average_badge_team0, average_badge_team1) AS team_badge,
         row_number() OVER (PARTITION BY account_id ORDER BY start_time DESC) AS rn
     FROM match_player
@@ -245,6 +245,10 @@ mmr AS (
     )
     GROUP BY account_id
 ),
+hero_perf AS (
+    SELECT account_id, hero_id, count() AS games_all, sum(won) AS wins_all
+    FROM recent GROUP BY account_id, hero_id
+),
 hero_recent AS (
     SELECT account_id, hero_id,
            count()                AS hero_matches,
@@ -256,9 +260,11 @@ hero_recent AS (
 )
 SELECT h.account_id AS account_id, h.hero_id AS hero_id, m.mmr AS mmr,
        h.hero_matches AS hero_matches, h.best_rn AS best_rn,
-       h.last_match_id AS last_match_id, h.last_played AS last_played
+       h.last_match_id AS last_match_id, h.last_played AS last_played,
+       p.games_all AS games_all, p.wins_all AS wins_all
 FROM hero_recent AS h
 INNER JOIN mmr AS m USING (account_id)
+INNER JOIN hero_perf AS p USING (account_id, hero_id)
 WHERE h.hero_matches >= {minhero}
 ORDER BY hero_id ASC, mmr DESC
 LIMIT {pool} BY hero_id
@@ -399,6 +405,8 @@ def main():
                                     best_rn=int(s["best_rn"]),
                                     last_match_id=int(s["last_match_id"]),
                                     last_played=s["last_played"],
+                                    games_all=int(s.get("games_all") or 0),
+                                    wins_all=int(s.get("wins_all") or 0),
                                     ambiguous=r["ambiguous"]))
             taken += 1
 
@@ -409,14 +417,22 @@ def main():
 
     print("[5/5] aggregating", file=sys.stderr)
     keep = {(m, a) for m, a in wanted}
-    per_build = defaultdict(list)
+    per_build, skipped_abilities = defaultdict(list), set()
     for r in item_rows:
         key = (int(r["match_id"]), int(r["account_id"]))
         if key not in keep:          # the IN-pair filter is done here, not in SQL
             continue
+        iid = int(r["item_id"])
+        if iid not in items:     # hero abilities also appear in items.item_id
+            skipped_abilities.add(iid)
+            continue
         per_build[(int(r["hero_id"]),) + key].append(
-            (int(r["item_id"]), int(r["net_worth_at_buy"] or 0),
+            (iid, int(r["net_worth_at_buy"] or 0),
              int(r["game_time_s"] or 0), int(r["sold_time_s"] or 0)))
+
+    if skipped_abilities:
+        print("  [items] skipped %d non-shop ids (hero abilities)"
+              % len(skipped_abilities), file=sys.stderr)
 
     builds = defaultdict(int)
     holds = defaultdict(lambda: defaultdict(int))
@@ -460,10 +476,16 @@ def main():
             continue
         by_mmr = sorted(lst, key=lambda c: -c["mmr"])
         n = builds.get(hid, 0)
+        g = sum(c.get("games_all", 0) for c in lst)
+        w = sum(c.get("wins_all", 0) for c in lst)
+        top5 = [c["mmr"] for c in by_mmr[:5]]
         per_reg = {rg: sum(1 for c in lst if c["region"] == rg) for rg in REGIONS}
         tier.append({"hero_id": hid, "hero": heroes.get(hid, ""),
                      "top_mmr": round(by_mmr[0]["mmr"], 4),
+                     "top5_mmr": round(sum(top5) / len(top5), 4),
                      "median_mmr": round(sorted(c["mmr"] for c in lst)[len(lst) // 2], 4),
+                     "elite_winrate": round(100.0 * w / g, 2) if g else "",
+                     "elite_games": g,
                      "players": len(lst), "builds_sampled": n,
                      "thin": "YES" if n < TARGET_BUILDS else "",
                      "by_region": " ".join("%s=%d" % (r, per_reg[r]) for r in REGIONS),
@@ -473,14 +495,15 @@ def main():
         t["rank"] = i
 
     write("tierlist.csv", tier,
-          ["rank", "hero_id", "hero", "top_mmr", "median_mmr", "players",
-           "builds_sampled", "thin", "by_region", "top_account_id"])
+          ["rank", "hero_id", "hero", "elite_winrate", "elite_games", "median_mmr",
+           "top5_mmr", "top_mmr", "players", "builds_sampled", "thin", "by_region",
+           "top_account_id"])
     write("candidates.csv",
           [dict(c, hero=heroes.get(c["hero_id"], ""), mmr=round(c["mmr"], 4))
            for lst in chosen.values() for c in sorted(lst, key=lambda x: -x["mmr"])],
           ["hero_id", "hero", "region", "ladder_pos", "account_id", "account_name",
-           "badge_level", "mmr", "hero_matches", "best_rn", "last_match_id",
-           "last_played", "ambiguous"])
+           "badge_level", "mmr", "games_all", "wins_all", "hero_matches", "best_rn",
+           "last_match_id", "last_played", "ambiguous"])
     write("item_frequency.csv", freq,
           ["hero_id", "hero", "snapshot", "item_id", "item", "category", "tier",
            "builds_with_item", "builds", "pct"])
