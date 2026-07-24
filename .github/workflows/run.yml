@@ -46,17 +46,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Show repo contents
-        run: |
-          echo "--- working dir ---"
-          pwd
-          echo "--- root listing ---"
-          ls -la
-          echo "--- python files anywhere ---"
-          find . -name "*.py" -not -path "./.git/*"
-          echo "--- python version ---"
-          python3 --version
-
       - name: Run pipeline
         env:
           REGIONS: ${{ inputs.regions }}
@@ -67,17 +56,14 @@ jobs:
           LEADERBOARD_DEPTH: ${{ inputs.leaderboard_depth }}
           SNAPSHOTS: ${{ inputs.snapshots }}
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
-        run: |
-          SCRIPT=$(find . -maxdepth 2 -name '*.py' -not -path './.git/*' | head -1)
-          if [ -z "$SCRIPT" ]; then
-            echo "::error::No .py file found in the repository."
-            ls -la
-            exit 1
-          fi
-          echo "Running: $SCRIPT"
-          python3 "$SCRIPT"
+        run: python3 deadlock_pipeline.py
 
-      - name: Upload CSVs
+      - name: Render images
+        run: |
+          pip install --quiet Pillow
+          python3 make_images.py
+
+      - name: Upload output
         if: always()
         uses: actions/upload-artifact@v4
         with:
