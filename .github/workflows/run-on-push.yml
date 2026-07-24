@@ -5,35 +5,39 @@ on:
     branches: [main, master]
   workflow_dispatch:
     inputs:
+      regions:
+        description: "Regions (comma separated)"
+        required: false
+        default: "NAmerica,Europe"
+      per_region:
+        description: "Qualifying players taken per region per hero"
+        required: false
+        default: "10"
       min_badge:
-        description: "Lobby floor (average badge, 0-116)"
+        description: "Badge floor; 0 trusts the ladder, 113 tightens"
         required: false
-        default: "100"
-      lookback_days:
-        description: "Days of match history to scan"
-        required: false
-        default: "90"
+        default: "0"
       recency_window:
         description: "Hero must appear in the player's last N games"
         required: false
         default: "25"
-      players_per_hero:
-        description: "Candidates kept per hero"
+      min_hero_matches:
+        description: "Games on the hero required inside that window"
         required: false
-        default: "10"
-      missing_items_fallback:
-        description: "When the newest qualifying game has no item data"
+        default: "1"
+      leaderboard_depth:
+        description: "Ladder entries read per hero per region (backfill depth)"
         required: false
-        default: "step_back"
-        type: choice
-        options:
-          - step_back
-          - drop
+        default: "60"
+      snapshots:
+        description: "Net-worth snapshots in souls (comma separated)"
+        required: false
+        default: "4800,9600,14400,20800"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -44,11 +48,13 @@ jobs:
 
       - name: Run pipeline
         env:
+          REGIONS: ${{ inputs.regions }}
+          PER_REGION: ${{ inputs.per_region }}
           MIN_BADGE: ${{ inputs.min_badge }}
-          LOOKBACK_DAYS: ${{ inputs.lookback_days }}
           RECENCY_WINDOW: ${{ inputs.recency_window }}
-          PLAYERS_PER_HERO: ${{ inputs.players_per_hero }}
-          MISSING_ITEMS_FALLBACK: ${{ inputs.missing_items_fallback }}
+          MIN_HERO_MATCHES: ${{ inputs.min_hero_matches }}
+          LEADERBOARD_DEPTH: ${{ inputs.leaderboard_depth }}
+          SNAPSHOTS: ${{ inputs.snapshots }}
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
         run: python3 deadlock_pipeline.py
 
