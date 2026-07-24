@@ -128,13 +128,25 @@ def sql(query, label=""):
 _CATEGORY_MAP = {"weapon": "G", "spirit": "S", "vitality": "V"}
 
 
+def _pick(d, keys):
+    for k in keys:
+        v = (d or {}).get(k)
+        if v:
+            return v
+    return ""
+
+
 def load_assets():
-    heroes = {}
+    heroes, hero_icon = {}, {}
     for h in _get(BASE + "/v1/assets/heroes"):
         hid = h.get("id")
         if hid is None or h.get("disabled") or h.get("in_development"):
             continue
         heroes[int(hid)] = h.get("name") or ("hero_%s" % hid)
+        hero_icon[int(hid)] = _pick(h.get("images"),
+                                    ("icon_hero_card", "icon_image_small",
+                                     "icon_hero_card_webp", "icon_image_small_webp",
+                                     "minimap_image"))
 
     raw = [it for it in _get(BASE + "/v1/assets/items")
            if it.get("type") == "upgrade" and it.get("id") is not None]
@@ -155,7 +167,10 @@ def load_assets():
         items[iid] = {"name": it.get("name") or ("item_%d" % iid),
                       "cat": cat,
                       "cost": int(it.get("cost") or 0),
-                      "tier": it.get("item_tier")}
+                      "tier": it.get("item_tier"),
+                      "icon": _pick(it, ("shop_image_small", "shop_image", "image",
+                                         "shop_image_small_webp", "shop_image_webp",
+                                         "image_webp"))}
         # component_items is an array of CLASS NAMES per the spec
         for comp in (it.get("component_items") or []):
             cid = by_class.get(comp) if isinstance(comp, str) else (
@@ -175,7 +190,11 @@ def load_assets():
         print("  [assets] WARNING: no component linkage. Sample item keys: %s"
               % (sorted(sample.keys())[:20] if sample else "none had component_items"),
               file=sys.stderr)
-    return heroes, items, component_of
+    have_icons = sum(1 for v in items.values() if v["icon"])
+    print("  [assets] icons: %d/%d heroes, %d/%d items"
+          % (sum(1 for v in hero_icon.values() if v), len(heroes), have_icons, len(items)),
+          file=sys.stderr)
+    return heroes, hero_icon, items, component_of
 
 
 # --------------------------------------------------------------------------
@@ -342,7 +361,7 @@ def main():
     excluded = []
 
     print("[1/5] assets", file=sys.stderr)
-    heroes, items, component_of = load_assets()
+    heroes, hero_icon, items, component_of = load_assets()
 
     print("[2/5] ladders (%s), depth %d, target %d per region"
           % (", ".join(REGIONS), LEADERBOARD_DEPTH, PER_REGION), file=sys.stderr)
@@ -455,6 +474,7 @@ def main():
             freq.append({"hero_id": hid, "hero": heroes.get(hid, ""), "snapshot": snap,
                          "item_id": iid, "item": m.get("name", "item_%d" % iid),
                          "category": m.get("cat") or "?", "tier": m.get("tier"),
+                         "icon_url": m.get("icon", ""),
                          "builds_with_item": c, "builds": n,
                          "pct": round(100.0 * c / n, 1)})
     freq.sort(key=lambda d: (d["hero"], SNAPSHOT_ORDER.index(d["snapshot"]), -d["pct"]))
@@ -469,6 +489,10 @@ def main():
                        "G_pct": round(100.0 * cats.get("G", 0) / total, 1),
                        "S_pct": round(100.0 * cats.get("S", 0) / total, 1)})
     splits.sort(key=lambda d: (d["hero"], SNAPSHOT_ORDER.index(d["snapshot"])))
+
+    # Lane positioning is an early-game construct, so the split that slots a hero
+    # into the composition framework is the FIRST snapshot, not postgame.
+    early = {s["hero_id"]: s for s in splits if s["snapshot"] == SNAPSHOT_ORDER[0]}
 
     tier = []
     for hid, lst in chosen.items():
@@ -489,16 +513,22 @@ def main():
                      "players": len(lst), "builds_sampled": n,
                      "thin": "YES" if n < TARGET_BUILDS else "",
                      "by_region": " ".join("%s=%d" % (r, per_reg[r]) for r in REGIONS),
-                     "top_account_id": by_mmr[0]["account_id"]})
+                     "top_account_id": by_mmr[0]["account_id"],
+                     "lane_split": early.get(hid, {}).get("split", ""),
+                     "lane_weak": early.get(hid, {}).get("weak", ""),
+                     "lane_role": {"GS": "damage"}.get(
+                         early.get(hid, {}).get("split", ""), "frontline/support"),
+                     "icon_url": hero_icon.get(hid, "")})
     # ranked by pooled elite win rate: badge saturates at the top, win rate does not
     tier.sort(key=lambda d: -(d["elite_winrate"] or 0))
     for i, t in enumerate(tier, 1):
         t["rank"] = i
 
     write("tierlist.csv", tier,
-          ["rank", "hero_id", "hero", "elite_winrate", "elite_games", "median_mmr",
-           "top5_mmr", "top_mmr", "players", "builds_sampled", "thin", "by_region",
-           "top_account_id"])
+          ["rank", "hero_id", "hero", "elite_winrate", "elite_games",
+           "lane_split", "lane_weak", "lane_role", "median_mmr", "top5_mmr",
+           "top_mmr", "players", "builds_sampled", "thin", "by_region",
+           "top_account_id", "icon_url"])
     write("candidates.csv",
           [dict(c, hero=heroes.get(c["hero_id"], ""), mmr=round(c["mmr"], 4))
            for lst in chosen.values() for c in sorted(lst, key=lambda x: -x["mmr"])],
@@ -507,7 +537,7 @@ def main():
            "last_match_id", "last_played", "ambiguous"])
     write("item_frequency.csv", freq,
           ["hero_id", "hero", "snapshot", "item_id", "item", "category", "tier",
-           "builds_with_item", "builds", "pct"])
+           "builds_with_item", "builds", "pct", "icon_url"])
     write("hero_splits.csv", splits,
           ["hero_id", "hero", "snapshot", "split", "weak", "V_pct", "G_pct", "S_pct"])
     write("excluded.csv", excluded,
