@@ -46,6 +46,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Cache icons
+        uses: actions/cache@v4
+        with:
+          path: icons
+          key: deadlock-icons-v1
+
       - name: Run pipeline
         env:
           REGIONS: ${{ inputs.regions }}
@@ -58,16 +64,26 @@ jobs:
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
         run: python3 deadlock_pipeline.py
 
-      - name: Render images
+      - name: Fetch icons and render images
         run: |
           pip install --quiet Pillow
+          python3 fetch_icons.py
           python3 make_images.py
 
-      - name: Upload output
+      - name: Upload images
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: deadlock-output
-          path: output/
+          name: deadlock-images
+          path: output/images/
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 3
+
+      - name: Upload data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deadlock-csvs
+          path: output/*.csv
+          if-no-files-found: error
+          retention-days: 3
