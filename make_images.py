@@ -12,13 +12,18 @@ Writes ./output/images/tierlist.png
 """
 
 import csv
-import io
+import hashlib
+import json
 import os
 import sys
-import urllib.request
 from collections import defaultdict
 
 from PIL import Image, ImageDraw, ImageFont
+
+ICONS_DIR = "icons"
+_index = {}
+if os.path.exists(os.path.join(ICONS_DIR, "index.json")):
+    _index = json.load(open(os.path.join(ICONS_DIR, "index.json")))
 
 OUT = "output"
 IMG = os.path.join(OUT, "images")
@@ -46,17 +51,22 @@ def font(sz, bold=True):
 
 
 def fetch_icon(url):
+    """Read the icon from ./icons/ (populated by fetch_icons.py). No network."""
     if not url:
         return None
     if url in _icon_cache:
         return _icon_cache[url]
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "deadlock-img/1.0"})
-        with urllib.request.urlopen(req, timeout=60) as r:
-            im = Image.open(io.BytesIO(r.read())).convert("RGBA")
-    except Exception as e:
-        print("  [img] icon fail %s (%s)" % (url.split('/')[-1], e), file=sys.stderr)
-        im = None
+    fn = _index.get(url) or (hashlib.sha1(url.encode()).hexdigest() + ".png")
+    path = os.path.join(ICONS_DIR, fn)
+    im = None
+    if os.path.exists(path):
+        try:
+            im = Image.open(path).convert("RGBA")
+        except Exception as e:
+            print("  [img] bad icon file %s (%s)" % (fn, e), file=sys.stderr)
+    else:
+        print("  [img] missing icon %s — run fetch_icons.py" % url.split('/')[-1],
+              file=sys.stderr)
     _icon_cache[url] = im
     return im
 
@@ -217,4 +227,4 @@ if __name__ == "__main__":
     build_tierlist()
     print("[img] item frequency images", file=sys.stderr)
     build_item_images()
-    print("[img] done, %d icons fetched" % len(_icon_cache), file=sys.stderr)
+    print("[img] done, %d icons loaded from disk" % len(_icon_cache), file=sys.stderr)
