@@ -7,17 +7,26 @@ Candidates are the top qualifying players from each region's hero ladder
 data come from SQL.
 
 Outputs (./output/):
-    tierlist.csv         heroes ranked by the top MMR in their sampled pool
+    tierlist.csv         heroes ranked by their pool's pooled win rate ON THE HERO
     candidates.csv       the sampled players, per hero per region
     item_frequency.csv   hold rates per hero per net-worth snapshot
     hero_splits.csv      V/G/S soul share and split classification, per snapshot
     excluded.csv         ladder entries dropped, with the reason
+
+NAMING NOTE. hero_games / hero_wins count a player's games and wins ON THE HERO
+named in the same row, across the whole lookback. They were called games_all /
+wins_all, which read as "all heroes" and caused a downstream misreading.
+offhero_games / offhero_wins are that player's record on EVERY OTHER hero, and
+exist so hero strength can be separated from the general skill of whoever mains
+the hero. hero_matches is a different quantity again: games on the hero within
+the player's last RECENCY_WINDOW matches, so it caps at that value.
 
 Stdlib only.  Run:  python3 deadlock_pipeline.py
 """
 
 import csv
 import json
+import math
 import os
 import sys
 import time
@@ -52,6 +61,10 @@ LOOKBACK_DAYS = _env("LOOKBACK_DAYS", 90)
 EMA_WINDOW = _env("EMA_WINDOW", 50)
 EMA_ALPHA = 2.0 / (EMA_WINDOW + 1)
 
+# A player needs at least this many off-hero games before their off-hero win
+# rate is worth pooling; below it the baseline is noise.
+MIN_OFFHERO_GAMES = _env("MIN_OFFHERO_GAMES", 20)
+
 # Live data has NO rows with match_mode = 'Ranked', so that filter is off by
 # default. Set MATCH_MODE to e.g. Unranked to reinstate one.
 MATCH_MODE = os.environ.get("MATCH_MODE") or ""
@@ -80,7 +93,7 @@ TARGET_BUILDS = PER_REGION * len(REGIONS)
 
 
 def _get(url, tries=3):
-    req = urllib.request.Request(url, headers={"User-Agent": "deadlock-pipeline/4.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "deadlock-pipeline/5.0"})
     if API_KEY:
         req.add_header("X-API-Key", API_KEY)
     for attempt in range(tries):
@@ -237,6 +250,12 @@ def fetch_ladders(heroes):
 # No account-id list: an IN clause of ~90k ids produced a 908KB URL and a 414.
 # Instead SQL picks the elite population itself and Python intersects with the
 # ladder afterwards, which also prunes most of the ambiguous name matches.
+#
+# hero_perf is grouped by (account_id, hero_id) -> a player's record ON ONE HERO.
+# acct_perf is grouped by account_id alone -> the same player across EVERY hero.
+# Subtracting gives the off-hero baseline, which is what lets a hero's win rate
+# be separated from the general skill of the players who main it. Both read the
+# same `recent` CTE, so this costs no extra SQL call.
 Q_POOL = """
 WITH elite AS (
     SELECT DISTINCT account_id
@@ -265,8 +284,12 @@ mmr AS (
     GROUP BY account_id
 ),
 hero_perf AS (
-    SELECT account_id, hero_id, count() AS games_all, sum(won) AS wins_all
+    SELECT account_id, hero_id, count() AS hero_games, sum(won) AS hero_wins
     FROM recent GROUP BY account_id, hero_id
+),
+acct_perf AS (
+    SELECT account_id, count() AS acct_games, sum(won) AS acct_wins
+    FROM recent GROUP BY account_id
 ),
 hero_recent AS (
     SELECT account_id, hero_id,
@@ -280,10 +303,12 @@ hero_recent AS (
 SELECT h.account_id AS account_id, h.hero_id AS hero_id, m.mmr AS mmr,
        h.hero_matches AS hero_matches, h.best_rn AS best_rn,
        h.last_match_id AS last_match_id, h.last_played AS last_played,
-       p.games_all AS games_all, p.wins_all AS wins_all
+       p.hero_games AS hero_games, p.hero_wins AS hero_wins,
+       a.acct_games AS acct_games, a.acct_wins AS acct_wins
 FROM hero_recent AS h
 INNER JOIN mmr AS m USING (account_id)
 INNER JOIN hero_perf AS p USING (account_id, hero_id)
+INNER JOIN acct_perf AS a USING (account_id)
 WHERE h.hero_matches >= {minhero}
 ORDER BY hero_id ASC, mmr DESC
 LIMIT {pool} BY hero_id
@@ -349,6 +374,20 @@ def snapshot_holdings(purchases, component_of):
         out[_label(t)] = prune({p[0] for p in upto if not p[3] or p[3] > reached})
     out["postgame"] = prune({p[0] for p in purchases if not p[3]})
     return out
+
+
+# --------------------------------------------------------------------------
+# STATS HELPERS
+# --------------------------------------------------------------------------
+
+
+def _wr(wins, games):
+    return 100.0 * wins / games if games else None
+
+
+def _se(games):
+    """Standard error of a win rate near 50%, in percentage points."""
+    return 100.0 * math.sqrt(0.25 / games) if games else None
 
 
 # --------------------------------------------------------------------------
@@ -419,13 +458,18 @@ def main():
                 excluded.append(dict(base, reason="already sampled in another region"))
                 continue
             s = stats[(aid, hid)]
+            hg = int(s.get("hero_games") or 0)
+            hw = int(s.get("hero_wins") or 0)
+            # off-hero = everything the account played minus this hero
+            og = max(int(s.get("acct_games") or 0) - hg, 0)
+            ow = max(int(s.get("acct_wins") or 0) - hw, 0)
             chosen[hid].append(dict(base, account_id=aid, mmr=float(s["mmr"]),
                                     hero_matches=int(s["hero_matches"]),
                                     best_rn=int(s["best_rn"]),
                                     last_match_id=int(s["last_match_id"]),
                                     last_played=s["last_played"],
-                                    games_all=int(s.get("games_all") or 0),
-                                    wins_all=int(s.get("wins_all") or 0),
+                                    hero_games=hg, hero_wins=hw,
+                                    offhero_games=og, offhero_wins=ow,
                                     ambiguous=r["ambiguous"]))
             taken += 1
 
@@ -501,16 +545,30 @@ def main():
             continue
         by_mmr = sorted(lst, key=lambda c: -c["mmr"])
         n = builds.get(hid, 0)
-        g = sum(c.get("games_all", 0) for c in lst)
-        w = sum(c.get("wins_all", 0) for c in lst)
+        g = sum(c.get("hero_games", 0) for c in lst)
+        w = sum(c.get("hero_wins", 0) for c in lst)
+        # Only players with a usable off-hero sample contribute to the baseline.
+        thick = [c for c in lst if c.get("offhero_games", 0) >= MIN_OFFHERO_GAMES]
+        og = sum(c["offhero_games"] for c in thick)
+        ow = sum(c["offhero_wins"] for c in thick)
+        hero_wr, off_wr = _wr(w, g), _wr(ow, og)
         top5 = [c["mmr"] for c in by_mmr[:5]]
         per_reg = {rg: sum(1 for c in lst if c["region"] == rg) for rg in REGIONS}
         tier.append({"hero_id": hid, "hero": heroes.get(hid, ""),
                      "top_mmr": round(by_mmr[0]["mmr"], 4),
                      "top5_mmr": round(sum(top5) / len(top5), 4),
                      "median_mmr": round(sorted(c["mmr"] for c in lst)[len(lst) // 2], 4),
-                     "elite_winrate": round(100.0 * w / g, 2) if g else "",
+                     "elite_winrate": round(hero_wr, 2) if hero_wr is not None else "",
                      "elite_games": g,
+                     "elite_se": round(_se(g), 2) if g else "",
+                     "offhero_winrate": round(off_wr, 2) if off_wr is not None else "",
+                     "offhero_games": og,
+                     "winrate_delta": (round(hero_wr - off_wr, 2)
+                                       if (hero_wr is not None and off_wr is not None)
+                                       else ""),
+                     "delta_se": (round(math.sqrt(_se(g) ** 2 + _se(og) ** 2), 2)
+                                  if (g and og) else ""),
+                     "offhero_players": len(thick),
                      "players": len(lst), "builds_sampled": n,
                      "thin": "YES" if n < TARGET_BUILDS else "",
                      "by_region": " ".join("%s=%d" % (r, per_reg[r]) for r in REGIONS),
@@ -524,9 +582,15 @@ def main():
     tier.sort(key=lambda d: -(d["elite_winrate"] or 0))
     for i, t in enumerate(tier, 1):
         t["rank"] = i
+    # a second ordering, by how much the pool outperforms its own off-hero baseline
+    for i, t in enumerate(sorted(tier, key=lambda d: -(d["winrate_delta"]
+                                                       if d["winrate_delta"] != "" else -99)), 1):
+        t["delta_rank"] = i
 
     write("tierlist.csv", tier,
-          ["rank", "hero_id", "hero", "elite_winrate", "elite_games",
+          ["rank", "hero_id", "hero", "elite_winrate", "elite_games", "elite_se",
+           "offhero_winrate", "offhero_games", "offhero_players",
+           "winrate_delta", "delta_se", "delta_rank",
            "lane_split", "lane_weak", "lane_role", "median_mmr", "top5_mmr",
            "top_mmr", "players", "builds_sampled", "thin", "by_region",
            "top_account_id", "icon_url"])
@@ -534,7 +598,8 @@ def main():
           [dict(c, hero=heroes.get(c["hero_id"], ""), mmr=round(c["mmr"], 4))
            for lst in chosen.values() for c in sorted(lst, key=lambda x: -x["mmr"])],
           ["hero_id", "hero", "region", "ladder_pos", "account_id", "account_name",
-           "badge_level", "mmr", "games_all", "wins_all", "hero_matches", "best_rn",
+           "badge_level", "mmr", "hero_games", "hero_wins",
+           "offhero_games", "offhero_wins", "hero_matches", "best_rn",
            "last_match_id", "last_played", "ambiguous"])
     write("item_frequency.csv", freq,
           ["hero_id", "hero", "snapshot", "item_id", "item", "category", "tier",
@@ -548,6 +613,24 @@ def main():
     if thin:
         print("  [warn] thin heroes (<%d builds): %s"
               % (TARGET_BUILDS, ", ".join(thin[:12])), file=sys.stderr)
+
+    # The band widths in PROMPT-tierlist assume a particular sample size. If the
+    # pool or lookback changes, the bands have to move with the standard error.
+    ses = [t["elite_se"] for t in tier if t["elite_se"] != ""]
+    if ses:
+        mean_se = sum(ses) / len(ses)
+        print("  [bands] mean elite_se %.2f pts -> a 2.0-pt band is %.1f SE"
+              % (mean_se, 2.0 / mean_se), file=sys.stderr)
+        if 2.0 / mean_se < 1.3:
+            print("  [bands] WARNING: bands are finer than the data supports; "
+                  "widen them or enlarge the pool", file=sys.stderr)
+
+    moved = [t for t in tier if t["delta_rank"] != "" and abs(t["delta_rank"] - t["rank"]) >= 8]
+    if moved:
+        print("  [delta] heroes shifting >=8 places on the off-hero baseline: %s"
+              % ", ".join("%s %d->%d" % (t["hero"], t["rank"], t["delta_rank"])
+                          for t in moved[:10]), file=sys.stderr)
+
     print("\nDone. %d heroes, %d builds, %d item rows, %d SQL calls."
           % (len(tier), sum(builds.values()), len(freq), _sql_calls[0]), file=sys.stderr)
 
