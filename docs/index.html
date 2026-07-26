@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Deadlock Tier List</title>
+<meta name="description" content="Deadlock hero tier list by peak potential win rate, with item builds by net worth. NA + EU.">
+<meta name="theme-color" content="#14161c">
+<meta name="color-scheme" content="dark">
+<style>
+:root{
+  color-scheme:dark;
+  --bg:#14161c; --panel:#1a1d25; --panel-2:#20242e; --frame:#2e3441;
+  --text:#e6e9f0; --dim:#99a1b3; --ink:#0f1014;
+  --s:#df5a5a; --a:#e0913c; --b:#78a046; --c:#468296; --d:#5a606e;
+  --cat-g:#e8752a; --cat-s:#8b4fd6; --cat-v:#3fa65c; --cat-x:#5a606e;
+  --pad:16px;
+  --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
+  --mono:ui-monospace,"SF Mono","Cascadia Mono","Roboto Mono",Menlo,monospace;
+}
+*{box-sizing:border-box}
+.backdrop{position:fixed;inset:0;background:#14161c;z-index:-1;pointer-events:none}
+html{-webkit-text-size-adjust:100%;background:#14161c!important;color-scheme:dark;
+  scrollbar-color:var(--frame) #14161c}
+body{
+  margin:0;background:var(--bg)!important;color:var(--text);font-family:var(--sans);
+  font-size:15px;line-height:1.45;
+  padding:0 max(var(--pad),env(safe-area-inset-left)) calc(48px + env(safe-area-inset-bottom));
+  -webkit-font-smoothing:antialiased;min-height:100dvh;max-width:1180px;margin:0 auto;
+}
+h1,h2,h3{margin:0;font-weight:800;letter-spacing:.06em;text-transform:uppercase}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+/* ---------- header ---------- */
+header{padding:22px 0 18px}
+.eyebrow{font-size:11px;letter-spacing:.28em;color:var(--dim);text-transform:uppercase;font-weight:700}
+h1{font-size:clamp(24px,7vw,38px);letter-spacing:.04em;margin-top:4px}
+.sub{color:var(--dim);font-size:13px;margin-top:6px}
+.sub b{color:var(--text);font-weight:600}
+
+/* ---------- tier list ---------- */
+.tier-row{
+  display:flex;align-items:stretch;gap:8px;
+  background:var(--panel);border:1px solid var(--frame);border-radius:12px;
+  margin-bottom:8px;overflow:hidden;
+}
+.tier-chip{
+  flex:0 0 44px;display:grid;place-items:center;
+  font:800 22px/1 var(--sans);color:var(--ink);letter-spacing:0;
+}
+.tier-chip[data-t=S]{background:var(--s)} .tier-chip[data-t=A]{background:var(--a)}
+.tier-chip[data-t=B]{background:var(--b)} .tier-chip[data-t=C]{background:var(--c)}
+.tier-chip[data-t=D]{background:var(--d)}
+.strip{
+  display:flex;gap:6px;overflow-x:auto;padding:8px 8px 8px 0;
+  scrollbar-width:thin;-webkit-overflow-scrolling:touch;
+}
+.strip::-webkit-scrollbar{height:4px}
+.strip::-webkit-scrollbar-thumb{background:var(--frame);border-radius:2px}
+.hero{
+  flex:0 0 auto;width:60px;background:none;border:0;padding:0;cursor:pointer;
+  color:var(--dim);font-family:inherit;text-align:center;
+}
+.ic{
+  position:relative;display:block;overflow:hidden;flex:0 0 auto;
+  background:var(--panel-2);border-radius:10px;
+}
+.ic::before{
+  content:attr(data-fallback);position:absolute;inset:0;display:grid;place-items:center;
+  font:700 11px/1 var(--sans);color:var(--dim);text-transform:uppercase;letter-spacing:.04em;
+}
+.ic img{position:relative;width:100%;height:100%;display:block;object-fit:cover;object-position:center 22%}
+.hero .ic{
+  width:56px;height:56px;margin:0 auto;border:1px solid var(--frame);
+  transition:border-color .12s,transform .12s;
+}
+.hero .nm{font-size:10.5px;line-height:1.2;margin-top:5px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.hero:hover .ic{border-color:var(--dim)}
+.hero[aria-pressed=true] .ic{border-color:var(--text);transform:translateY(-2px)}
+.hero[aria-pressed=true] .nm{color:var(--text)}
+.hero:focus-visible{outline:2px solid var(--text);outline-offset:3px;border-radius:12px}
+
+/* ---------- hero detail ---------- */
+.detail{margin-top:24px;scroll-margin-top:12px}
+.hero-head{display:flex;gap:12px;align-items:center}
+.hero-head .ic{width:56px;height:56px;border:1px solid var(--frame)}
+.hero-head h2{font-size:clamp(20px,5.5vw,28px)}
+.badges{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.badge{font-size:11px;padding:2px 8px;border-radius:99px;background:var(--panel-2);
+  color:var(--dim);border:1px solid var(--frame);white-space:nowrap}
+.badge.tier{color:var(--ink);border:0;font-weight:800}
+.badge.tier[data-t=S]{background:var(--s)} .badge.tier[data-t=A]{background:var(--a)}
+.badge.tier[data-t=B]{background:var(--b)} .badge.tier[data-t=C]{background:var(--c)}
+.badge.tier[data-t=D]{background:var(--d)}
+.note{
+  margin-top:12px;padding:9px 12px;border-radius:8px;font-size:12.5px;
+  background:rgba(224,145,60,.10);border:1px solid rgba(224,145,60,.35);color:#f0c48a;
+}
+.section-label{font-size:11px;letter-spacing:.2em;color:var(--dim);
+  text-transform:uppercase;font-weight:700;margin:22px 0 2px}
+.section-label{margin-bottom:12px}
+
+/* ---------- snapshot columns ---------- */
+.cols{
+  display:grid;grid-template-columns:repeat(5,1fr);gap:6px;padding-bottom:10px;
+}
+.col{min-width:0}
+.col h3{font-size:12px;color:var(--text);letter-spacing:.04em;text-align:center}
+.col .rule{height:2px;background:var(--frame);border-radius:1px;margin:5px 0 8px}
+.grid{display:flex;flex-direction:column;align-items:center;gap:9px}
+.tile{
+  position:relative;width:100%;max-width:54px;aspect-ratio:1;border-radius:9px;
+  border:1px solid var(--frame);border-bottom-width:3px;background:var(--panel);
+}
+.tile[data-c=G]{border-bottom-color:var(--cat-g)}
+.tile[data-c=S]{border-bottom-color:var(--cat-s)}
+.tile[data-c=V]{border-bottom-color:var(--cat-v)}
+.tile[data-c="?"]{border-bottom-color:var(--cat-x)}
+.tile .ic{width:100%;height:100%;border-radius:8px}
+.tile .n{
+  position:absolute;right:-3px;bottom:-4px;min-width:19px;height:17px;padding:0 4px;
+  display:grid;place-items:center;border-radius:5px;
+  background:var(--ink);border:1px solid var(--frame);
+  font-size:11.5px;font-weight:800;color:var(--text);
+}
+.more{
+  width:100%;max-width:54px;margin:3px auto 0;padding:6px 2px;border-radius:8px;cursor:pointer;
+  background:transparent;border:1px dashed var(--frame);color:var(--dim);
+  font:700 11px/1 var(--sans);letter-spacing:.02em;
+}
+.more:hover{color:var(--text);border-color:var(--dim)}
+.empty{color:var(--dim);font-size:12px;padding:6px 2px}
+
+/* ---------- footer ---------- */
+footer{margin-top:32px;padding-top:14px;border-top:1px solid var(--frame);
+  color:var(--dim);font-size:11.5px;line-height:1.55;max-width:62ch}
+.method{margin:10px 0 0}
+.method dt{font-weight:800;letter-spacing:.14em;text-transform:uppercase;
+  font-size:10px;color:var(--text);margin-top:12px}
+.method dd{margin:3px 0 0}
+.method em{font-style:normal;color:var(--text)}
+.credit{margin-top:16px;padding-top:12px;border-top:1px solid var(--frame);font-size:11px}
+.credit a{color:var(--dim);text-decoration:underline;text-underline-offset:2px}
+.credit a:hover{color:var(--text)}
+footer a{color:var(--dim)}
+.loading{color:var(--dim);padding:40px 0}
+@media (min-width:760px){
+  body{padding-left:max(28px,env(safe-area-inset-left));padding-right:28px}
+  .cols{gap:10px;max-width:760px}
+  .tile{max-width:64px}
+  .more{max-width:64px}
+  .col h3{font-size:13px}
+  header{padding:34px 0 24px}
+  .detail{margin-top:32px}
+  .hero{width:72px} .hero .ic{width:68px;height:68px}
+  .tier-chip{flex-basis:56px;font-size:26px}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="backdrop" aria-hidden="true"></div>
+
+<header>
+  <div class="eyebrow">Deadlock</div>
+  <h1>Tier List</h1>
+  <p class="sub" id="sub">Loading…</p>
+</header>
+
+<main>
+  <section id="tiers" class="loading">Loading tier list…</section>
+  <section class="detail" id="detail" hidden></section>
+</main>
+
+<footer>
+  <div id="stamp"></div>
+  <dl class="method">
+    <dt>Peak potential</dt>
+    <dd>For each hero, the ten highest-ranked players in NA and the ten in EU who have
+    played it inside their last 25 games. The win rate pools every ranked game those
+    twenty played on that hero, so it measures the ceiling a hero reaches in expert
+    hands rather than its average across the ladder.</dd>
+
+    <dt>Builds</dt>
+    <dd>Taken from the most recent game of the hero's top 10 players in NA and EU
+    respectively.</dd>
+  </dl>
+
+  <div class="credit">
+    Data from <a href="https://deadlock-api.com" target="_blank" rel="noopener">deadlock-api.com</a>.
+    Hero and item art belongs to Valve Corporation.
+    An unofficial fan project — not affiliated with or endorsed by Valve.
+  </div>
+</footer>
+
+<script>
+const SNAP_CAP = 12;
+let DATA = null, current = null;
+const expanded = new Set();
+
+const el = (t, cls) => { const n = document.createElement(t); if (cls) n.className = cls; return n; };
+
+// Try in order: icons inlined into this file (preview build only), the
+// self-hosted docs/icons copy, then the asset bucket.
+const INLINE = window.__ICONS__ || null;
+const iconStats = {ok:0, fail:0};
+
+function icon(ref, alt){
+  const wrap = el('span','ic');
+  wrap.dataset.fallback = (alt || '?').slice(0,2);
+  const img = el('img');
+  img.decoding = 'async';
+  img.referrerPolicy = 'no-referrer';
+  img.alt = alt || '';
+  if (!ref || !ref[1]) return wrap;
+
+  const chain = [];
+  if (ref[0] && INLINE && INLINE[ref[0]]) chain.push(INLINE[ref[0]]);
+  if (ref[0]) chain.push('icons/' + ref[0]);
+  chain.push(ref[1]);
+  let step = 0, timer = null, done = false;
+  const give_up = () => {
+    if (done) return;
+    done = true; clearTimeout(timer);
+    iconStats.fail += 1; img.remove(); updateStamp();
+  };
+  const advance = () => {
+    if (done) return;
+    clearTimeout(timer);
+    step += 1;
+    if (step >= chain.length) return give_up();
+    img.src = chain[step];
+    timer = setTimeout(advance, 6000);
+  };
+  img.addEventListener('error', advance);
+  img.addEventListener('load', () => {
+    if (done) return;
+    done = true; clearTimeout(timer);
+    iconStats.ok += 1; updateStamp();
+  });
+  img.src = chain[0];              // set last, so the handlers are already bound
+  timer = setTimeout(advance, 6000);
+  wrap.appendChild(img);
+  return wrap;
+}
+
+function renderTiers(){
+  const root = document.getElementById('tiers');
+  root.className = '';
+  root.replaceChildren();
+  for (const [name] of DATA.bands){
+    const members = DATA.heroes.filter(h => h.tier === name);
+    if (!members.length) continue;
+    const row = el('div','tier-row');
+    const chip = el('div','tier-chip');
+    chip.dataset.t = name; chip.textContent = name;
+    chip.setAttribute('aria-label', 'Tier ' + name);
+    const strip = el('div','strip');
+    for (const h of members){
+      const b = el('button','hero');
+      b.type = 'button';
+      b.dataset.slug = h.slug;
+      b.setAttribute('aria-pressed','false');
+      b.appendChild(icon(h.icon, h.name));
+      const nm = el('div','nm'); nm.textContent = h.name;
+      b.appendChild(nm);
+      b.onclick = () => select(h.slug);
+      strip.appendChild(b);
+    }
+    row.append(chip, strip);
+    root.appendChild(row);
+  }
+}
+
+function select(slug){
+  const h = DATA.heroes.find(x => x.slug === slug);
+  if (!h) return;
+  current = slug;
+  expanded.clear();
+  for (const b of document.querySelectorAll('.hero'))
+    b.setAttribute('aria-pressed', String(b.dataset.slug === slug));
+  try { history.replaceState(null, '', '#' + slug); }
+  catch (e) { /* file:// has a null origin and rejects replaceState */ }
+  renderDetail(h);
+}
+
+function renderDetail(h){
+  const d = document.getElementById('detail');
+  d.hidden = false;
+  d.replaceChildren();
+
+  const head = el('div','hero-head');
+  head.appendChild(icon(h.icon, h.name));
+  const meta = el('div');
+  const h2 = el('h2'); h2.textContent = h.name;
+  const badges = el('div','badges');
+  const t = el('span','badge tier'); t.dataset.t = h.tier;
+  t.textContent = h.tier + ' · ' + h.winrate.toFixed(1) + '%';
+  badges.appendChild(t);
+  meta.append(h2, badges);
+  head.appendChild(meta);
+  d.appendChild(head);
+
+  if (h.thin){
+    const n = el('div','note');
+    n.textContent = 'Thin sample: ' + h.of_builds + ' builds instead of 20. '
+      + 'Counts here move more from one player than they do for other heroes.';
+    d.appendChild(n);
+  }
+
+  const lab = el('div','section-label');
+  lab.textContent = 'Items held by net worth';
+  d.appendChild(lab);
+
+  const cols = el('div','cols');
+  const builds = DATA.builds[h.slug] || {};
+  for (const snap of DATA.snapshots) cols.appendChild(renderCol(snap, builds[snap] || [], h));
+  d.appendChild(cols);
+
+}
+
+function renderCol(snap, all, hero){
+  const list = all.filter(p => p[0] >= 2);
+  const col = el('div','col');
+  const h3 = el('h3'); h3.textContent = snap;
+  const rule = el('div','rule');
+  col.append(h3, rule);
+
+  if (!list.length){ const e = el('div','empty'); e.textContent = 'No shared items.'; col.appendChild(e); return col; }
+
+  const open = expanded.has(snap);
+  const shown = open ? list : list.slice(0, SNAP_CAP);
+  const grid = el('div','grid');
+  for (const [count, id] of shown){
+    const it = DATA.items[id] || {name:'item ' + id, cat:'?', icon:['','']};
+    const tile = el('div','tile');
+    tile.dataset.c = it.cat;
+    tile.title = it.name + ' — ' + count + ' of ' + hero.of_builds;
+    const n = el('span','n num'); n.textContent = count;
+    tile.append(icon(it.icon, it.name), n);
+    grid.appendChild(tile);
+  }
+  col.appendChild(grid);
+  if (list.length > SNAP_CAP){
+    const b = el('button','more');
+    b.type = 'button';
+    b.textContent = open ? '−' : '+' + (list.length - SNAP_CAP);
+    b.onclick = () => {
+      open ? expanded.delete(snap) : expanded.add(snap);
+      renderDetail(hero);
+    };
+    col.appendChild(b);
+  }
+  return col;
+}
+
+function updateStamp(){
+  if (!DATA) return;
+  const bad = iconStats.fail ? ' · ' + iconStats.fail + ' icons failed to load' : '';
+  document.getElementById('stamp').textContent =
+    'Updated ' + DATA.generated_at.replace('T',' ').replace('Z',' UTC')
+    + ' · ' + DATA.heroes.length + ' heroes' + bad;
+}
+
+function boot(data){
+  DATA = data;
+  const day = data.generated_at.slice(0,10);
+  document.getElementById('sub').innerHTML =
+    'peak potential · <b>NA + EU</b> · ' + day;
+  updateStamp();
+  renderTiers();
+  const want = decodeURIComponent(location.hash.slice(1));
+  select(data.heroes.find(h => h.slug === want) ? want : data.heroes[0].slug);
+}
+
+if (window.__DATA__) {
+  boot(window.__DATA__);
+} else {
+  fetch('data.json?v=' + Date.now())
+    .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
+    .then(boot)
+    .catch(err => {
+      document.getElementById('tiers').textContent =
+        'Could not load data.json (' + err.message + '). Serve this folder over HTTP rather than opening the file directly.';
+    });
+}
+</script>
+</body>
+</html>
