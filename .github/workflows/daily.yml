@@ -1,0 +1,66 @@
+name: Daily refresh
+
+on:
+  schedule:
+    - cron: "0 8 * * *"     # 08:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run pipeline
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+        run: python3 deadlock_pipeline.py
+
+      - name: Fetch any new icons
+        run: |
+          python3 fetch_icons.py
+          mkdir -p docs/icons
+          cp -n icons/*.png docs/icons/ 2>/dev/null || true
+
+      # exits non-zero on obviously broken data, which fails the job and
+      # leaves the last good docs/data.json in place
+      - name: Build site data
+        run: python3 build_site_data.py
+
+      # Only docs/ is committed. output/ holds candidates.csv and excluded.csv,
+      # which carry Steam account IDs and display names — those stay off the repo.
+      - name: Commit if changed
+        run: |
+          git config user.name  "deadlock-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add docs/data.json docs/icons
+          if git diff --cached --quiet; then
+            echo "no change"
+          else
+            git commit -m "data: refresh $(date -u +%Y-%m-%d)"
+            git push
+          fi
+
+      # Artifacts on a public repo are downloadable by anyone, so the
+      # player-level CSVs are excluded here too.
+      - name: Upload aggregate CSVs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deadlock-aggregates
+          retention-days: 7
+          path: |
+            output/tierlist.csv
+            output/item_frequency.csv
+            output/hero_splits.csv
