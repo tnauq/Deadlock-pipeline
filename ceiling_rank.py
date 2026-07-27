@@ -175,7 +175,27 @@ def main():
 
     out = []
     for rg in REGIONS:
-        rows = sorted(per_region.get(rg, []), key=lambda d: d["global_pos"])
+        # global_pos ties happen: one account can be the located ceiling player
+        # for two heroes at the identical board position (e.g. a McGinnis/Ivy
+        # dual-main). Without a tiebreak, sort stability alone decided which
+        # hero showed first — an artifact of dict iteration order, not a
+        # ranking. Break ties by hero_ladder_pos (their standing on THAT
+        # hero's own per-hero board — lower is better, so this asks "which
+        # hero do they actually rank higher on"), then by pool elite_winrate
+        # if that's tied too (e.g. wander sits at ladder_pos 1 on both
+        # McGinnis and Ivy). Missing values sort last, not first.
+        def _lp(d):
+            try:
+                return int(d["hero_ladder_pos"])
+            except (TypeError, ValueError):
+                return 10**9
+        def _wr(d):
+            try:
+                return float(d["elite_winrate"])
+            except (TypeError, ValueError):
+                return -1.0
+        rows = sorted(per_region.get(rg, []),
+                      key=lambda d: (d["global_pos"], _lp(d), -_wr(d)))
         for i, d in enumerate(rows, 1):
             d["ceiling_rank"] = i
         out.extend(rows)
