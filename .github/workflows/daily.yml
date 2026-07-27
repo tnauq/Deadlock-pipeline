@@ -1,4 +1,4 @@
-name: Daily refresh
+name: Daily name: Daily refresh
 
 on:
   schedule:
@@ -22,9 +22,15 @@ jobs:
         with:
           python-version: "3.12"
 
+      # PER_REGION 20 doubles the sampled builds so NA and EU each get their
+      # own set of ~20. LEADERBOARD_DEPTH 60 gives the backfill room to find
+      # 20 QUALIFYING players per region, since roughly a third of ladder
+      # entries get filtered out.
       - name: Run pipeline
         env:
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+          PER_REGION: "20"
+          LEADERBOARD_DEPTH: "60"
         run: python3 deadlock_pipeline.py
 
       - name: Fetch any new icons
