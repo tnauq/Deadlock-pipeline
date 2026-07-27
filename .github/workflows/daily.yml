@@ -38,6 +38,14 @@ jobs:
       - name: Build site data
         run: python3 build_site_data.py
 
+      # TEMPORARY — first look at the ceiling ranking. Reads the CSVs the
+      # pipeline just wrote and prints its table to this step's log. Writes
+      # output/ceiling.csv, which is discarded when the runner tears down.
+      # continue-on-error so a failure here can't block the data refresh.
+      - name: Ceiling ranking (experiment)
+        continue-on-error: true
+        run: python3 ceiling_rank.py
+
       # Only docs/ is committed. output/ holds candidates.csv and excluded.csv,
       # which carry Steam account IDs and display names — those stay off the repo.
       - name: Commit if changed
