@@ -22,15 +22,19 @@ jobs:
         with:
           python-version: "3.12"
 
-      # PER_REGION 20 doubles the sampled builds so NA and EU each get their
-      # own set of ~20. LEADERBOARD_DEPTH 60 gives the backfill room to find
-      # 20 QUALIFYING players per region, since roughly a third of ladder
-      # entries get filtered out.
+      # PER_REGION 20 gives NA and EU their own set of ~20 builds each.
+      # LEADERBOARD_DEPTH 100 is the backfill room to find 20 QUALIFYING
+      # players per region. Depth costs almost nothing in quality: the
+      # SQL_BADGE_FLOOR of 110 (Eternus) gates entry regardless of ladder
+      # position, and median mmr falls only ~0.7 across the first 40 places.
+      # RECENCY_WINDOW stays at 25 deliberately — 99% of qualifying players
+      # played the hero within their last 20 games, so widening it would add
+      # almost no volume while letting stale builds in.
       - name: Run pipeline
         env:
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
           PER_REGION: "20"
-          LEADERBOARD_DEPTH: "60"
+          LEADERBOARD_DEPTH: "100"
         run: python3 deadlock_pipeline.py
 
       - name: Fetch any new icons
@@ -39,18 +43,16 @@ jobs:
           mkdir -p docs/icons
           cp -n icons/*.png docs/icons/ 2>/dev/null || true
 
+      # Ranks each hero by its strongest player's ladder position, per region.
+      # Must run BEFORE the builder: the site's ordering and tiers come from
+      # output/ceiling.csv. No continue-on-error now that it is load-bearing.
+      - name: Ceiling ranking
+        run: python3 ceiling_rank.py
+
       # exits non-zero on obviously broken data, which fails the job and
       # leaves the last good docs/data.json in place
       - name: Build site data
         run: python3 build_site_data.py
-
-      # TEMPORARY — ceiling ranking. Position comes from list order, not the
-      # 'rank' field (which carries ties), and a match needs both the display
-      # name and the account id to agree.
-      # continue-on-error so a failure here can't block the data refresh.
-      - name: Ceiling ranking (experiment)
-        continue-on-error: true
-        run: python3 ceiling_rank.py
 
       # Only docs/ is committed. output/ holds candidates.csv and excluded.csv,
       # which carry Steam account IDs and display names — those stay off the repo.
@@ -78,3 +80,4 @@ jobs:
             output/tierlist.csv
             output/item_frequency.csv
             output/hero_splits.csv
+            output/ceiling.csv
