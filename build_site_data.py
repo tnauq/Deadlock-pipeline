@@ -4,13 +4,15 @@ Turn the pipeline CSVs into one JSON file the static site reads.
 
     python3 build_site_data.py
 
-Reads  ./output/tierlist.csv, ./output/item_frequency.csv
+Reads  ./output/tierlist.csv, ./output/item_frequency.csv, ./output/ceiling.csv
 Writes ./docs/data.json
 
-Item metadata (name, category, tier, icon) is deduped into a lookup table
-keyed by item_id, so the per-hero payload is just [count, item_id] pairs.
-Icons are referenced by their sha1 filename in ./docs/icons/ (matching
-fetch_icons.py) with the original URL kept as a fallback.
+Heroes are ordered by CEILING — the ladder position of each hero's strongest
+player, computed per region. Win rate is carried through for reference but is
+not what the ordering or the tiers are built from.
+
+Everything is per region: NAmerica and Europe get their own ordering, their own
+tiers, and their own item counts. Nothing is pooled across regions.
 """
 
 import csv
@@ -20,17 +22,41 @@ import json
 import os
 import sys
 from collections import defaultdict
+from math import erf, sqrt
 
 OUT = "output"
 DOCS = "docs"
 SNAPSHOTS = ["4.8k", "9.6k", "14.4k", "20.8k", "postgame"]
+REGIONS = ["NAmerica", "Europe"]
+REGION_LABEL = {"NAmerica": "NA", "Europe": "EU"}
 
-BANDS = [("S", 59.0, 200.0), ("A", 57.0, 59.0), ("B", 55.0, 57.0),
-         ("C", 53.0, 55.0), ("D", 0.0, 53.0)]
+# Tiers are a bell: the normal split into five equal-width z bands, heroes
+# allocated by area. S 11.5%, A 23.0%, B 31.1%, C 23.0%, D 11.5% — so at 38
+# heroes that is 4 / 9 / 12 / 9 / 4. Ranking is by position, so unlike the old
+# fixed win-rate bands these are RELATIVE: a hero can change tier because
+# others moved.
+TIER_NAMES = ["S", "A", "B", "C", "D"]
+_Z_CUTS = [1.2, 0.4, -0.4, -1.2]
 
-# refuse to publish obviously broken data over a good file
+
+def _phi(z):
+    return 0.5 * (1 + erf(z / sqrt(2)))
+
+
+_EDGES = [1.0] + [_phi(z) for z in _Z_CUTS] + [0.0]
+TIER_AREAS = [_EDGES[i] - _EDGES[i + 1] for i in range(5)]
+
 MIN_HEROES = 30
-WINRATE_SANE = (40.0, 75.0)
+
+
+def allocate(n):
+    """Bell-shaped tier sizes for n heroes; largest remainder so it sums to n."""
+    raw = [a * n for a in TIER_AREAS]
+    base = [int(x) for x in raw]
+    order = sorted(range(5), key=lambda i: -(raw[i] - base[i]))
+    for i in order[:n - sum(base)]:
+        base[i] += 1
+    return base
 
 
 def slug(name):
@@ -47,52 +73,41 @@ def icon_ref(url):
     return [hashlib.sha1(url.encode()).hexdigest() + ".png", url]
 
 
-def band_of(w):
-    for name, lo, hi in BANDS:
-        if lo <= w < hi:
-            return name
-    return "D"
-
-
-def read(name):
-    with open(os.path.join(OUT, name), newline="", encoding="utf-8-sig") as f:
+def read(name, required=True):
+    path = os.path.join(OUT, name)
+    if not os.path.exists(path):
+        if required:
+            raise SystemExit("missing %s" % path)
+        return []
+    with open(path, newline="", encoding="utf-8-sig") as f:
         return list(csv.DictReader(f))
 
 
 def main():
     tier_rows = [r for r in read("tierlist.csv") if r.get("elite_winrate")]
     item_rows = read("item_frequency.csv")
+    ceil_rows = read("ceiling.csv")
 
     if len(tier_rows) < MIN_HEROES:
-        raise SystemExit("refusing to build: only %d heroes (expected >=%d)"
-                         % (len(tier_rows), MIN_HEROES))
+        raise SystemExit("refusing to build: only %d heroes" % len(tier_rows))
+    if "region" not in (item_rows[0] if item_rows else {}):
+        raise SystemExit("item_frequency.csv has no region column — pipeline is out of date")
 
-    heroes = []
+    # ---- hero facts, shared across regions -------------------------------
+    heroes = {}
     for r in tier_rows:
-        w = float(r["elite_winrate"])
-        if not WINRATE_SANE[0] <= w <= WINRATE_SANE[1]:
-            raise SystemExit("refusing to build: %s win rate %.1f out of range"
-                             % (r["hero"], w))
-        heroes.append({
+        s = slug(r["hero"])
+        heroes[s] = {
             "id": int(r["hero_id"]),
             "name": r["hero"],
-            "slug": slug(r["hero"]),
-            "rank": int(r["rank"]),
-            "winrate": w,
-            "tier": band_of(w),
-            "games": int(r["elite_games"]),
-            "players": int(r["players"]),
-            "builds": int(r["builds_sampled"]),
-            "thin": r.get("thin", "").strip().upper() == "YES",
-            "split": r.get("lane_split", ""),
-            "weak": r.get("lane_weak", ""),
-            "role": r.get("lane_role", ""),
-            "regions": r.get("by_region", ""),
+            "slug": s,
             "icon": icon_ref(r["icon_url"]),
-        })
-    heroes.sort(key=lambda h: -h["winrate"])
+            # carried for reference, not used for ordering or tiers
+            "winrate": float(r["elite_winrate"]),
+            "winrate_rank": int(r["rank"]),
+        }
 
-    # deduped item lookup
+    # ---- deduped item lookup ---------------------------------------------
     meta = {}
     for r in item_rows:
         iid = r["item_id"]
@@ -100,58 +115,76 @@ def main():
             meta[iid] = {
                 "name": r["item"],
                 "cat": r["category"] or "?",
-                "tier": int(r["tier"]) if r.get("tier") else 0,
                 "icon": icon_ref(r["icon_url"]),
             }
 
-    # hero slug -> snapshot -> [[count, item_id], ...] sorted by count desc
-    builds = defaultdict(lambda: {s: [] for s in SNAPSHOTS})
-    of_builds = {}
-    singletons = 0
+    # ---- per-region builds ------------------------------------------------
+    builds = {rg: defaultdict(lambda: {s: [] for s in SNAPSHOTS}) for rg in REGIONS}
+    of_builds = {rg: {} for rg in REGIONS}
     for r in item_rows:
-        c = int(r["count"])
-        if c < 2:
-            singletons += 1            # kept; the site filters these client-side
-        s = r["snapshot"]
-        if s not in SNAPSHOTS:
+        rg, s = r["region"], slug(r["hero"])
+        if rg not in builds or r["snapshot"] not in SNAPSHOTS:
             continue
-        builds[slug(r["hero"])][s].append([c, r["item_id"]])
-        of_builds[slug(r["hero"])] = int(r["of_builds"])
+        if int(r["count"]) < 2:
+            continue
+        builds[rg][s][r["snapshot"]].append([int(r["count"]), r["item_id"]])
+        of_builds[rg][s] = int(r["of_builds"])
+    for rg in REGIONS:
+        for hero in builds[rg].values():
+            for s in SNAPSHOTS:
+                hero[s].sort(key=lambda p: (-p[0], meta[p[1]]["name"]))
 
-    for hero in builds.values():
-        for s in SNAPSHOTS:
-            hero[s].sort(key=lambda p: (-p[0], meta[p[1]]["name"]))
-
-    missing = [h["name"] for h in heroes if h["slug"] not in builds]
-    if missing:
-        print("  [warn] no item data for: %s" % ", ".join(missing), file=sys.stderr)
-
-    for h in heroes:
-        h["of_builds"] = of_builds.get(h["slug"], h["builds"])
-
-    if not singletons:
-        print("  [warn] no count==1 rows in item_frequency.csv — the pipeline is "
-              "still filtering singletons, so the site's one-off toggle will be "
-              "inert until that filter is removed.", file=sys.stderr)
+    # ---- per-region ordering, from the ceiling ---------------------------
+    regions = {}
+    for rg in REGIONS:
+        rows = sorted((r for r in ceil_rows if r["region"] == rg),
+                      key=lambda r: int(r["global_pos"]))
+        if not rows:
+            raise SystemExit("no ceiling rows for %s" % rg)
+        sizes = allocate(len(rows))
+        order, i = [], 0
+        for name, n in zip(TIER_NAMES, sizes):
+            for r in rows[i:i + n]:
+                s = slug(r["hero"])
+                if s not in heroes:
+                    continue
+                order.append({
+                    "slug": s,
+                    "tier": name,
+                    "rank": len(order) + 1,
+                    "of_builds": of_builds[rg].get(s, 0),
+                    # kept out of the page, useful in the JSON
+                    "pos": int(r["global_pos"]),
+                    "pct": float(r["pct"]),
+                    "player": r["ceiling_player"],
+                })
+            i += n
+        regions[rg] = {
+            "label": REGION_LABEL[rg],
+            "depth": int(rows[0]["region_depth"]),
+            "order": order,
+            "builds": {k: v for k, v in builds[rg].items()},
+        }
+        print("  [%s] %d heroes, tiers %s" % (rg, len(order), dict(zip(TIER_NAMES, sizes))),
+              file=sys.stderr)
 
     data = {
         "generated_at": datetime.datetime.now(datetime.timezone.utc)
                                 .strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "has_singletons": singletons > 0,
         "snapshots": SNAPSHOTS,
-        "bands": [[n, lo, hi] for n, lo, hi in BANDS],
+        "tiers": TIER_NAMES,
+        "region_order": REGIONS,
         "heroes": heroes,
         "items": meta,
-        "builds": builds,
+        "regions": regions,
     }
 
     os.makedirs(DOCS, exist_ok=True)
     path = os.path.join(DOCS, "data.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, separators=(",", ":"), ensure_ascii=False)
-    kb = os.path.getsize(path) / 1024
     print("  -> %s (%.0f KB, %d heroes, %d items)"
-          % (path, kb, len(heroes), len(meta)), file=sys.stderr)
+          % (path, os.path.getsize(path) / 1024, len(heroes), len(meta)), file=sys.stderr)
 
 
 if __name__ == "__main__":
