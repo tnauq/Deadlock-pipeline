@@ -1,4 +1,4 @@
-name: Daily name: Daily refresh
+name: Daily refresh
 
 on:
   schedule:
