@@ -65,6 +65,17 @@ EMA_ALPHA = 2.0 / (EMA_WINDOW + 1)
 # rate is worth pooling; below it the baseline is noise.
 MIN_OFFHERO_GAMES = _env("MIN_OFFHERO_GAMES", 20)
 
+# Assign each account to exactly one hero (the one it played most in the recency
+# window) and drop it from every other hero's pool.
+#
+# OFF by default. Deadlock requires a minimum of 3 selected heroes and Eternus
+# forces at least 2 at high priority, so single-hero mains do not exist at this
+# rank — the rule was deleting genuine specialists from a hero's pool because
+# they were one game busier on their other high-priority pick. With it off, an
+# account can appear under several heroes; its rows stay hero-specific either
+# way, since every stat is computed from that account's games ON that hero.
+EXCLUSIVITY = (os.environ.get("EXCLUSIVITY") or "0") == "1"
+
 # Live data has NO rows with match_mode = 'Ranked', so that filter is off by
 # default. Set MATCH_MODE to e.g. Unranked to reinstate one.
 MATCH_MODE = os.environ.get("MATCH_MODE") or ""
@@ -402,8 +413,9 @@ def main():
     print("[1/5] assets", file=sys.stderr)
     heroes, hero_icon, items, component_of = load_assets()
 
-    print("[2/5] ladders (%s), depth %d, target %d per region"
-          % (", ".join(REGIONS), LEADERBOARD_DEPTH, PER_REGION), file=sys.stderr)
+    print("[2/5] ladders (%s), depth %d, target %d per region, exclusivity %s"
+          % (", ".join(REGIONS), LEADERBOARD_DEPTH, PER_REGION,
+             "ON" if EXCLUSIVITY else "OFF"), file=sys.stderr)
     ladder = fetch_ladders(heroes)
     n_ids = len({a for rows in ladder.values() for r in rows for a in r["ids"]})
     print("  [lb] %d distinct candidate ids across all entries" % n_ids, file=sys.stderr)
@@ -449,7 +461,7 @@ def main():
                     else "no candidate id in the elite pool, or hero not in last %d games"
                          % RECENCY_WINDOW)))
                 continue
-            if home[aid] != hid:
+            if EXCLUSIVITY and home[aid] != hid:
                 excluded.append(dict(base, reason="duplicate; assigned to %s (%d games)"
                                      % (heroes.get(home[aid], home[aid]),
                                         played[aid][home[aid]])))
