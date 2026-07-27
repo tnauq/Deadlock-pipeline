@@ -475,6 +475,10 @@ def main():
 
     wanted = [(c["last_match_id"], c["account_id"])
               for lst in chosen.values() for c in lst]
+    # which region each sampled build came from, so item frequencies can be
+    # reported per region rather than pooled
+    build_region = {(c["last_match_id"], c["account_id"]): c["region"]
+                    for lst in chosen.values() for c in lst}
     print("[4/5] item query (%d player-matches)" % len(wanted), file=sys.stderr)
     item_rows = query_items(wanted) if wanted else []
 
@@ -498,31 +502,36 @@ def main():
               % len(skipped_abilities), file=sys.stderr)
 
     builds = defaultdict(int)
+    builds_rg = defaultdict(int)
     holds = defaultdict(lambda: defaultdict(int))
     souls = defaultdict(lambda: defaultdict(int))
 
     for (hid, _m, _a), purchases in per_build.items():
+        rg = build_region.get((_m, _a), "")
         builds[hid] += 1
+        builds_rg[(hid, rg)] += 1
         for snap, held in snapshot_holdings(purchases, component_of).items():
             for iid in held:
-                holds[(hid, snap)][iid] += 1
+                holds[(hid, rg, snap)][iid] += 1
                 meta = items.get(iid)
                 if meta and meta["cat"] and meta["cost"]:
                     souls[(hid, snap)][meta["cat"]] += meta["cost"]
 
     freq = []
-    for (hid, snap), counter in holds.items():
-        n = builds[hid] or 1
+    for (hid, rg, snap), counter in holds.items():
+        n = builds_rg[(hid, rg)] or 1
         for iid, c in counter.items():
             if c < 2:                      # exclude single-instance items
                 continue
             m = items.get(iid, {})
-            freq.append({"hero_id": hid, "hero": heroes.get(hid, ""), "snapshot": snap,
+            freq.append({"hero_id": hid, "hero": heroes.get(hid, ""), "region": rg,
+                         "snapshot": snap,
                          "item_id": iid, "item": m.get("name", "item_%d" % iid),
                          "category": m.get("cat") or "?", "tier": m.get("tier"),
                          "icon_url": m.get("icon", ""),
                          "count": c, "of_builds": n})
-    freq.sort(key=lambda d: (d["hero"], SNAPSHOT_ORDER.index(d["snapshot"]), -d["count"]))
+    freq.sort(key=lambda d: (d["hero"], d["region"],
+                             SNAPSHOT_ORDER.index(d["snapshot"]), -d["count"]))
 
     splits = []
     for (hid, snap), cats in souls.items():
@@ -602,7 +611,7 @@ def main():
            "offhero_games", "offhero_wins", "hero_matches", "best_rn",
            "last_match_id", "last_played", "ambiguous"])
     write("item_frequency.csv", freq,
-          ["hero_id", "hero", "snapshot", "item_id", "item", "category", "tier",
+          ["hero_id", "hero", "region", "snapshot", "item_id", "item", "category", "tier",
            "count", "of_builds", "icon_url"])
     write("hero_splits.csv", splits,
           ["hero_id", "hero", "snapshot", "split", "weak", "V_pct", "G_pct", "S_pct"])
