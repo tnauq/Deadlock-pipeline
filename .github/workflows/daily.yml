@@ -38,13 +38,13 @@ jobs:
       - name: Build site data
         run: python3 build_site_data.py
 
-      # TEMPORARY — diagnosing the leaderboard response shape. ceiling_rank.py
-      # returned ten heroes tied at position 1, so an assumption in it is wrong.
-      # This only prints to the log; it writes nothing.
+      # TEMPORARY — ceiling ranking. Position comes from list order, not the
+      # 'rank' field (which carries ties), and a match needs both the display
+      # name and the account id to agree.
       # continue-on-error so a failure here can't block the data refresh.
       - name: Ceiling ranking (experiment)
         continue-on-error: true
-        run: python3 diagnose_board.py
+        run: python3 ceiling_rank.py
 
       # Only docs/ is committed. output/ holds candidates.csv and excluded.csv,
       # which carry Steam account IDs and display names — those stay off the repo.
