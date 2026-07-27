@@ -26,13 +26,6 @@ BASE = "https://api.deadlock-api.com"
 REGIONS = ["NAmerica", "Europe"]      # enum values match candidates.csv exactly
 OUT_DIR = "output"
 
-# How to compare a position in one region against a position in another.
-#   "percentile" — position / region_depth. Neutral, but assumes the two
-#                  ladders are equally deep in talent, not just in headcount.
-#   "raw"        — compare positions directly, then TIEBREAK_REGION wins ties.
-CROSS_REGION = os.environ.get("CROSS_REGION") or "percentile"
-TIEBREAK_REGION = os.environ.get("TIEBREAK_REGION") or "Europe"
-
 # Accept only name+id confirmed matches. Set STRICT=0 to also allow entries
 # whose name is unique on the board but whose candidate id list omits our id.
 STRICT = (os.environ.get("STRICT") or "1") != "0"
@@ -117,61 +110,84 @@ def main():
     print("[2/2] locating pool members", file=sys.stderr)
     by_hero = defaultdict(list)
     tally = defaultdict(int)
+    hits = []
     for row in cands:
         if row["region"] not in boards:
             continue
         rec, how = locate(row, boards)
         tally[how] += 1
         if rec and not (STRICT and how == "name_only"):
-            by_hero[row["hero"]].append((row, rec, how))
+            hits.append((row, rec, how))
+
+    # One board entry is one player. Two pool accounts sharing a display name
+    # can both confirm against the same entry, because that entry's candidate
+    # list holds both ids — which made one name the ceiling for two heroes.
+    # Neither claim can be preferred, so drop both.
+    claimed = defaultdict(list)
+    for row, rec, how in hits:
+        claimed[(row["region"], rec["pos"])].append(row)
+    contested = {k for k, v in claimed.items()
+                 if len({r["account_id"] for r in v}) > 1}
+    for row, rec, how in hits:
+        if (row["region"], rec["pos"]) in contested:
+            tally["contested_entry"] += 1
+            continue
+        by_hero[row["hero"]].append((row, rec, how))
+    if contested:
+        print("  [match] dropped %d entries claimed by more than one pool account"
+              % len(contested), file=sys.stderr)
     print("  [match] " + "  ".join("%s=%d" % kv for kv in sorted(tally.items())),
           file=sys.stderr)
     if STRICT:
         print("  [match] strict mode: name_only matches excluded", file=sys.stderr)
 
-    def key(pair):
-        """Lower is better. This is the whole cross-region decision."""
-        row, rec, _ = pair
-        if CROSS_REGION == "percentile":
-            return (rec["pos"] / max(depth[row["region"]], 1), 0)
-        # raw positions, with the tiebreak region winning exact ties
-        return (rec["pos"], 0 if row["region"] == TIEBREAK_REGION else 1)
+    # Each region is ranked against its own board. Nothing is compared across
+    # regions, so there is no percentile normalisation and no tiebreak convention.
+    per_region = defaultdict(list)
+    for hero, pairs in by_hero.items():
+        best = defaultdict(list)
+        for row, rec, how in pairs:
+            best[row["region"]].append((row, rec, how))
+        for rg, lst in best.items():
+            lst.sort(key=lambda p: p[1]["pos"])
+            row, rec, how = lst[0]
+            t = tier.get(hero, {})
+            hid = int(t.get("hero_id") or row["hero_id"])
+            per_region[rg].append({
+                "hero": hero,
+                "hero_id": hid,
+                "region": rg,
+                "ceiling_player": rec["name"] or row["account_name"],
+                "global_pos": rec["pos"],
+                "region_depth": depth[rg],
+                "pct": round(100.0 * rec["pos"] / max(depth[rg], 1), 3),
+                "badge_level": rec["badge"],
+                "hero_ladder_pos": row["ladder_pos"],
+                "mmr": row["mmr"],
+                "match": how,
+                # Valve's own view of what this account mains — a sanity check
+                # on the one-trick assignment, not used in the ordering
+                "valve_top_hero": "YES" if hid in (rec["top_heroes"] or []) else "",
+                "pool_located": len(lst),
+                "winrate_rank": t.get("rank", ""),
+                "elite_winrate": t.get("elite_winrate", ""),
+            })
 
     out = []
-    for hero, pairs in by_hero.items():
-        pairs.sort(key=key)
-        row, rec, how = pairs[0]
-        t = tier.get(hero, {})
-        hid = int(t.get("hero_id") or row["hero_id"])
-        out.append({
-            "hero": hero,
-            "hero_id": hid,
-            "ceiling_player": rec["name"] or row["account_name"],
-            "region": row["region"],
-            "global_pos": rec["pos"],
-            "region_depth": depth[row["region"]],
-            "pct": round(100.0 * rec["pos"] / max(depth[row["region"]], 1), 3),
-            "badge_level": rec["badge"],
-            "hero_ladder_pos": row["ladder_pos"],
-            "mmr": row["mmr"],
-            # Valve's own view of what this account mains — a free sanity check
-            # on the one-trick assignment, not used in the ordering
-            "match": how,
-            "valve_top_hero": "YES" if hid in (rec["top_heroes"] or []) else "",
-            "pool_located": len(pairs),
-            "winrate_rank": t.get("rank", ""),
-            "elite_winrate": t.get("elite_winrate", ""),
-        })
+    for rg in REGIONS:
+        rows = sorted(per_region.get(rg, []), key=lambda d: d["global_pos"])
+        for i, d in enumerate(rows, 1):
+            d["ceiling_rank"] = i
+        out.extend(rows)
 
-    out.sort(key=lambda d: d["pct"] if CROSS_REGION == "percentile" else d["global_pos"])
-    for i, d in enumerate(out, 1):
-        d["ceiling_rank"] = i
+    for region in REGIONS:
+        have = {d["hero"] for d in out if d["region"] == region}
+        gap = sorted(set(tier) - have)
+        if gap:
+            print("  [warn] %s: no located pool member for %d heroes: %s"
+                  % (region, len(gap), ", ".join(gap)), file=sys.stderr)
 
-    missing = sorted(set(tier) - {d["hero"] for d in out})
-    if missing:
-        print("  [warn] no located pool member for: %s" % ", ".join(missing), file=sys.stderr)
-
-    cols = ["ceiling_rank", "hero", "hero_id", "ceiling_player", "region", "global_pos",
+    cols = ["region", "ceiling_rank", "hero", "hero_id", "ceiling_player", "global_pos",
             "region_depth", "pct", "badge_level", "hero_ladder_pos", "mmr", "match",
             "valve_top_hero", "pool_located", "winrate_rank", "elite_winrate"]
     path = os.path.join(OUT_DIR, "ceiling.csv")
@@ -179,17 +195,20 @@ def main():
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         w.writerows(out)
-    print("  -> %s (%d heroes, cross_region=%s)" % (path, len(out), CROSS_REGION),
-          file=sys.stderr)
+    print("  -> %s (%d hero-region rows)" % (path, len(out)), file=sys.stderr)
 
-    print("\n  %-4s %-12s %-16s %-8s %6s %7s %-10s %s" %
-          ("#", "hero", "ceiling player", "region", "pos", "pct", "match", "wr#"),
-          file=sys.stderr)
-    for d in out[:15]:
-        print("  %-4d %-12s %-16s %-8s %6d %6.2f%% %-10s %s" %
-              (d["ceiling_rank"], d["hero"][:12], (d["ceiling_player"] or "?")[:16],
-               d["region"][:8], d["global_pos"], d["pct"], d["match"], d["winrate_rank"]),
-              file=sys.stderr)
+    for region in REGIONS:
+        rows = [d for d in out if d["region"] == region][:10]
+        if not rows:
+            continue
+        print("\n  %s — top 10 by ceiling (%d heroes ranked)"
+              % (region, sum(1 for d in out if d["region"] == region)), file=sys.stderr)
+        print("  %-4s %-12s %-16s %6s %-10s %s" %
+              ("#", "hero", "ceiling player", "pos", "match", "wr#"), file=sys.stderr)
+        for d in rows:
+            print("  %-4d %-12s %-16s %6d %-10s %s" %
+                  (d["ceiling_rank"], d["hero"][:12], (d["ceiling_player"] or "?")[:16],
+                   d["global_pos"], d["match"], d["winrate_rank"]), file=sys.stderr)
     dup = defaultdict(list)
     for d in out:
         dup[(d["ceiling_player"], d["region"])].append(d["hero"])
