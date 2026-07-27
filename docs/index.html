@@ -37,6 +37,15 @@ header{padding:22px 0 18px}
 h1{font-size:clamp(24px,7vw,38px);letter-spacing:.04em;margin-top:4px}
 .sub{color:var(--dim);font-size:13px;margin-top:6px}
 .sub b{color:var(--text);font-weight:600}
+.regions{display:inline-flex;gap:2px;margin-top:14px;padding:2px;
+  background:var(--panel);border:1px solid var(--frame);border-radius:99px}
+.regions button{
+  min-width:62px;padding:6px 16px;border:0;border-radius:99px;cursor:pointer;
+  background:transparent;color:var(--dim);
+  font:700 12px/1 var(--sans);letter-spacing:.12em;
+}
+.regions button[aria-pressed=true]{background:var(--frame);color:var(--text)}
+.regions button:focus-visible{outline:2px solid var(--text);outline-offset:2px}
 
 /* ---------- tier list ---------- */
 .tier-row{
@@ -145,6 +154,12 @@ footer{margin-top:32px;padding-top:14px;border-top:1px solid var(--frame);
 .credit a:hover{color:var(--text)}
 footer a{color:var(--dim)}
 .loading{color:var(--dim);padding:40px 0}
+.empty-state{
+  display:grid;place-items:center;text-align:center;min-height:190px;
+  margin-top:24px;padding:32px 20px;border-radius:12px;
+  border:1px dashed var(--frame);color:var(--dim);font-size:13.5px;max-width:34ch;
+  margin-left:auto;margin-right:auto;line-height:1.6;
+}
 @media (min-width:760px){
   body{padding-left:max(28px,env(safe-area-inset-left));padding-right:28px}
   .cols{gap:10px;max-width:760px}
@@ -166,6 +181,7 @@ footer a{color:var(--dim)}
   <div class="eyebrow">Deadlock</div>
   <h1>Tier List</h1>
   <p class="sub" id="sub">Loading…</p>
+  <div class="regions" id="regions" role="group" aria-label="Region"></div>
 </header>
 
 <main>
@@ -196,10 +212,11 @@ footer a{color:var(--dim)}
 
 <script>
 const SNAP_CAP = 12;
-let DATA = null, current = null;
+let DATA = null, current = null, region = null;
 const expanded = new Set();
 
 const el = (t, cls) => { const n = document.createElement(t); if (cls) n.className = cls; return n; };
+const R = () => DATA.regions[region];
 
 // Try in order: icons inlined into this file (preview build only), the
 // self-hosted docs/icons copy, then the asset bucket.
@@ -219,6 +236,7 @@ function icon(ref, alt){
   if (ref[0] && INLINE && INLINE[ref[0]]) chain.push(INLINE[ref[0]]);
   if (ref[0]) chain.push('icons/' + ref[0]);
   chain.push(ref[1]);
+
   let step = 0, timer = null, done = false;
   const give_up = () => {
     if (done) return;
@@ -239,33 +257,56 @@ function icon(ref, alt){
     done = true; clearTimeout(timer);
     iconStats.ok += 1; updateStamp();
   });
-  img.src = chain[0];              // set last, so the handlers are already bound
+  img.src = chain[0];
   timer = setTimeout(advance, 6000);
   wrap.appendChild(img);
   return wrap;
+}
+
+function renderRegions(){
+  const root = document.getElementById('regions');
+  root.replaceChildren();
+  for (const rg of DATA.region_order){
+    const b = el('button');
+    b.type = 'button';
+    b.textContent = DATA.regions[rg].label;
+    b.setAttribute('aria-pressed', String(rg === region));
+    b.onclick = () => {
+      if (rg === region) return;
+      region = rg;
+      current = null;
+      expanded.clear();
+      renderRegions();
+      renderTiers();
+      renderDetail();
+    };
+    root.appendChild(b);
+  }
 }
 
 function renderTiers(){
   const root = document.getElementById('tiers');
   root.className = '';
   root.replaceChildren();
-  for (const [name] of DATA.bands){
-    const members = DATA.heroes.filter(h => h.tier === name);
+  const order = R().order;
+  for (const name of DATA.tiers){
+    const members = order.filter(o => o.tier === name);
     if (!members.length) continue;
     const row = el('div','tier-row');
     const chip = el('div','tier-chip');
     chip.dataset.t = name; chip.textContent = name;
     chip.setAttribute('aria-label', 'Tier ' + name);
     const strip = el('div','strip');
-    for (const h of members){
+    for (const o of members){
+      const h = DATA.heroes[o.slug];
       const b = el('button','hero');
       b.type = 'button';
-      b.dataset.slug = h.slug;
-      b.setAttribute('aria-pressed','false');
+      b.dataset.slug = o.slug;
+      b.setAttribute('aria-pressed', String(o.slug === current));
       b.appendChild(icon(h.icon, h.name));
       const nm = el('div','nm'); nm.textContent = h.name;
       b.appendChild(nm);
-      b.onclick = () => select(h.slug);
+      b.onclick = () => select(o.slug);
       strip.appendChild(b);
     }
     row.append(chip, strip);
@@ -274,60 +315,62 @@ function renderTiers(){
 }
 
 function select(slug){
-  const h = DATA.heroes.find(x => x.slug === slug);
-  if (!h) return;
   current = slug;
   expanded.clear();
   for (const b of document.querySelectorAll('.hero'))
     b.setAttribute('aria-pressed', String(b.dataset.slug === slug));
-  try { history.replaceState(null, '', '#' + slug); }
+  try { history.replaceState(null, '', '#' + region + '/' + slug); }
   catch (e) { /* file:// has a null origin and rejects replaceState */ }
-  renderDetail(h);
+  renderDetail();
 }
 
-function renderDetail(h){
+function renderDetail(){
   const d = document.getElementById('detail');
   d.hidden = false;
   d.replaceChildren();
 
+  const entry = current && R().order.find(o => o.slug === current);
+  if (!entry){
+    const box = el('div','empty-state');
+    box.textContent = 'Click a hero in the tier list to see what the top players are building';
+    d.appendChild(box);
+    return;
+  }
+
+  const h = DATA.heroes[entry.slug];
   const head = el('div','hero-head');
   head.appendChild(icon(h.icon, h.name));
   const meta = el('div');
   const h2 = el('h2'); h2.textContent = h.name;
   const badges = el('div','badges');
-  const t = el('span','badge tier'); t.dataset.t = h.tier;
-  t.textContent = h.tier + ' · ' + h.winrate.toFixed(1) + '%';
+  const t = el('span','badge tier'); t.dataset.t = entry.tier;
+  t.textContent = entry.tier;
   badges.appendChild(t);
+  const rg = el('span','badge'); rg.textContent = R().label;
+  badges.appendChild(rg);
   meta.append(h2, badges);
   head.appendChild(meta);
   d.appendChild(head);
 
-  if (h.thin){
-    const n = el('div','note');
-    n.textContent = 'Thin sample: ' + h.of_builds + ' builds instead of 20. '
-      + 'Counts here move more from one player than they do for other heroes.';
-    d.appendChild(n);
-  }
-
   const lab = el('div','section-label');
-  lab.textContent = 'Items held by net worth';
+  lab.textContent = 'Items held by net worth · of ' + entry.of_builds + ' builds';
   d.appendChild(lab);
 
   const cols = el('div','cols');
-  const builds = DATA.builds[h.slug] || {};
-  for (const snap of DATA.snapshots) cols.appendChild(renderCol(snap, builds[snap] || [], h));
+  const builds = R().builds[entry.slug] || {};
+  for (const snap of DATA.snapshots)
+    cols.appendChild(renderCol(snap, builds[snap] || [], entry));
   d.appendChild(cols);
-
 }
 
-function renderCol(snap, all, hero){
+function renderCol(snap, all, entry){
   const list = all.filter(p => p[0] >= 2);
   const col = el('div','col');
   const h3 = el('h3'); h3.textContent = snap;
   const rule = el('div','rule');
   col.append(h3, rule);
 
-  if (!list.length){ const e = el('div','empty'); e.textContent = 'No shared items.'; col.appendChild(e); return col; }
+  if (!list.length){ const e = el('div','empty'); e.textContent = '—'; col.appendChild(e); return col; }
 
   const open = expanded.has(snap);
   const shown = open ? list : list.slice(0, SNAP_CAP);
@@ -336,19 +379,20 @@ function renderCol(snap, all, hero){
     const it = DATA.items[id] || {name:'item ' + id, cat:'?', icon:['','']};
     const tile = el('div','tile');
     tile.dataset.c = it.cat;
-    tile.title = it.name + ' — ' + count + ' of ' + hero.of_builds;
+    tile.title = it.name + ' — ' + count + ' of ' + entry.of_builds;
     const n = el('span','n num'); n.textContent = count;
     tile.append(icon(it.icon, it.name), n);
     grid.appendChild(tile);
   }
   col.appendChild(grid);
+
   if (list.length > SNAP_CAP){
     const b = el('button','more');
     b.type = 'button';
-    b.textContent = open ? '−' : '+' + (list.length - SNAP_CAP);
+    b.textContent = open ? '\u2212' : '+' + (list.length - SNAP_CAP);
     b.onclick = () => {
       open ? expanded.delete(snap) : expanded.add(snap);
-      renderDetail(hero);
+      renderDetail();
     };
     col.appendChild(b);
   }
@@ -359,19 +403,23 @@ function updateStamp(){
   if (!DATA) return;
   const bad = iconStats.fail ? ' · ' + iconStats.fail + ' icons failed to load' : '';
   document.getElementById('stamp').textContent =
-    'Updated ' + DATA.generated_at.replace('T',' ').replace('Z',' UTC')
-    + ' · ' + DATA.heroes.length + ' heroes' + bad;
+    'Updated ' + DATA.generated_at.replace('T',' ').replace('Z',' UTC') + bad;
 }
 
 function boot(data){
   DATA = data;
-  const day = data.generated_at.slice(0,10);
-  document.getElementById('sub').innerHTML =
-    'peak potential · <b>NA + EU</b> · ' + day;
+  region = data.region_order[0];
+  const want = decodeURIComponent(location.hash.slice(1)).split('/');
+  if (want.length === 2 && data.regions[want[0]]){
+    region = want[0];
+    if (data.heroes[want[1]]) current = want[1];
+  }
+  document.getElementById('sub').textContent =
+    'peak potential · ' + data.generated_at.slice(0,10);
   updateStamp();
+  renderRegions();
   renderTiers();
-  const want = decodeURIComponent(location.hash.slice(1));
-  select(data.heroes.find(h => h.slug === want) ? want : data.heroes[0].slug);
+  renderDetail();
 }
 
 if (window.__DATA__) {
