@@ -33,6 +33,10 @@ OUT_DIR = "output"
 CROSS_REGION = os.environ.get("CROSS_REGION") or "percentile"
 TIEBREAK_REGION = os.environ.get("TIEBREAK_REGION") or "Europe"
 
+# Accept only name+id confirmed matches. Set STRICT=0 to also allow entries
+# whose name is unique on the board but whose candidate id list omits our id.
+STRICT = (os.environ.get("STRICT") or "1") != "0"
+
 
 def get(url):
     req = urllib.request.Request(url, headers={"User-Agent": "deadlock-ceiling/1.0"})
@@ -41,55 +45,63 @@ def get(url):
 
 
 def fetch_board(region):
-    """Return (by_account_id, by_name, depth) for one region's cross-hero board."""
+    """Return (entries_by_name, depth) for one region's cross-hero board.
+
+    Position is the LIST INDEX, not the 'rank' field. Measured on the live
+    board: 1001 entries carry only 634 distinct 'rank' values, and rank 1 is
+    shared by 14 players, but the list is monotonic in rank — so list order is
+    the real ordering and 'rank' is a tied/rounded label.
+    """
     data = get("%s/v1/leaderboard/%s" % (BASE, region))
     entries = data.get("entries") if isinstance(data, dict) else data
     if not entries:
         raise SystemExit("no entries for %s; response keys: %s"
                          % (region, list(data)[:8] if isinstance(data, dict) else type(data)))
 
-    by_id, by_name = {}, defaultdict(list)
+    by_name = defaultdict(list)
     for i, e in enumerate(entries):
-        # 'rank' is the board position; fall back to order if it's ever null
-        pos = e.get("rank")
-        pos = int(pos) if pos else i + 1
-        rec = {
-            "pos": pos,
-            "name": e.get("account_name"),
+        name = e.get("account_name")
+        if not name:
+            continue
+        by_name[name].append({
+            "pos": i + 1,
+            "name": name,
             "badge": e.get("badge_level"),
             "ranked_rank": e.get("ranked_rank"),
             "top_heroes": e.get("top_hero_ids") or [],
-        }
-        for aid in (e.get("possible_account_ids") or []):
-            # a lower position wins if an id somehow appears twice
-            if aid and (aid not in by_id or pos < by_id[aid]["pos"]):
-                by_id[int(aid)] = rec
-        if rec["name"]:
-            by_name[rec["name"]].append(rec)
+            "ids": {int(a) for a in (e.get("possible_account_ids") or []) if a},
+        })
 
-    print("  [board] %-9s %d entries, depth %d"
-          % (region, len(entries), max(r["pos"] for r in by_id.values()) if by_id else 0),
+    print("  [board] %-9s %d entries, %d named, depth %d"
+          % (region, len(entries), sum(len(v) for v in by_name.values()), len(entries)),
           file=sys.stderr)
-    return by_id, by_name, len(entries)
+    return by_name, len(entries)
 
 
 def locate(row, boards):
     """Find a pool member on their region's cross-hero board.
 
-    Exact = the account id the pipeline resolved appears in that entry's
-    possible_account_ids. Name-only matches are returned but flagged, and a
-    name matching several entries is refused rather than guessed.
+    possible_account_ids is a CANDIDATE list, not an identity — the 1001 NA
+    entries between them reference ~34,700 distinct ids, and one name can carry
+    30+. Matching on it alone put the wrong player in 110 of 371 slots. So an
+    accepted match needs BOTH the display name and the id to agree.
     """
-    by_id, by_name, _ = boards[row["region"]]
+    by_name, _ = boards[row["region"]]
     aid = int(row["account_id"])
-    if aid in by_id:
-        return by_id[aid], "exact"
-    hits = by_name.get(row["account_name"] or "", [])
-    if len(hits) == 1:
-        return hits[0], "name"
-    if len(hits) > 1:
-        return None, "ambiguous_name"
-    return None, "absent"
+    named = by_name.get(row["account_name"] or "", [])
+    if not named:
+        return None, "name_absent"
+
+    confirmed = [r for r in named if aid in r["ids"]]
+    if len(confirmed) == 1:
+        return confirmed[0], "confirmed"
+    if len(confirmed) > 1:
+        # same name, several entries, all listing this id — cannot separate them
+        return None, "ambiguous"
+    if len(named) == 1:
+        # name is unique on the board but the id isn't in its candidate list
+        return named[0], "name_only"
+    return None, "unresolved"
 
 
 def main():
@@ -100,7 +112,7 @@ def main():
     boards = {}
     for region in REGIONS:
         boards[region] = fetch_board(region)
-    depth = {r: boards[r][2] for r in REGIONS}
+    depth = {r: boards[r][1] for r in REGIONS}
 
     print("[2/2] locating pool members", file=sys.stderr)
     by_hero = defaultdict(list)
@@ -110,14 +122,16 @@ def main():
             continue
         rec, how = locate(row, boards)
         tally[how] += 1
-        if rec:
-            by_hero[row["hero"]].append((row, rec))
+        if rec and not (STRICT and how == "name_only"):
+            by_hero[row["hero"]].append((row, rec, how))
     print("  [match] " + "  ".join("%s=%d" % kv for kv in sorted(tally.items())),
           file=sys.stderr)
+    if STRICT:
+        print("  [match] strict mode: name_only matches excluded", file=sys.stderr)
 
     def key(pair):
         """Lower is better. This is the whole cross-region decision."""
-        row, rec = pair
+        row, rec, _ = pair
         if CROSS_REGION == "percentile":
             return (rec["pos"] / max(depth[row["region"]], 1), 0)
         # raw positions, with the tiebreak region winning exact ties
@@ -126,7 +140,7 @@ def main():
     out = []
     for hero, pairs in by_hero.items():
         pairs.sort(key=key)
-        row, rec = pairs[0]
+        row, rec, how = pairs[0]
         t = tier.get(hero, {})
         hid = int(t.get("hero_id") or row["hero_id"])
         out.append({
@@ -142,6 +156,7 @@ def main():
             "mmr": row["mmr"],
             # Valve's own view of what this account mains — a free sanity check
             # on the one-trick assignment, not used in the ordering
+            "match": how,
             "valve_top_hero": "YES" if hid in (rec["top_heroes"] or []) else "",
             "pool_located": len(pairs),
             "winrate_rank": t.get("rank", ""),
@@ -157,7 +172,7 @@ def main():
         print("  [warn] no located pool member for: %s" % ", ".join(missing), file=sys.stderr)
 
     cols = ["ceiling_rank", "hero", "hero_id", "ceiling_player", "region", "global_pos",
-            "region_depth", "pct", "badge_level", "hero_ladder_pos", "mmr",
+            "region_depth", "pct", "badge_level", "hero_ladder_pos", "mmr", "match",
             "valve_top_hero", "pool_located", "winrate_rank", "elite_winrate"]
     path = os.path.join(OUT_DIR, "ceiling.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -167,12 +182,22 @@ def main():
     print("  -> %s (%d heroes, cross_region=%s)" % (path, len(out), CROSS_REGION),
           file=sys.stderr)
 
-    print("\n  %-4s %-12s %-16s %-8s %6s %7s" %
-          ("#", "hero", "ceiling player", "region", "pos", "pct"), file=sys.stderr)
-    for d in out[:12]:
-        print("  %-4d %-12s %-16s %-8s %6d %6.2f%%" %
+    print("\n  %-4s %-12s %-16s %-8s %6s %7s %-10s %s" %
+          ("#", "hero", "ceiling player", "region", "pos", "pct", "match", "wr#"),
+          file=sys.stderr)
+    for d in out[:15]:
+        print("  %-4d %-12s %-16s %-8s %6d %6.2f%% %-10s %s" %
               (d["ceiling_rank"], d["hero"][:12], (d["ceiling_player"] or "?")[:16],
-               d["region"][:8], d["global_pos"], d["pct"]), file=sys.stderr)
+               d["region"][:8], d["global_pos"], d["pct"], d["match"], d["winrate_rank"]),
+              file=sys.stderr)
+    dup = defaultdict(list)
+    for d in out:
+        dup[(d["ceiling_player"], d["region"])].append(d["hero"])
+    shared = {k: v for k, v in dup.items() if len(v) > 1}
+    if shared:
+        print("\n  [warn] one player is the ceiling for several heroes:", file=sys.stderr)
+        for (nm, reg), hs in shared.items():
+            print("    %-16s %-8s %s" % (nm, reg, ", ".join(hs)), file=sys.stderr)
 
 
 if __name__ == "__main__":
