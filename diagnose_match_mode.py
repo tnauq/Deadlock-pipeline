@@ -15,17 +15,33 @@ No CSVs required. A few small SELECTs, not the full pipeline.
 
 import json
 import sys
+import time
 import urllib.parse
 import urllib.request
 
 BASE = "https://api.deadlock-api.com"
+SQL_PAUSE_S = 32   # /v1/sql allows 2 req/min per IP; this run makes 6 calls,
+                   # so budget for ~3 minutes total. The pipeline itself makes
+                   # its first SQL call right after this step, so the pause
+                   # AFTER the last query here matters too, not just between.
+_calls = 0
 
 
-def sql(query):
+def sql(query, label=""):
+    global _calls
+    if _calls:
+        print("  ... waiting %ds (rate limit)" % SQL_PAUSE_S, file=sys.stderr)
+        time.sleep(SQL_PAUSE_S)
+    _calls += 1
     url = BASE + "/v1/sql?format=json&query=" + urllib.parse.quote(query)
     req = urllib.request.Request(url, headers={"User-Agent": "deadlock-diag/1.0"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        rows = json.loads(r.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            rows = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")[:400]
+        print("  [%s] FAILED (%s): %s" % (label, e.code, body), file=sys.stderr)
+        return []
     if isinstance(rows, dict):
         rows = rows.get("data", rows.get("rows", []))
     return rows
@@ -76,6 +92,13 @@ def main():
     print("\n--- is there a badge/rank/mmr-like column that changed? ---")
     for r in sql("SELECT * FROM match_player LIMIT 1"):
         print("  columns:", sorted(r.keys()))
+
+    # This runs right before deadlock_pipeline.py's own first SQL call in the
+    # same job. Leave the shared per-IP quota clear for it rather than passing
+    # the throttle debt forward.
+    print("\n  ... cooldown %ds before handing off to the pipeline" % SQL_PAUSE_S,
+          file=sys.stderr)
+    time.sleep(SQL_PAUSE_S)
 
 
 if __name__ == "__main__":
