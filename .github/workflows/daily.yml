@@ -22,6 +22,16 @@ jobs:
         with:
           python-version: "3.12"
 
+      # TEMPORARY — checking whether the new ranked-mode update changed
+      # match_mode / game_mode on match_player. The pipeline currently filters
+      # on game_mode='Normal' and never touches match_mode (see SCHEMA.md
+      # quirk #1); if the update changed either field's values, that filter
+      # could silently start including or excluding the wrong games.
+      # continue-on-error so a failure here can't block the data refresh.
+      - name: Diagnose match_mode (experiment)
+        continue-on-error: true
+        run: python3 diagnose_match_mode.py
+
       # PER_REGION 20 gives NA and EU their own set of ~20 builds each.
       # LEADERBOARD_DEPTH 100 is the backfill room to find 20 QUALIFYING
       # players per region. Depth costs almost nothing in quality: the
