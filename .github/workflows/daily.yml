@@ -40,11 +40,23 @@ jobs:
       # RECENCY_WINDOW stays at 25 deliberately — 99% of qualifying players
       # played the hero within their last 20 games, so widening it would add
       # almost no volume while letting stale builds in.
+      #
+      # MATCH_MODE=Ranked, set 2026-07-30. Deadlock's ranked mode is new and
+      # thin (~1,080 games total across a 3-day sample vs ~841k Unranked, per
+      # diagnose_match_mode.py) — deliberate choice to run on partial data now
+      # and let the daily cron accumulate real ranked volume over time, rather
+      # than keep pooling ranked into the unranked cohort indefinitely.
+      # EXPECT EARLY RUNS TO BE THIN. build_site_data.py refuses to publish
+      # below MIN_HEROES=30, so if ranked volume is too low for enough heroes
+      # to qualify, the build step fails on purpose and yesterday's data.json
+      # stays live — that's the safety net working, not a bug. Revisit this
+      # setting once hero-region coverage looks like it did under Unranked.
       - name: Run pipeline
         env:
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
           PER_REGION: "20"
           LEADERBOARD_DEPTH: "100"
+          MATCH_MODE: "Ranked"
         run: python3 deadlock_pipeline.py
 
       - name: Fetch any new icons
