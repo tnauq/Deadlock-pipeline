@@ -76,8 +76,14 @@ MIN_OFFHERO_GAMES = _env("MIN_OFFHERO_GAMES", 20)
 # way, since every stat is computed from that account's games ON that hero.
 EXCLUSIVITY = (os.environ.get("EXCLUSIVITY") or "0") == "1"
 
-# Live data has NO rows with match_mode = 'Ranked', so that filter is off by
-# default. Set MATCH_MODE to e.g. Unranked to reinstate one.
+# A ranked mode update shipped ~2026-07-30. Confirmed live and non-trivial:
+# match_mode='Ranked' now returns real rows (924-1,080 over a 3-day sample,
+# vs. ~841k Unranked), and ~97% of those Ranked rows also carry
+# game_mode='Normal' — so the cohort currently pools Ranked and Unranked
+# together at roughly 1,400:1 with no way to tell them apart downstream.
+# Decide deliberately: MATCH_MODE=Unranked excludes ranked games (closest to
+# today's existing cohort), MATCH_MODE=Ranked switches to ranked-only once
+# there's enough volume, and "" (default) keeps pooling both as now.
 MATCH_MODE = os.environ.get("MATCH_MODE") or ""
 GAME_MODE = os.environ.get("GAME_MODE") or "Normal"
 MODE_SQL = ("match_mode = '%s' AND " % MATCH_MODE if MATCH_MODE else "") + \
