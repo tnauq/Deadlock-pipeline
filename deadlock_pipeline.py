@@ -52,7 +52,13 @@ REGIONS = [r.strip() for r in
            (os.environ.get("REGIONS") or "NAmerica,Europe").split(",") if r.strip()]
 
 PER_REGION = _env("PER_REGION", 10)              # qualifying players per region per hero
-LEADERBOARD_DEPTH = _env("LEADERBOARD_DEPTH", 40)  # ladder entries read, for backfill
+LEADERBOARD_DEPTH = _env("LEADERBOARD_DEPTH", 40)  # hard ceiling on entries read per hero-region
+# Adaptive depth (see fetch_ladders): read ~PER_REGION/LADDER_YIELD entries plus
+# a margin, rather than always reading to LEADERBOARD_DEPTH. Measured yield was
+# 1,259 players from 3,674 entries = 34%.
+LADDER_YIELD = float(os.environ.get("LADDER_YIELD") or 0.34)
+LADDER_MARGIN = _env("LADDER_MARGIN", 15)
+LADDER_MIN_READ = _env("LADDER_MIN_READ", 40)
 
 POOL_PER_HERO = _env("POOL_PER_HERO", 500)       # rows SQL returns per hero
 RECENCY_WINDOW = _env("RECENCY_WINDOW", 25)
@@ -94,7 +100,7 @@ MODE_SQL = ("match_mode = '%s' AND " % MATCH_MODE if MATCH_MODE else "") + \
 SNAPSHOTS = [int(x) for x in
              (os.environ.get("SNAPSHOTS") or "4800,9600,14400,20800").split(",")]
 
-MAX_URL = _env("MAX_URL", 8500)   # ~9KB is documented as working (SCHEMA.md); 6000 was overly conservative
+MAX_URL = _env("MAX_URL", 9000)   # ~9KB is documented as working (SCHEMA.md quirk #4)
 SQL_PAUSE_S = _env("SQL_PAUSE_S", 35)
 # Unkeyed /v1/sql allows 2 req/min AND 20 req/hr (SCHEMA.md quirk #5). The
 # hourly cap is the binding one for chunked queries — it is what killed the
@@ -265,7 +271,21 @@ def fetch_ladders(heroes):
                 continue
             entries = payload.get("entries", []) if isinstance(payload, dict) else payload
             rows = []
-            for pos, e in enumerate(entries[:LEADERBOARD_DEPTH], 1):
+            # ADAPTIVE DEPTH. Reading 100 deep everywhere is wasted on boards
+            # that fill easily and useless on boards that are short. Measured
+            # 2026-07-31: every hero with a deep board (Bebop/Haze/Lash/Shiv at
+            # ~100/region) filled its full 20/region, while the starved heroes
+            # (Mirage 22/region, Grey Talon 17) have boards shorter than any
+            # cap. So depth only ever bites heroes that don't need it.
+            #
+            # Yield is ~34% of entries -> qualifying players, so PER_REGION*3
+            # plus a margin is enough to fill the pool. A short board is taken
+            # whole. This keeps the SQL id count flat as ranked grows: at full
+            # saturation a fixed depth of 100 projects to ~30 SQL calls against
+            # the 20/hr unkeyed cap, which would break the run outright.
+            want = min(LEADERBOARD_DEPTH,
+                       max(LADDER_MIN_READ, int(PER_REGION / LADDER_YIELD) + LADDER_MARGIN))
+            for pos, e in enumerate(entries[:want], 1):
                 # NATIVE ORDER IS PRESERVED DELIBERATELY. The API does not return
                 # possible_account_ids sorted numerically (observed: "wander" ->
                 # [17403205, 56217724, 243091796, 1296699245, 884669372, ...]),
