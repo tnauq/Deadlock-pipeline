@@ -7,6 +7,14 @@ Turn the pipeline CSVs into one JSON file the static site reads.
 Reads  ./output/tierlist.csv, ./output/item_frequency.csv, ./output/ceiling.csv
 Writes ./docs/data.json
 
+MERGES BY REGION. The unkeyed API allows 20 SQL requests/hour, and processing
+both regions in one run projects past that as ranked saturates. So runs are
+split — one region each, alternating — and docs/data.json is the persistent
+store: output/ is gitignored and runners are ephemeral, so the previous
+region's CSVs are gone by the time the next run starts. Each run replaces only
+the region it processed and leaves the other block untouched. Set REGIONS to
+control which region a run handles.
+
 Heroes are ordered by CEILING — the ladder position of each hero's strongest
 player, computed per region. Win rate is carried through for reference but is
 not what the ordering or the tiers are built from.
@@ -27,7 +35,9 @@ from math import erf, sqrt
 OUT = "output"
 DOCS = "docs"
 SNAPSHOTS = ["4.8k", "9.6k", "14.4k", "20.8k", "postgame"]
-REGIONS = ["NAmerica", "Europe"]
+REGIONS = [r.strip() for r in
+           (os.environ.get("REGIONS") or "NAmerica,Europe").split(",") if r.strip()]
+ALL_REGIONS = ["NAmerica", "Europe"]   # display order, independent of what this run built
 REGION_LABEL = {"NAmerica": "NA", "Europe": "EU"}
 
 # Tiers are a bell: the normal split into five equal-width z bands, heroes
@@ -148,15 +158,15 @@ def main():
                 s = slug(r["hero"])
                 if s not in heroes:
                     continue
+                # Only what the page renders. Ladder position, percentile and
+                # the ceiling player's display name stay in output/ceiling.csv
+                # and are deliberately NOT published — the site never shows
+                # them, and data.json is served publicly.
                 order.append({
                     "slug": s,
                     "tier": name,
                     "rank": len(order) + 1,
                     "of_builds": of_builds[rg].get(s, 0),
-                    # kept out of the page, useful in the JSON
-                    "pos": int(r["global_pos"]),
-                    "pct": float(r["pct"]),
-                    "player": r["ceiling_player"],
                 })
             i += n
         regions[rg] = {
@@ -168,23 +178,62 @@ def main():
         print("  [%s] %d heroes, tiers %s" % (rg, len(order), dict(zip(TIER_NAMES, sizes))),
               file=sys.stderr)
 
-    data = {
-        "generated_at": datetime.datetime.now(datetime.timezone.utc)
-                                .strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "snapshots": SNAPSHOTS,
-        "tiers": TIER_NAMES,
-        "region_order": REGIONS,
-        "heroes": heroes,
-        "items": meta,
-        "regions": regions,
-    }
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for rg in regions:
+        regions[rg]["generated_at"] = now      # per region: they refresh on different runs
 
     os.makedirs(DOCS, exist_ok=True)
     path = os.path.join(DOCS, "data.json")
+
+    # ---- merge with whatever is already published --------------------------
+    # This run may have built only one region. Carry the other region's block
+    # forward from the existing file rather than dropping it: its CSVs no
+    # longer exist on this runner.
+    prev = {}
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                prev = json.load(f)
+        except Exception as e:
+            print("  [warn] could not read existing %s (%s) — writing fresh" % (path, e),
+                  file=sys.stderr)
+            prev = {}
+
+    merged_regions = dict(prev.get("regions") or {})
+    for rg, block in regions.items():
+        merged_regions[rg] = block
+    carried = [rg for rg in merged_regions if rg not in regions]
+    if carried:
+        for rg in carried:
+            stamp = merged_regions[rg].get("generated_at", "?")
+            print("  [%s] carried forward unchanged (built %s)" % (rg, stamp), file=sys.stderr)
+
+    # heroes/items are shared across regions, so union them rather than
+    # replacing — a region-only run still sees every hero, but this keeps an
+    # icon or item that only the other region's CSVs mentioned.
+    merged_heroes = dict(prev.get("heroes") or {})
+    merged_heroes.update(heroes)
+    merged_items = dict(prev.get("items") or {})
+    merged_items.update(meta)
+
+    # only advertise regions that actually have data
+    order = [rg for rg in ALL_REGIONS if rg in merged_regions]
+
+    data = {
+        "generated_at": now,
+        "snapshots": SNAPSHOTS,
+        "tiers": TIER_NAMES,
+        "region_order": order,
+        "heroes": merged_heroes,
+        "items": merged_items,
+        "regions": merged_regions,
+    }
+
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, separators=(",", ":"), ensure_ascii=False)
-    print("  -> %s (%.0f KB, %d heroes, %d items)"
-          % (path, os.path.getsize(path) / 1024, len(heroes), len(meta)), file=sys.stderr)
+    print("  -> %s (%.0f KB, %d heroes, %d items, regions %s)"
+          % (path, os.path.getsize(path) / 1024, len(merged_heroes), len(merged_items),
+             ", ".join(order)), file=sys.stderr)
 
 
 if __name__ == "__main__":
