@@ -71,6 +71,7 @@ LEADERBOARD_DEPTH = _env("LEADERBOARD_DEPTH", 40)  # ladder entries read, for ba
 # fixed value again once ranked has re-stratified and this isn't needed.
 SQL_BADGE_FLOOR = _env("SQL_BADGE_FLOOR", 0)
 AUTO_FLOOR_MARGIN = _env("AUTO_FLOOR_MARGIN", 6)  # subranks below the observed top
+AUTO_FLOOR_MIN_TOP = _env("AUTO_FLOOR_MIN_TOP", 20)  # refuse auto if top < this (see _auto_floor)
 
 POOL_PER_HERO = _env("POOL_PER_HERO", 500)       # rows SQL returns per hero
 RECENCY_WINDOW = _env("RECENCY_WINDOW", 25)
@@ -448,6 +449,26 @@ def _auto_floor():
         raise SystemExit("AUTO badge floor: no ranked games in the lookback window "
                          "to measure a top badge from. Set SQL_BADGE_FLOOR explicitly "
                          "or widen LOOKBACK_DAYS.")
+    # Observed 2026-07-31: average_badge_team0/1 went to a populated-but-zero
+    # state across the ENTIRE ranked dataset for roughly an hour (real values
+    # at 10:30 UTC, all zero by 11:51 UTC, same query shape) — a live upstream
+    # issue, not a null/missing-data gap this pipeline can distinguish from
+    # "badge is genuinely just very low right now" by itself. If top comes
+    # back at or near zero, the honest move is to fail loudly rather than set
+    # floor=max(top-margin,0)=0 and silently admit every account with no skill
+    # filter at all — that would "succeed" while publishing a meaningless
+    # cohort. AUTO_FLOOR_MIN_TOP is deliberately far below any real rank
+    # (Initiate is ~10s) so it only trips on this kind of data failure.
+    if top < AUTO_FLOOR_MIN_TOP:
+        raise SystemExit("AUTO badge floor: observed top badge is %d, which is not a "
+                         "plausible rank value (floor guard is %d). This most likely means "
+                         "average_badge_team0/team1 are broken upstream right now, not that "
+                         "the population is actually this low. Refusing to set a near-zero "
+                         "floor, which would admit every account with no skill filter. Not "
+                         "writing CSVs — leaving yesterday's output/data.json in place. "
+                         "Re-run once badge data looks sane, or override with "
+                         "SQL_BADGE_FLOOR set explicitly if you're confident this is real."
+                         % (top, AUTO_FLOOR_MIN_TOP))
     floor = max(top - AUTO_FLOOR_MARGIN, 0)
     print("  [badge] top observed %d, floor set to %d (margin %d)"
           % (top, floor, AUTO_FLOOR_MARGIN), file=sys.stderr)
