@@ -33,7 +33,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 BASE = "https://api.deadlock-api.com"
 API_KEY = os.environ.get("DEADLOCK_API_KEY")
@@ -56,6 +56,8 @@ LEADERBOARD_DEPTH = _env("LEADERBOARD_DEPTH", 40)  # ladder entries read, for ba
 
 POOL_PER_HERO = _env("POOL_PER_HERO", 500)       # rows SQL returns per hero
 RECENCY_WINDOW = _env("RECENCY_WINDOW", 25)
+MAX_IDS_PER_ENTRY = _env("MAX_IDS_PER_ENTRY", 5)  # see fetch_ladders — caps the
+                                                   # SQL candidate-id explosion
 MIN_HERO_MATCHES = _env("MIN_HERO_MATCHES", 1)
 LOOKBACK_DAYS = _env("LOOKBACK_DAYS", 90)
 EMA_WINDOW = _env("EMA_WINDOW", 50)
@@ -92,7 +94,7 @@ MODE_SQL = ("match_mode = '%s' AND " % MATCH_MODE if MATCH_MODE else "") + \
 SNAPSHOTS = [int(x) for x in
              (os.environ.get("SNAPSHOTS") or "4800,9600,14400,20800").split(",")]
 
-MAX_URL = _env("MAX_URL", 6000)                  # encoded-URL ceiling; Cloudflare 414s well above
+MAX_URL = _env("MAX_URL", 8500)   # ~9KB is documented as working (SCHEMA.md); 6000 was overly conservative
 SQL_PAUSE_S = _env("SQL_PAUSE_S", 35)
 OUT_DIR = "output"
 
@@ -247,12 +249,32 @@ def fetch_ladders(heroes):
             entries = payload.get("entries", []) if isinstance(payload, dict) else payload
             rows = []
             for pos, e in enumerate(entries[:LEADERBOARD_DEPTH], 1):
+                # NATIVE ORDER IS PRESERVED DELIBERATELY. The API does not return
+                # possible_account_ids sorted numerically (observed: "wander" ->
+                # [17403205, 56217724, 243091796, 1296699245, 884669372, ...]),
+                # so the ordering is something the service chose — most likely
+                # best-match-first. Sorting here would discard whatever signal
+                # that carries and keep the numerically smallest ids instead,
+                # which is arbitrary. Truncation therefore keeps the API's own
+                # first N. resolved_idx below measures whether this assumption
+                # actually holds.
+                all_ids = []
+                for a in (e.get("possible_account_ids") or []):
+                    a = int(a)
+                    if a not in all_ids:
+                        all_ids.append(a)
                 rows.append({"hero_id": hid, "region": region, "ladder_pos": pos,
                              "account_name": e.get("account_name", ""),
                              "badge_level": e.get("badge_level")
                                             or e.get("ranked_rank") or 0,
-                             "ids": {int(a) for a in
-                                     (e.get("possible_account_ids") or [])}})
+                             # A minority of names carry very long id lists (218
+                             # of 1001 NA entries averaged 153 ids each) and
+                             # inflated a ~7,600-entry leaderboard into 87,351
+                             # SQL candidates — 470 chunks, 4.5+ hours at the
+                             # rate limit (2026-07-31). Most entries have 1-2.
+                             "ids_ordered": all_ids[:MAX_IDS_PER_ENTRY],
+                             "ids": set(all_ids[:MAX_IDS_PER_ENTRY]),
+                             "ids_truncated": len(all_ids) > MAX_IDS_PER_ENTRY})
             ladder[(hid, region)] = rows
             total += len(rows)
         print("  [lb] hero %-3d %-22s %d entries" % (hid, heroes[hid][:22], total),
@@ -439,11 +461,20 @@ def main():
              "ON" if EXCLUSIVITY else "OFF"), file=sys.stderr)
     ladder = fetch_ladders(heroes)
     ladder_ids = {a for rows in ladder.values() for r in rows for a in r["ids"]}
-    print("  [lb] %d distinct candidate ids across all entries" % len(ladder_ids),
-          file=sys.stderr)
+    n_truncated = sum(1 for rows in ladder.values() for r in rows if r["ids_truncated"])
+    print("  [lb] %d distinct candidate ids across all entries (%d entries hit the "
+          "%d-id cap)" % (len(ladder_ids), n_truncated, MAX_IDS_PER_ENTRY), file=sys.stderr)
     if not ladder_ids:
         raise SystemExit("No account ids resolved from any leaderboard entry. Not writing "
                          "CSVs — leaving yesterday's output/data.json in place.")
+
+    # ~186 ids fit per chunk at MAX_URL=6000; ~8500 roughly doubles that. Printed
+    # up front because the 2026-07-31 run silently ran for 15 minutes before
+    # hitting a 429 with no way to tell in advance it would take 4+ hours.
+    est_chunk = max(50, MAX_URL // 45)
+    est_chunks = -(-len(ladder_ids) // est_chunk)
+    print("  [lb] ~%d chunks expected, ~%d min at the SQL rate limit"
+          % (est_chunks, est_chunks * 35 // 60), file=sys.stderr)
 
     print("[3/5] candidate pool query (%d ladder-sourced ids)" % len(ladder_ids),
           file=sys.stderr)
@@ -464,6 +495,24 @@ def main():
                       for a in r["ids"] if (a, hid) in stats]
             r["account_id"] = max(scored)[1] if scored else None
             r["ambiguous"] = len(scored) > 1
+            # Which slot in the API's native ordering won? If the API really is
+            # returning best-match-first, this should cluster hard at 0 and
+            # MAX_IDS_PER_ENTRY can drop to 1-2, removing the whole id-explosion
+            # problem. If it's spread evenly, the order carries no signal and
+            # truncating is a genuine accuracy cost that has to be justified
+            # on cost grounds alone.
+            r["resolved_idx"] = (r["ids_ordered"].index(r["account_id"])
+                                 if r["account_id"] in r["ids_ordered"] else None)
+
+    idxs = [r["resolved_idx"] for rows in ladder.values() for r in rows
+            if r.get("resolved_idx") is not None]
+    if idxs:
+        hist = Counter(idxs)
+        print("  [ids] resolved account's slot in the API's native order: %s"
+              % dict(sorted(hist.items())), file=sys.stderr)
+        print("  [ids] %d of %d resolved from slot 0 (%.0f%%)"
+              % (hist.get(0, 0), len(idxs), 100.0 * hist.get(0, 0) / len(idxs)),
+              file=sys.stderr)
 
     played = defaultdict(dict)
     for (hid, _rg), rows in ladder.items():
