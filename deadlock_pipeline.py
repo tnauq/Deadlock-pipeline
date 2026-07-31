@@ -53,7 +53,25 @@ REGIONS = [r.strip() for r in
 
 PER_REGION = _env("PER_REGION", 10)              # qualifying players per region per hero
 LEADERBOARD_DEPTH = _env("LEADERBOARD_DEPTH", 40)  # ladder entries read, for backfill
-SQL_BADGE_FLOOR = _env("SQL_BADGE_FLOOR", 110)   # an account must reach this lobby badge
+
+# An account must reach this lobby badge to enter the pool. SQL_BADGE_FLOOR=0
+# (the default) means AUTO: measure the top badge actually being played in the
+# lookback window and set the floor relative to that, instead of a hardcoded
+# absolute number.
+#
+# Why: badge is tier*10 + subrank (Deadlock Labs' published formula). The old
+# hardcoded 110 sat at Eternus I — the very top of the old distribution. A
+# ranked soft-reset (2026-07-30) dropped everyone's badge at once; the ceiling
+# is currently high Oracle / low Phantom (~83-91), nowhere near 110. That's
+# not gradual drift a fixed number degrades gracefully against — it's a
+# discontinuity, and 110 returned exactly zero candidates because of it.
+# AUTO_FLOOR_MARGIN subtracts from the observed top badge so entry isn't
+# limited to the single top subrank, which would starve the pool the same way
+# right after every future reset. Set SQL_BADGE_FLOOR explicitly to pin a
+# fixed value again once ranked has re-stratified and this isn't needed.
+SQL_BADGE_FLOOR = _env("SQL_BADGE_FLOOR", 0)
+AUTO_FLOOR_MARGIN = _env("AUTO_FLOOR_MARGIN", 6)  # subranks below the observed top
+
 POOL_PER_HERO = _env("POOL_PER_HERO", 500)       # rows SQL returns per hero
 RECENCY_WINDOW = _env("RECENCY_WINDOW", 25)
 MIN_HERO_MATCHES = _env("MIN_HERO_MATCHES", 1)
@@ -273,6 +291,17 @@ def fetch_ladders(heroes):
 # Subtracting gives the off-hero baseline, which is what lets a hero's win rate
 # be separated from the general skill of the players who main it. Both read the
 # same `recent` CTE, so this costs no extra SQL call.
+Q_TOP_BADGE = """
+SELECT max(top_badge) AS top_badge
+FROM (
+    SELECT greatest(average_badge_team0, average_badge_team1) AS top_badge
+    FROM match_player
+    WHERE {mode}start_time >= now() - INTERVAL {lookback} DAY
+      AND average_badge_team0 IS NOT NULL
+      AND average_badge_team1 IS NOT NULL
+)
+"""
+
 Q_POOL = """
 WITH elite AS (
     SELECT DISTINCT account_id
@@ -344,8 +373,8 @@ WHERE match_id IN ({mids}) AND account_id IN ({aids})
 """
 
 
-def query_pool():
-    return sql(Q_POOL.format(lookback=LOOKBACK_DAYS, floor=SQL_BADGE_FLOOR,
+def query_pool(floor):
+    return sql(Q_POOL.format(lookback=LOOKBACK_DAYS, floor=floor,
                              keep=repr(1.0 - EMA_ALPHA), ema=EMA_WINDOW,
                              recency=RECENCY_WINDOW, minhero=MIN_HERO_MATCHES,
                              pool=POOL_PER_HERO, mode=MODE_SQL), "candidate pool")
@@ -412,25 +441,61 @@ def _se(games):
 # --------------------------------------------------------------------------
 
 
+def _auto_floor():
+    rows = sql(Q_TOP_BADGE.format(lookback=LOOKBACK_DAYS, mode=MODE_SQL), "top badge")
+    top = int(rows[0]["top_badge"]) if rows and rows[0].get("top_badge") is not None else None
+    if top is None:
+        raise SystemExit("AUTO badge floor: no ranked games in the lookback window "
+                         "to measure a top badge from. Set SQL_BADGE_FLOOR explicitly "
+                         "or widen LOOKBACK_DAYS.")
+    floor = max(top - AUTO_FLOOR_MARGIN, 0)
+    print("  [badge] top observed %d, floor set to %d (margin %d)"
+          % (top, floor, AUTO_FLOOR_MARGIN), file=sys.stderr)
+    return floor
+
+
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     excluded = []
 
-    print("[1/5] assets", file=sys.stderr)
+    print("[1/6] assets", file=sys.stderr)
     heroes, hero_icon, items, component_of = load_assets()
 
-    print("[2/5] ladders (%s), depth %d, target %d per region, exclusivity %s"
+    print("[2/6] ladders (%s), depth %d, target %d per region, exclusivity %s"
           % (", ".join(REGIONS), LEADERBOARD_DEPTH, PER_REGION,
              "ON" if EXCLUSIVITY else "OFF"), file=sys.stderr)
     ladder = fetch_ladders(heroes)
     n_ids = len({a for rows in ladder.values() for r in rows for a in r["ids"]})
     print("  [lb] %d distinct candidate ids across all entries" % n_ids, file=sys.stderr)
 
-    print("[3/5] candidate pool query (badge floor %d)" % SQL_BADGE_FLOOR, file=sys.stderr)
+    floor = SQL_BADGE_FLOOR
+    if floor <= 0:
+        print("[3/6] detecting badge floor (auto)", file=sys.stderr)
+        floor = _auto_floor()
+    else:
+        print("[3/6] badge floor %d (fixed)" % floor, file=sys.stderr)
+
+    print("[4/6] candidate pool query", file=sys.stderr)
     stats = {}
-    for r in query_pool():
+    for r in query_pool(floor):
         stats[(int(r["account_id"]), int(r["hero_id"]))] = r
+
+    # Contingency: a manually pinned floor can go stale fast right after a
+    # rank reset (this is exactly what happened with SQL_BADGE_FLOOR=110 on
+    # 2026-07-30 — it returned zero rows). Rather than fail outright, fall
+    # back to auto-detecting the floor once and retry before giving up.
+    if not stats and SQL_BADGE_FLOOR > 0:
+        print("  [pool] 0 rows at fixed floor %d — retrying with auto-detected floor"
+              % floor, file=sys.stderr)
+        floor = _auto_floor()
+        for r in query_pool(floor):
+            stats[(int(r["account_id"]), int(r["hero_id"]))] = r
+
     print("  [pool] %d (account,hero) rows" % len(stats), file=sys.stderr)
+    if not stats:
+        raise SystemExit("No candidates even after the auto-floor retry. Ranked volume may "
+                         "be too low right now, or LOOKBACK_DAYS needs widening. Not writing "
+                         "CSVs — leaving yesterday's output/data.json in place.")
 
     # resolve each ladder entry to one account: of the possible ids, keep the one
     # with the most games on THIS hero inside the window
@@ -497,10 +562,10 @@ def main():
     # reported per region rather than pooled
     build_region = {(c["last_match_id"], c["account_id"]): c["region"]
                     for lst in chosen.values() for c in lst}
-    print("[4/5] item query (%d player-matches)" % len(wanted), file=sys.stderr)
+    print("[5/6] item query (%d player-matches)" % len(wanted), file=sys.stderr)
     item_rows = query_items(wanted) if wanted else []
 
-    print("[5/5] aggregating", file=sys.stderr)
+    print("[6/6] aggregating", file=sys.stderr)
     keep = {(m, a) for m, a in wanted}
     per_build, skipped_abilities = defaultdict(list), set()
     for r in item_rows:
