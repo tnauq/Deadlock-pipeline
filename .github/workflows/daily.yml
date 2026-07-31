@@ -2,7 +2,8 @@ name: Daily refresh
 
 on:
   schedule:
-    - cron: "0 8 * * *"     # 08:00 UTC daily
+    - cron: "0 */4 * * *"   # every 4 hours, on the hour (00/04/08/12/16/20 UTC)
+                            # was daily; raised while ranked mode saturates
   workflow_dispatch:
 
 permissions:
@@ -21,16 +22,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      # TEMPORARY — checking whether the new ranked-mode update changed
-      # match_mode / game_mode on match_player. The pipeline currently filters
-      # on game_mode='Normal' and never touches match_mode (see SCHEMA.md
-      # quirk #1); if the update changed either field's values, that filter
-      # could silently start including or excluding the wrong games.
-      # continue-on-error so a failure here can't block the data refresh.
-      - name: Diagnose match_mode (experiment)
-        continue-on-error: true
-        run: python3 diagnose_match_mode.py
 
       # PER_REGION 20 gives NA and EU their own set of ~20 builds each.
       # LEADERBOARD_DEPTH 100 is the backfill room to find 20 QUALIFYING
