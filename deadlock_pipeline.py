@@ -56,7 +56,7 @@ LEADERBOARD_DEPTH = _env("LEADERBOARD_DEPTH", 40)  # ladder entries read, for ba
 
 POOL_PER_HERO = _env("POOL_PER_HERO", 500)       # rows SQL returns per hero
 RECENCY_WINDOW = _env("RECENCY_WINDOW", 25)
-MAX_IDS_PER_ENTRY = _env("MAX_IDS_PER_ENTRY", 5)  # see fetch_ladders — caps the
+MAX_IDS_PER_ENTRY = _env("MAX_IDS_PER_ENTRY", 2)  # see fetch_ladders — caps the
                                                    # SQL candidate-id explosion
 MIN_HERO_MATCHES = _env("MIN_HERO_MATCHES", 1)
 LOOKBACK_DAYS = _env("LOOKBACK_DAYS", 90)
@@ -96,6 +96,10 @@ SNAPSHOTS = [int(x) for x in
 
 MAX_URL = _env("MAX_URL", 8500)   # ~9KB is documented as working (SCHEMA.md); 6000 was overly conservative
 SQL_PAUSE_S = _env("SQL_PAUSE_S", 35)
+# Unkeyed /v1/sql allows 2 req/min AND 20 req/hr (SCHEMA.md quirk #5). The
+# hourly cap is the binding one for chunked queries — it is what killed the
+# 2026-07-31 runs at chunk 21 both times. An X-API-Key raises this.
+HOURLY_SQL_BUDGET = _env("HOURLY_SQL_BUDGET", 20)
 OUT_DIR = "output"
 
 
@@ -121,7 +125,20 @@ def _get(url, tries=3):
                 return json.loads(r.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             if e.code in (429, 500, 502, 503) and attempt < tries - 1:
-                time.sleep(2 ** attempt)
+                wait = 2 ** attempt
+                if e.code == 429:
+                    # The 429 body carries the exact wait, e.g.
+                    # {"error":{"quota":{...},"next_request_in":18}}. The old
+                    # 2**attempt backoff (1s, 2s) was far too short to clear it.
+                    try:
+                        body = json.loads(e.read().decode("utf-8", "replace"))
+                        hint = body.get("error", {}).get("next_request_in")
+                        if hint:
+                            wait = int(hint) + 2
+                    except Exception:
+                        wait = 60
+                    print("  [http] 429, waiting %ds" % wait, file=sys.stderr)
+                time.sleep(wait)
                 continue
             raise
     raise RuntimeError("unreachable")
@@ -373,7 +390,12 @@ WHERE match_id IN ({mids}) AND account_id IN ({aids})
 def query_pool(account_ids):
     """Chunked so no single URL exceeds MAX_URL — same pattern as query_items()."""
     ids = sorted(account_ids)
-    rows, chunk, i = [], max(50, MAX_URL // 8), 0
+    # ~22.7 encoded chars per id measured on real runs; //25 leaves room for the
+    # ~800-char query body. The old //8 guess was 4x too high and self-halved
+    # down to 265 ids/chunk, wasting most of the URL budget and doubling the
+    # chunk count — which matters because the HOURLY cap (20 req/hr unkeyed) is
+    # the real constraint, not the 2/min one.
+    rows, chunk, i = [], max(50, MAX_URL // 25), 0
     while i < len(ids):
         part = ids[i:i + chunk]
         q = Q_POOL.format(lookback=LOOKBACK_DAYS, ids=",".join(str(a) for a in part),
@@ -390,7 +412,10 @@ def query_pool(account_ids):
 
 def query_items(pairs):
     """Chunked so no single URL exceeds MAX_URL."""
-    rows, chunk, i = [], max(20, MAX_URL // 40), 0
+    # ~22 encoded chars per (match_id, account_id) pair; //25 leaves room for
+    # the query body. The old //40 was undersized and cost 3 extra requests —
+    # which matters against the 20 req/HR unkeyed cap, not the 2/min one.
+    rows, chunk, i = [], max(20, MAX_URL // 25), 0
     while i < len(pairs):
         part = pairs[i:i + chunk]
         q = Q_ITEMS.format(mids=",".join(str(m) for m, _ in part),
@@ -471,10 +496,22 @@ def main():
     # ~186 ids fit per chunk at MAX_URL=6000; ~8500 roughly doubles that. Printed
     # up front because the 2026-07-31 run silently ran for 15 minutes before
     # hitting a 429 with no way to tell in advance it would take 4+ hours.
-    est_chunk = max(50, MAX_URL // 45)
+    est_chunk = max(50, MAX_URL // 25)
     est_chunks = -(-len(ladder_ids) // est_chunk)
     print("  [lb] ~%d chunks expected, ~%d min at the SQL rate limit"
-          % (est_chunks, est_chunks * 35 // 60), file=sys.stderr)
+          % (est_chunks, est_chunks * SQL_PAUSE_S // 60), file=sys.stderr)
+    # The unkeyed tier allows 20 SQL requests/HOUR (SCHEMA.md quirk #5). Two runs
+    # on 2026-07-31 died at exactly chunk 21 because of this, not the 2/min rule.
+    # The item query chunks too — budget for the whole run, not just this query.
+    est_items = -(-(TARGET_BUILDS * len(heroes)) // max(20, MAX_URL // 25))
+    est_total = est_chunks + est_items
+    print("  [lb] ~%d pool + ~%d item = ~%d SQL requests this run (hourly cap %d)"
+          % (est_chunks, est_items, est_total, HOURLY_SQL_BUDGET), file=sys.stderr)
+    if not API_KEY and est_total > HOURLY_SQL_BUDGET:
+        print("  [lb] WARNING: ~%d requests exceeds the %d req/hr unkeyed cap and WILL 429 "
+              "partway through. Lower MAX_IDS_PER_ENTRY (currently %d) or set the "
+              "DEADLOCK_API_KEY secret."
+              % (est_total, HOURLY_SQL_BUDGET, MAX_IDS_PER_ENTRY), file=sys.stderr)
 
     print("[3/5] candidate pool query (%d ladder-sourced ids)" % len(ladder_ids),
           file=sys.stderr)
