@@ -96,6 +96,14 @@ def main():
     for e in entries[:3]:
         print(" ", json.dumps(e)[:300])
 
+    # This runs right before deadlock_pipeline.py's own first SQL call in the
+    # same job. Leave the shared per-IP quota clear for it rather than passing
+    # the throttle debt forward — missing this caused a 429 on the very next
+    # step (2026-07-31).
+    print("\n  ... cooldown %ds before handing off to the pipeline" % SQL_PAUSE_S,
+          file=sys.stderr)
+    time.sleep(SQL_PAUSE_S)
+
 
 if __name__ == "__main__":
     main()
