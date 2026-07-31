@@ -23,7 +23,8 @@ import urllib.request
 from collections import defaultdict
 
 BASE = "https://api.deadlock-api.com"
-REGIONS = ["NAmerica", "Europe"]      # enum values match candidates.csv exactly
+REGIONS = [r.strip() for r in
+           (os.environ.get("REGIONS") or "NAmerica,Europe").split(",") if r.strip()]
 OUT_DIR = "output"
 
 # Accept only name+id confirmed matches. Set STRICT=0 to also allow entries
