@@ -400,8 +400,13 @@ function renderCol(snap, all, entry){
 function updateStamp(){
   if (!DATA) return;
   const bad = iconStats.fail ? ' · ' + iconStats.fail + ' icons failed to load' : '';
-  document.getElementById('stamp').textContent =
-    'Updated ' + DATA.generated_at.replace('T',' ').replace('Z',' UTC') + bad;
+  // regions refresh on separate runs, so each carries its own timestamp
+  const parts = DATA.region_order.map(rg => {
+    const b = DATA.regions[rg];
+    const t = (b.generated_at || DATA.generated_at || '').replace('T',' ').replace('Z',' UTC');
+    return b.label + ' ' + t;
+  });
+  document.getElementById('stamp').textContent = 'Updated · ' + parts.join('  ·  ') + bad;
 }
 
 function boot(data){
