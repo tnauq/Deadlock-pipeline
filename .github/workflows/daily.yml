@@ -42,6 +42,15 @@ jobs:
       # to qualify, the build step fails on purpose and yesterday's data.json
       # stays live — that's the safety net working, not a bug. Revisit this
       # setting once hero-region coverage looks like it did under Unranked.
+      # TEMPORARY — mmr and ceiling.csv's badge_level came back constant
+      # (-6.0 / empty) on every row under MATCH_MODE=Ranked, not just thin.
+      # -6.0 is what the mmr formula returns when team_badge resolves to 0,
+      # consistent with `team` no longer being 'Team0'/'Team1' on ranked rows.
+      # continue-on-error so a failure here can't block the data refresh.
+      - name: Diagnose badge gap (experiment)
+        continue-on-error: true
+        run: python3 diagnose_badge_gap.py
+
       # SQL_BADGE_FLOOR pinned to 90 (Phantom I), 2026-07-30. The old fixed
       # 110 sat at Eternus and returned ZERO candidates after the ranked
       # soft-reset dropped everyone's badge — see diagnose_ranked_volume.py.
