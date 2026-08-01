@@ -43,6 +43,8 @@ OUT = "output"
 DOCS_ARCHIVE = os.path.join("docs", "archive")
 RAW_ARCHIVE = "archive"
 INDEX = os.path.join(DOCS_ARCHIVE, "index.json")
+MANIFEST = os.path.join(DOCS_ARCHIVE, "items_manifest.json")   # latest catalogue
+PATCHES = os.path.join(DOCS_ARCHIVE, "patches.json")           # dated change log
 
 REGIONS = [r.strip() for r in
            (os.environ.get("REGIONS") or "NAmerica,Europe").split(",") if r.strip()]
@@ -64,6 +66,86 @@ def slug(name):
     while "__" in s:
         s = s.replace("__", "_")
     return s
+
+
+def track_item_manifest():
+    """Detect and log item catalogue changes, so a patch is visible in the data.
+
+    An item patch adds, removes, renames, recosts and recategorises items. The
+    dangerous case is a REWORK: same item_id, same name, completely different
+    behaviour. A chart spanning the patch would draw one continuous line across
+    two different items. Cost and tier changes are the cheapest available proxy
+    for "this item was touched", so they are logged even though they don't
+    prove a rework on their own.
+
+    Writes the current catalogue and appends any diff to patches.json. Returns
+    a summary dict for the day's snapshot, or None if the manifest is missing.
+    """
+    src = os.path.join(OUT, "items_manifest.json")
+    if not os.path.exists(src):
+        return None
+    try:
+        with open(src, encoding="utf-8") as f:
+            now = json.load(f)
+    except Exception as e:
+        print("  [warn] items_manifest.json unreadable (%s)" % e, file=sys.stderr)
+        return None
+
+    prev = {}
+    if os.path.exists(MANIFEST):
+        try:
+            with open(MANIFEST, encoding="utf-8") as f:
+                prev = json.load(f)
+        except Exception:
+            prev = {}
+
+    today = datetime.date.today().isoformat()
+    diff = {"added": [], "removed": [], "renamed": [],
+            "recategorised": [], "recosted": [], "retiered": []}
+    if prev:
+        for iid in sorted(set(now) - set(prev)):
+            diff["added"].append({"id": iid, "name": now[iid]["name"]})
+        for iid in sorted(set(prev) - set(now)):
+            diff["removed"].append({"id": iid, "name": prev[iid]["name"]})
+        for iid in sorted(set(now) & set(prev)):
+            a, b = prev[iid], now[iid]
+            if a["name"] != b["name"]:
+                diff["renamed"].append({"id": iid, "from": a["name"], "to": b["name"]})
+            if a["cat"] != b["cat"]:
+                diff["recategorised"].append({"id": iid, "name": b["name"],
+                                              "from": a["cat"], "to": b["cat"]})
+            if a["cost"] != b["cost"]:
+                diff["recosted"].append({"id": iid, "name": b["name"],
+                                         "from": a["cost"], "to": b["cost"]})
+            if a["tier"] != b["tier"]:
+                diff["retiered"].append({"id": iid, "name": b["name"],
+                                         "from": a["tier"], "to": b["tier"]})
+
+    changed = sum(len(v) for v in diff.values())
+    if changed:
+        log = {"patches": []}
+        if os.path.exists(PATCHES):
+            try:
+                with open(PATCHES, encoding="utf-8") as f:
+                    log = json.load(f)
+            except Exception:
+                log = {"patches": []}
+        entry = dict(diff)
+        entry["date"] = today
+        entry["total_changes"] = changed
+        entry["item_count"] = len(now)
+        log.setdefault("patches", []).append(entry)
+        log["patches"].sort(key=lambda d: d["date"])
+        with open(PATCHES, "w", encoding="utf-8") as f:
+            json.dump(log, f, separators=(",", ":"), ensure_ascii=False)
+        print("  [items] CATALOGUE CHANGED: %s"
+              % ", ".join("%s %d" % (k, len(v)) for k, v in diff.items() if v),
+              file=sys.stderr)
+
+    with open(MANIFEST, "w", encoding="utf-8") as f:
+        json.dump(now, f, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
+
+    return {"item_count": len(now), "changed_today": changed}
 
 
 def build_players(region, ceil_rows):
@@ -211,6 +293,9 @@ def main():
     date = datetime.date.today().isoformat()
     wrote = 0
 
+    # catalogue tracking is region-independent — do it once per run
+    catalogue = track_item_manifest()
+
     for region in present:
         if region not in REGIONS:
             continue
@@ -221,6 +306,8 @@ def main():
             continue
 
         snap = build_snapshot(region, ceil_rows, item_rows, tier_rows)
+        if catalogue:
+            snap["catalogue"] = catalogue
         if not snap["heroes"]:
             print("  [warn] %s: no ceiling rows, nothing archived" % region, file=sys.stderr)
             continue
