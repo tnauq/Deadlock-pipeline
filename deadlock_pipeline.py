@@ -744,6 +744,22 @@ def main():
                                                        if d["winrate_delta"] != "" else -99)), 1):
         t["delta_rank"] = i
 
+    # Full item manifest, INCLUDING items nobody built. An item patch will add,
+    # remove, rename, recost and recategorise items; without a dated record of
+    # what the catalogue looked like each day, a chart spanning the patch
+    # silently treats a reworked item as continuous with its old self. This is
+    # free — load_assets() already fetched all of it.
+    try:
+        manifest = {str(iid): {"name": m["name"], "cat": m["cat"],
+                               "cost": m["cost"], "tier": m["tier"]}
+                    for iid, m in sorted(items.items())}
+        with open(os.path.join(OUT_DIR, "items_manifest.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
+        print("  -> %s/items_manifest.json (%d items)" % (OUT_DIR, len(manifest)),
+              file=sys.stderr)
+    except Exception as e:
+        print("  [warn] could not write items_manifest.json (%s)" % e, file=sys.stderr)
+
     write("tierlist.csv", tier,
           ["rank", "hero_id", "hero", "elite_winrate", "elite_games", "elite_se",
            "offhero_winrate", "offhero_games", "offhero_players",
