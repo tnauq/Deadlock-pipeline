@@ -1,0 +1,69 @@
+name: Hero type comps
+
+# Manual only — no schedule. This makes 1 /v1/sql query and the unkeyed cap is
+# 20 req/HOUR, which a pipeline run already spends ~16 of. Running it in the
+# same hour as "Daily refresh" risks 429ing one or the other.
+#
+# The "types only" mode costs ZERO sql calls and is safe to run any time.
+
+on:
+  workflow_dispatch:
+    inputs:
+      types_only:
+        description: "Only print the hero->type map (no SQL, safe any time)"
+        required: false
+        default: false
+        type: boolean
+      badge_floor:
+        description: "Minimum lobby badge (Unranked scale 0-116). Lower if too few results."
+        required: false
+        default: "100"
+        type: string
+      lookback_days:
+        description: "Days of matches to scan"
+        required: false
+        default: "14"
+        type: string
+      min_teams:
+        description: "Drop signatures seen fewer times than this"
+        required: false
+        default: "50"
+        type: string
+
+jobs:
+  comps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Deliberately uses COMP_* names, not MATCH_MODE — so it can never
+      # inherit the pipeline's MATCH_MODE=Ranked. Composition analysis needs
+      # Unranked: ranked is far too thin for 84 signatures, and average_badge
+      # is 0 on ranked rows so the badge floor would filter nothing.
+      - name: Analyse team composition by hero type
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+          COMP_MATCH_MODE: Unranked
+          COMP_GAME_MODE: Normal
+          COMP_BADGE_FLOOR: ${{ inputs.badge_floor }}
+          COMP_LOOKBACK_DAYS: ${{ inputs.lookback_days }}
+          COMP_MIN_TEAMS: ${{ inputs.min_teams }}
+        run: |
+          if [ "${{ inputs.types_only }}" = "true" ]; then
+            python3 hero_type_comps.py --types
+          else
+            python3 hero_type_comps.py
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: type-comps
+          retention-days: 30
+          path: output/type_comps.csv
+          if-no-files-found: ignore
