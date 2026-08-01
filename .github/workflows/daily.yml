@@ -119,14 +119,6 @@ jobs:
       # TEMPORARY — one-shot probe of endpoints we aren't using yet. None of
       # these are /v1/sql, so the 20/hr budget that forced the region split is
       # untouched. Remove this step once its questions are answered.
-      # TEMPORARY — mmr-history alone; the batched probe hit a GLOBAL 429
-      # (50/min shared across all API users) before reaching it. Answers
-      # whether a dated per-match rating series exists, which would let a
-      # season curve be reconstructed retroactively instead of polled daily.
-      - name: Probe mmr-history (experiment)
-        continue-on-error: true
-        run: python3 probe_mmr_history.py
-
       - name: Archive daily snapshot
         env:
           REGIONS: ${{ steps.region.outputs.region }}
