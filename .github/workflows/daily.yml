@@ -109,13 +109,26 @@ jobs:
           REGIONS: ${{ steps.region.outputs.region }}
         run: python3 build_site_data.py
 
-      # Only docs/ is committed. output/ holds candidates.csv and excluded.csv,
-      # which carry Steam account IDs and display names — those stay off the repo.
+      # One trimmed snapshot per region per DAY, for charting change over time.
+      # The pipeline runs 6x/day but builds are a 20-player sample, so runs 4h
+      # apart differ mostly by noise — the script no-ops if today's file for
+      # this region already exists. JSON is uncompressed and lives in docs/ so
+      # the site can fetch it directly (Pages gzips text in transit anyway);
+      # raw CSVs go to archive/ OUTSIDE docs/ so they don't count against the
+      # 1GB published-Pages limit. ~53MB/yr in docs/, ~33MB/yr in archive/.
+      - name: Archive daily snapshot
+        env:
+          REGIONS: ${{ steps.region.outputs.region }}
+        run: python3 archive_snapshot.py
+
+      # docs/ plus archive/ are committed. output/ still stays off the repo:
+      # candidates.csv and excluded.csv carry Steam account IDs and display
+      # names. Nothing in the archive contains account-level data.
       - name: Commit if changed
         run: |
           git config user.name  "deadlock-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add docs/data.json docs/icons
+          git add docs/data.json docs/icons docs/archive archive
           if git diff --cached --quiet; then
             echo "no change"
           else
