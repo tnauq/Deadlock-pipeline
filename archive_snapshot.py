@@ -66,6 +66,57 @@ def slug(name):
     return s
 
 
+def build_players(region, ceil_rows):
+    """Top-N cross-hero board, for charting player movement over time.
+
+    Why players and not just heroes: a hero's ceiling rank jumps 15+ places the
+    moment a different person takes custody of it, which makes a hero race
+    strobe. A player's own ladder position drifts — measured across real runs,
+    median movement between snapshots is 0-1 positions once the reset settled.
+    Switching hero keeps them at roughly the same position with a new label.
+
+    IDENTITY IS THE CATCH. Board entries carry possible_account_ids, which is a
+    CANDIDATE list (one name can hold 30+), not an identity. An id is only
+    trustworthy where it agrees with a pool member the pipeline already
+    resolved. Entries are therefore tagged confirmed/unconfirmed rather than
+    being silently keyed on a display name, which would merge two people who
+    share a name or split one who renames.
+    """
+    path = os.path.join(OUT, "board.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            board = json.load(f)
+    except Exception as e:
+        print("  [warn] board.json unreadable (%s)" % e, file=sys.stderr)
+        return None
+    if region not in board:
+        return None
+
+    # names the pipeline resolved to a real account for this region
+    resolved = {}
+    for r in ceil_rows:
+        if r["region"] == region and r.get("ceiling_player"):
+            resolved.setdefault(r["ceiling_player"], []).append(r["hero"])
+
+    out = []
+    for e in board[region]["entries"]:
+        ids = e.get("ids") or []
+        confirmed = e["name"] in resolved and len(ids) == 1
+        out.append({
+            "pos": e["pos"],
+            "name": e["name"],
+            # single unambiguous candidate AND corroborated by a resolved pool
+            # member; anything else is a label, not an identity
+            "id": ids[0] if confirmed else None,
+            "confirmed": confirmed,
+            "top_heroes": e.get("top_heroes") or [],
+            "ceiling_for": resolved.get(e["name"], []),
+        })
+    return {"depth": board[region]["depth"], "entries": out}
+
+
 def build_snapshot(region, ceil_rows, item_rows, tier_rows):
     """Trimmed, chartable representation of one region on one day."""
     tier = {r["hero"]: r for r in tier_rows}
@@ -100,9 +151,12 @@ def build_snapshot(region, ceil_rows, item_rows, tier_rows):
         if r["item_id"] not in items:
             items[r["item_id"]] = {"name": r["item"], "cat": r["category"] or "?"}
 
+    players = build_players(region, ceil_rows)
+
     return {
         "date": datetime.date.today().isoformat(),
         "region": region,
+        "players": players,
         "generated_at": datetime.datetime.now(datetime.timezone.utc)
                                 .strftime("%Y-%m-%dT%H:%M:%SZ"),
         "heroes": heroes,
@@ -175,9 +229,12 @@ def main():
             json.dump(snap, f, separators=(",", ":"), ensure_ascii=False)
         n_days = update_index(date, region, snap)
         wrote += 1
-        print("  -> %s (%.0f KB, %d heroes) | index now %d entries"
-              % (path, os.path.getsize(path) / 1024, len(snap["heroes"]), n_days),
-              file=sys.stderr)
+        p = snap.get("players")
+        conf = sum(1 for e in p["entries"] if e["confirmed"]) if p else 0
+        print("  -> %s (%.0f KB, %d heroes, %d board players / %d id-confirmed) "
+              "| index now %d entries"
+              % (path, os.path.getsize(path) / 1024, len(snap["heroes"]),
+                 len(p["entries"]) if p else 0, conf, n_days), file=sys.stderr)
 
         # raw CSVs, outside docs/ so they don't count against the Pages limit
         if KEEP_RAW:
