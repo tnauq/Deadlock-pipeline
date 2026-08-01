@@ -31,6 +31,10 @@ OUT_DIR = "output"
 # whose name is unique on the board but whose candidate id list omits our id.
 STRICT = (os.environ.get("STRICT") or "1") != "0"
 
+# How many board entries to keep for the archive (player bar-chart-race data).
+# Costs no extra API calls — the full board is already fetched.
+BOARD_ARCHIVE_TOP = int(os.environ.get("BOARD_ARCHIVE_TOP") or 100)
+
 
 def get(url):
     req = urllib.request.Request(url, headers={"User-Agent": "deadlock-ceiling/1.0"})
@@ -52,6 +56,7 @@ def fetch_board(region):
         raise SystemExit("no entries for %s; response keys: %s"
                          % (region, list(data)[:8] if isinstance(data, dict) else type(data)))
 
+    ordered = []          # raw board order, kept for the archive
     by_name = defaultdict(list)
     for i, e in enumerate(entries):
         name = e.get("account_name")
@@ -65,11 +70,20 @@ def fetch_board(region):
             "top_heroes": e.get("top_hero_ids") or [],
             "ids": {int(a) for a in (e.get("possible_account_ids") or []) if a},
         })
+        ordered.append({
+            "pos": i + 1,
+            "name": name,
+            "top_heroes": e.get("top_hero_ids") or [],
+            # CANDIDATE list, not an identity — one name can carry 30+ ids.
+            # Only trustworthy once cross-checked against a resolved pool
+            # member, which archive_snapshot.py does.
+            "ids": [int(a) for a in (e.get("possible_account_ids") or []) if a][:8],
+        })
 
     print("  [board] %-9s %d entries, %d named, depth %d"
           % (region, len(entries), sum(len(v) for v in by_name.values()), len(entries)),
           file=sys.stderr)
-    return by_name, len(entries)
+    return by_name, len(entries), ordered
 
 
 def locate(row, boards):
@@ -80,7 +94,7 @@ def locate(row, boards):
     30+. Matching on it alone put the wrong player in 110 of 371 slots. So an
     accepted match needs BOTH the display name and the id to agree.
     """
-    by_name, _ = boards[row["region"]]
+    by_name = boards[row["region"]][0]
     aid = int(row["account_id"])
     named = by_name.get(row["account_name"] or "", [])
     if not named:
@@ -107,6 +121,20 @@ def main():
     for region in REGIONS:
         boards[region] = fetch_board(region)
     depth = {r: boards[r][1] for r in REGIONS}
+
+    # Dump the raw ordered board for archive_snapshot.py. The leaderboard
+    # endpoint allows 100 req/s — a different bucket from /v1/sql's 20/hr —
+    # and this reuses the fetch already made, so it costs no extra requests.
+    try:
+        os.makedirs(OUT_DIR, exist_ok=True)
+        with open(os.path.join(OUT_DIR, "board.json"), "w", encoding="utf-8") as f:
+            json.dump({rg: {"depth": boards[rg][1],
+                            "entries": boards[rg][2][:BOARD_ARCHIVE_TOP]}
+                       for rg in REGIONS}, f, separators=(",", ":"), ensure_ascii=False)
+        print("  [board] wrote %s/board.json (top %d per region)"
+              % (OUT_DIR, BOARD_ARCHIVE_TOP), file=sys.stderr)
+    except Exception as e:
+        print("  [warn] could not write board.json (%s)" % e, file=sys.stderr)
 
     print("[2/2] locating pool members", file=sys.stderr)
     by_hero = defaultdict(list)
