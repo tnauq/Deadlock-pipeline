@@ -72,11 +72,28 @@ jobs:
           COMP_LOOKBACK_DAYS: ${{ inputs.lookback_days }}
         run: python3 type_pickrates.py
 
+      # Type ADVANTAGE gradient. A second /v1/sql query — same timing caution
+      # as the first step. A full comp-vs-comp matrix was rejected on power:
+      # 88 signatures give 3,916 cells at ~10 matches each (SE +/-15.7 pts).
+      # Collapsing to a per-type differential gives ~9 buckets at ~4,400
+      # matches (SE +/-0.75 pts) and tests the gradient directly.
+      - name: Type differential
+        if: inputs.types_only != true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+          COMP_MATCH_MODE: Unranked
+          COMP_GAME_MODE: Normal
+          COMP_BADGE_FLOOR: ${{ inputs.badge_floor }}
+          COMP_LOOKBACK_DAYS: ${{ inputs.lookback_days }}
+        run: python3 type_differential.py
+
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: type-comps
           retention-days: 30
-          path: output/type_comps.csv
+          path: |
+            output/type_comps.csv
+            output/type_differential.csv
           if-no-files-found: ignore
