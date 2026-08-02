@@ -45,6 +45,7 @@ jobs:
       # Unranked: ranked is far too thin for 84 signatures, and average_badge
       # is 0 on ranked rows so the badge floor would filter nothing.
       - name: Analyse team composition by hero type
+        continue-on-error: true
         env:
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
           COMP_MATCH_MODE: Unranked
@@ -64,7 +65,11 @@ jobs:
       # cannot collide with the pipeline. Answers whether the type-composition
       # win rates are just pick rates flowing through the matchmaker.
       - name: Pick rate baseline
+        # continue-on-error, not just always(): a failure here previously
+        # marked the job failed and SKIPPED the differential step entirely,
+        # which is why that never ran on 2026-08-02.
         if: always()
+        continue-on-error: true
         env:
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
           COMP_GAME_MODE: Normal
@@ -78,7 +83,10 @@ jobs:
       # Collapsing to a per-type differential gives ~9 buckets at ~4,400
       # matches (SE +/-0.75 pts) and tests the gradient directly.
       - name: Type differential
-        if: inputs.types_only != true
+        # always() so a failure in an earlier, independent analysis cannot
+        # skip this one
+        if: always() && inputs.types_only != true
+        continue-on-error: true
         env:
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
           COMP_MATCH_MODE: Unranked
