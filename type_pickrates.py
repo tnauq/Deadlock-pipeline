@@ -45,15 +45,28 @@ TYPES = ["assassin", "brawler", "marksman", "mystic"]
 # match hero_type_comps.py defaults so the comparison is like-for-like
 LOOKBACK_DAYS = int(os.environ.get("COMP_LOOKBACK_DAYS") or 14)
 BADGE_FLOOR = int(os.environ.get("COMP_BADGE_FLOOR") or 100)
-GAME_MODE = os.environ.get("COMP_GAME_MODE") or "Normal"
+# CASING DIFFERS BY ENDPOINT. /v1/sql uses the ClickHouse enum ('Normal'),
+# but /v1/analytics/* uses lowercase snake_case ('normal', 'street_brawl').
+# Sending 'Normal' here returns a bare HTTP 400 with no explanation — that
+# cost a run on 2026-08-02. Normalise whatever COMP_GAME_MODE holds.
+_GM = {"normal": "normal", "streetbrawl": "street_brawl",
+       "street_brawl": "street_brawl", "explorenyc": "explore_n_y_c",
+       "internal": "internal"}
+GAME_MODE = _GM.get((os.environ.get("COMP_GAME_MODE") or "Normal")
+                    .lower().replace("_", ""), "normal")
 
 
 def get(url):
     req = urllib.request.Request(url, headers={"User-Agent": "deadlock-picks/1.0"})
     if API_KEY:
         req.add_header("X-API-Key", API_KEY)
-    with urllib.request.urlopen(req, timeout=180) as r:
-        return json.loads(r.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")[:600]
+        raise SystemExit("request failed (HTTP %s)\n  %s\n  url: %s"
+                         % (e.code, body, url[:300]))
 
 
 def main():
@@ -76,6 +89,9 @@ def main():
     for hid, t in htype.items():
         roster[t if t in TYPES else "untyped"].append(hid)
 
+    if not 0 <= BADGE_FLOOR <= 116:
+        raise SystemExit("COMP_BADGE_FLOOR must be 0-116 (schema limit), got %d"
+                         % BADGE_FLOOR)
     since = int(time.time()) - LOOKBACK_DAYS * 86400
     q = urllib.parse.urlencode({
         "game_mode": GAME_MODE,
