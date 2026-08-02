@@ -53,8 +53,17 @@ def get(url):
     req = urllib.request.Request(url, headers={"User-Agent": "deadlock-diff/1.0"})
     if API_KEY:
         req.add_header("X-API-Key", API_KEY)
-    with urllib.request.urlopen(req, timeout=300) as r:
-        return json.loads(r.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")[:800]
+        raise SystemExit(
+            "SQL failed (HTTP %s)\n%s\n\n"
+            "If this is a timeout or memory error, lower COMP_LOOKBACK_DAYS "
+            "(currently %d) or raise COMP_BADGE_FLOOR (currently %d) to scan "
+            "fewer rows. If it is a 429, wait for the hourly window to clear."
+            % (e.code, body, LOOKBACK_DAYS, BADGE_FLOOR))
 
 
 def hero_types():
@@ -76,20 +85,32 @@ def hero_types():
 
 
 def build_query(by_type):
-    """Per team, count each type; then join the two teams of a match.
+    """One pass over match_player, no self-join.
 
-    Team0 is taken as the subject and Team1 as the enemy — one row per match,
-    not two, so a match is never counted twice. Win rate is Team0's. Because
-    the assignment is symmetric, the enemy's perspective is the mirror image
-    and adds nothing.
+    The first version joined two aggregated subqueries on match_id. That scans
+    ~14 days of match_player twice and produces four team-pairings per match
+    before the WHERE discards three — expensive enough to fail on a dataset
+    this size, which is what happened on 2026-08-02 with plenty of SQL budget
+    left.
 
-    Teams without exactly 6 players are dropped: abandons and parse gaps would
-    otherwise produce differentials that never actually occurred.
+    Conditional aggregation does it in a single GROUP BY instead: count each
+    type separately for Team0 and Team1 within the same pass and subtract.
+    Same result, one scan, no join.
+
+    Team0 is the subject and Team1 the enemy, so there is one row per match
+    rather than two. The mirror perspective is redundant — the differentials
+    are symmetric.
+
+    Matches where either side is not exactly 6 players are dropped; abandons
+    and parse gaps would otherwise create differentials that never occurred.
     """
-    counts = ",\n            ".join(
-        "countIf(hero_id IN (%s)) AS %s" % (",".join(str(i) for i in by_type[t]), t)
-        for t in TYPES)
-    diffs = ",\n    ".join("a.%s - b.%s AS d_%s" % (t, t, t) for t in TYPES)
+    parts = []
+    for t in TYPES:
+        ids = ",".join(str(i) for i in by_type[t])
+        parts.append(
+            "countIf(hero_id IN ({ids}) AND team = 'Team0') - "
+            "countIf(hero_id IN ({ids}) AND team = 'Team1') AS d_{t}".format(ids=ids, t=t))
+    diffs = ",\n        ".join(parts)
     sel = ", ".join("d_%s" % t for t in TYPES)
     return """
 SELECT
@@ -99,34 +120,21 @@ SELECT
     round(100 * avg(won), 3) AS winrate
 FROM (
     SELECT
-        a.match_id AS match_id,
-        a.won      AS won,
-        {diffs}
-    FROM (
-        SELECT match_id, team, any(won) AS won, count() AS players,
-            {counts}
-        FROM match_player
-        WHERE match_mode = '{mode}' AND game_mode = '{gmode}'
-          AND start_time >= now() - INTERVAL {lookback} DAY
-          AND greatest(average_badge_team0, average_badge_team1) >= {floor}
-        GROUP BY match_id, team
-        HAVING players = 6
-    ) AS a
-    INNER JOIN (
-        SELECT match_id, team, count() AS players,
-            {counts}
-        FROM match_player
-        WHERE match_mode = '{mode}' AND game_mode = '{gmode}'
-          AND start_time >= now() - INTERVAL {lookback} DAY
-          AND greatest(average_badge_team0, average_badge_team1) >= {floor}
-        GROUP BY match_id, team
-        HAVING players = 6
-    ) AS b ON a.match_id = b.match_id
-    WHERE a.team = 'Team0' AND b.team = 'Team1'
+        match_id,
+        {diffs},
+        anyIf(won, team = 'Team0')   AS won,
+        countIf(team = 'Team0')      AS p0,
+        countIf(team = 'Team1')      AS p1
+    FROM match_player
+    WHERE match_mode = '{mode}' AND game_mode = '{gmode}'
+      AND start_time >= now() - INTERVAL {lookback} DAY
+      AND greatest(average_badge_team0, average_badge_team1) >= {floor}
+    GROUP BY match_id
+    HAVING p0 = 6 AND p1 = 6
 )
 GROUP BY {sel}
 ORDER BY matches DESC
-""".format(sel=sel, diffs=diffs, counts=counts, mode=MATCH_MODE, gmode=GAME_MODE,
+""".format(sel=sel, diffs=diffs, mode=MATCH_MODE, gmode=GAME_MODE,
            lookback=LOOKBACK_DAYS, floor=BADGE_FLOOR)
 
 
