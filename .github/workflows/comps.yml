@@ -59,6 +59,19 @@ jobs:
             python3 hero_type_comps.py
           fi
 
+      # Pick-rate baseline. Uses /v1/analytics/hero-stats (200 req/min) and
+      # the assets payload — ZERO sql queries, so this is safe any time and
+      # cannot collide with the pipeline. Answers whether the type-composition
+      # win rates are just pick rates flowing through the matchmaker.
+      - name: Pick rate baseline
+        if: always()
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+          COMP_GAME_MODE: Normal
+          COMP_BADGE_FLOOR: ${{ inputs.badge_floor }}
+          COMP_LOOKBACK_DAYS: ${{ inputs.lookback_days }}
+        run: python3 type_pickrates.py
+
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
