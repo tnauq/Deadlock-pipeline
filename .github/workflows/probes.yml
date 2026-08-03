@@ -1,0 +1,46 @@
+name: Probes
+
+# Manual only. Kept out of "Daily refresh" because that job already spends ~16
+# of the 20 SQL requests/hour the unkeyed API allows, and this needs 4 more.
+# Run it in an hour with no scheduled job, or use the free-only mode.
+#
+# Cron fires at 00/04/08/12/16/20 UTC. Mid-window is safest.
+
+on:
+  workflow_dispatch:
+    inputs:
+      free_only:
+        description: "Schemas only - zero SQL queries, safe to run any time"
+        required: false
+        default: false
+        type: boolean
+      lookback_days:
+        description: "Days of ranked matches to scan"
+        required: false
+        default: "3"
+        type: string
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Closes the open items in PROBES.md:
+      #   banned_hero_ids        - ranked has a pregame lobby showing the enemy
+      #                            team with one swap allowed, so counterpicking
+      #                            is possible; is that visible in the data?
+      #   item_cohort_stats_*    - two unused tables whose names suggest they do
+      #                            server-side what the pipeline computes by hand
+      #   upgrades.* vs items.*  - answered from the schema alone, no query
+      #   average_badge          - has the 2026-07-31 zeroing resolved?
+      - name: Probe remaining
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+          PROBE_LOOKBACK_DAYS: ${{ inputs.lookback_days }}
+          SKIP_SQL: ${{ inputs.free_only && '1' || '0' }}
+        run: python3 probe_remaining.py
