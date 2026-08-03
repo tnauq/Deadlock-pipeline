@@ -37,6 +37,9 @@ API_KEY = os.environ.get("DEADLOCK_API_KEY")
 SKIP_SQL = (os.environ.get("SKIP_SQL") or "0") == "1"
 SQL_PAUSE = float(os.environ.get("SQL_PAUSE_S") or 35)
 LOOKBACK = int(os.environ.get("PROBE_LOOKBACK_DAYS") or 3)
+# bans and average_badge were both answered on 2026-08-03; set COHORT_ONLY=1 to
+# re-run just the two cohort-table queries (2 calls instead of 4)
+COHORT_ONLY = (os.environ.get("COHORT_ONLY") or "0") == "1"
 TABLES = ["item_cohort_stats_net_worth_agg", "item_cohort_stats_time_agg"]
 _sql_calls = 0
 
@@ -120,14 +123,18 @@ def main():
 
     head("BUDGETED: 4 SQL queries")
 
-    print("\n-- 1. banned_hero_ids: is there a draft phase in the data? --", file=sys.stderr)
+    if COHORT_ONLY:
+        print("\nCOHORT_ONLY=1 - skipping bans and badge (already answered)",
+              file=sys.stderr)
+    print("\n-- 1. banned_hero_ids: is there a draft phase in the data? --",
+          file=sys.stderr) if not COHORT_ONLY else None
     q1 = ("SELECT count() AS ranked_rows, "
           "countIf(length(banned_hero_ids) > 0) AS rows_with_bans, "
           "round(avg(length(banned_hero_ids)), 2) AS avg_bans, "
           "max(length(banned_hero_ids)) AS max_bans "
           "FROM match_player WHERE match_mode = 'Ranked' "
           "AND start_time >= now() - INTERVAL %d DAY" % LOOKBACK)
-    for r in sql(q1, "bans"):
+    for r in ([] if COHORT_ONLY else sql(q1, "bans")):
         print("  ", r, file=sys.stderr)
         if int(r.get("rows_with_bans") or 0) == 0:
             print("  >>> EMPTY - no ban data; the pregame swap is not visible here,",
@@ -136,37 +143,38 @@ def main():
         else:
             print("  >>> POPULATED - regional ban comparison is viable.", file=sys.stderr)
 
-    print("\n-- 2. has average_badge recovered for ranked? --", file=sys.stderr)
+    print("\n-- 2. has average_badge recovered for ranked? --", file=sys.stderr) if not COHORT_ONLY else None
     q2 = ("SELECT count() AS n, countIf(average_badge_team0 > 0) AS t0_nonzero, "
           "countIf(average_badge_team1 > 0) AS t1_nonzero, "
           "max(greatest(average_badge_team0, average_badge_team1)) AS top_badge "
           "FROM match_player WHERE match_mode = 'Ranked' "
           "AND start_time >= now() - INTERVAL %d DAY" % LOOKBACK)
-    for r in sql(q2, "badge"):
+    for r in ([] if COHORT_ONLY else sql(q2, "badge")):
         print("  ", r, file=sys.stderr)
         if int(r.get("t0_nonzero") or 0) == 0:
             print("  >>> STILL ZERO - the 2026-07-31 collapse persists.", file=sys.stderr)
         else:
             print("  >>> RECOVERED - a badge floor is viable again.", file=sys.stderr)
 
-    # These are AggregatingMergeTree tables. SELECT * returns HTTP 400 because
-    # players_state is AggregateFunction(uniq, UInt32) and an unmerged aggregate
-    # state cannot be serialised to JSON. Name the columns instead, and merge the
-    # one aggregate explicitly. (Discovered 2026-08-03.)
+    # AggregatingMergeTree. SELECT * returns HTTP 400 because players_state is
+    # AggregateFunction(uniq, UInt32) and an unmerged state cannot be serialised
+    # to JSON. But the n_* columns are SimpleAggregateFunction, which DO select
+    # as plain values - so simply omitting players_state is enough. No GROUP BY
+    # and no ORDER BY: an earlier attempt added both and timed out at 524,
+    # because sorting the whole table is far more work than reading three rows.
+    # Filter on day as well, so this touches one partition. (2026-08-03)
     BUCKET = {"item_cohort_stats_net_worth_agg": "bucket_net_worth",
               "item_cohort_stats_time_agg": "bucket_minute"}
     for t in TABLES:
         print("\n-- %s: grain --" % t, file=sys.stderr)
         rows = sql("SELECT match_mode, game_mode, day, cohort_item_id, item_id, "
-                   "%s AS bucket, n_matches, n_wins, n_sold, "
-                   "uniqMerge(players_state) AS players "
-                   "FROM %s GROUP BY match_mode, game_mode, day, cohort_item_id, "
-                   "item_id, bucket, n_matches, n_wins, n_sold "
-                   "ORDER BY n_matches DESC LIMIT 3" % (BUCKET[t], t), t)
+                   "%s AS bucket, n_matches, n_wins, n_sold "
+                   "FROM %s WHERE day >= today() - %d LIMIT 3"
+                   % (BUCKET[t], t, LOOKBACK), t)
         if not rows:
-            print("    (no rows - table may be empty)", file=sys.stderr)
+            print("    (no rows - table may be empty for this window)", file=sys.stderr)
             continue
-        for r in rows[:2]:
+        for r in rows[:3]:
             print("     %s" % json.dumps(r)[:420], file=sys.stderr)
         keys = sorted(rows[0].keys())
         print("     keys: %s" % keys, file=sys.stderr)
