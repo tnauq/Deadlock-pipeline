@@ -344,55 +344,9 @@ def fetch_ladders(heroes):
 # An IN clause of the full ~90k ladder ids produced a 908KB URL and a 414
 # (2026-07-25). query_pool() chunks the id list the same way query_items()
 # chunks (match_id, account_id) pairs, self-halving on a 414.
-Q_POOL = """
-WITH recent AS (
-    SELECT account_id, hero_id, match_id, start_time, won,
-        if(team = 'Team0', average_badge_team0, average_badge_team1) AS team_badge,
-        row_number() OVER (PARTITION BY account_id ORDER BY start_time DESC) AS rn
-    FROM match_player
-    WHERE account_id IN ({ids})
-      AND {mode}start_time >= now() - INTERVAL {lookback} DAY
-),
-mmr AS (
-    SELECT account_id, sum(score * w) / sum(w) AS mmr
-    FROM (
-        SELECT account_id,
-               (intDiv(team_badge, 10) - 1) * 6 + (team_badge % 10) AS score,
-               pow({keep}, rn - 1) AS w
-        FROM recent WHERE rn <= {ema} AND team_badge IS NOT NULL
-    )
-    GROUP BY account_id
-),
-hero_perf AS (
-    SELECT account_id, hero_id, count() AS hero_games, sum(won) AS hero_wins
-    FROM recent GROUP BY account_id, hero_id
-),
-acct_perf AS (
-    SELECT account_id, count() AS acct_games, sum(won) AS acct_wins
-    FROM recent GROUP BY account_id
-),
-hero_recent AS (
-    SELECT account_id, hero_id,
-           count()                AS hero_matches,
-           min(rn)                AS best_rn,
-           argMin(match_id, rn)   AS last_match_id,
-           argMin(start_time, rn) AS last_played
-    FROM recent WHERE rn <= {recency}
-    GROUP BY account_id, hero_id
-)
-SELECT h.account_id AS account_id, h.hero_id AS hero_id, m.mmr AS mmr,
-       h.hero_matches AS hero_matches, h.best_rn AS best_rn,
-       h.last_match_id AS last_match_id, h.last_played AS last_played,
-       p.hero_games AS hero_games, p.hero_wins AS hero_wins,
-       a.acct_games AS acct_games, a.acct_wins AS acct_wins
-FROM hero_recent AS h
-INNER JOIN mmr AS m USING (account_id)
-INNER JOIN hero_perf AS p USING (account_id, hero_id)
-INNER JOIN acct_perf AS a USING (account_id)
-WHERE h.hero_matches >= {minhero}
-ORDER BY hero_id ASC, mmr DESC
-LIMIT {pool} BY hero_id
-"""
+# Q_POOL removed 2026-08-03 — the candidate pool now comes from
+# /v1/players/hero-stats (batched, no SQL). See fetch_hero_stats().
+
 
 Q_ITEMS = """
 SELECT account_id, hero_id, match_id,
@@ -407,27 +361,87 @@ WHERE match_id IN ({mids}) AND account_id IN ({aids})
 """
 
 
-def query_pool(account_ids):
-    """Chunked so no single URL exceeds MAX_URL — same pattern as query_items()."""
+# --------------------------------------------------------------------------
+# RANKED PER-HERO STATS  (replaces the chunked SQL candidate pool)
+# --------------------------------------------------------------------------
+
+# /v1/players/hero-stats gained a match_mode filter in the 2026-08-03 spec.
+# Batched via repeated account_ids params, 100 req/s, and NOT /v1/sql — so the
+# whole candidate pool now costs nothing against the 20/hr SQL budget. It
+# returns everything the old Q_POOL query did:
+#
+#   matches_played -> hero_games      wins        -> hero_wins
+#   max(matches)   -> last_match_id   last_played -> last_played
+#
+# match_mode is case-insensitive here (both 'ranked' and 'Ranked' returned
+# identical rows when probed), unlike /v1/analytics/* where the wrong casing
+# returns a bare 400. Lowercase matches the documented enum.
+MODE_API = (os.environ.get("MATCH_MODE") or "Ranked").lower()
+SHRINK_K = float(os.environ.get("SHRINK_K") or 25)
+
+
+def shrunk(wins, games, k=None):
+    """Win rate pulled toward 0.5 by sample size.
+
+    Raw win rate is unusable as a selector at this volume — median ranked games
+    per (account, hero) was 4 when probed, so a 3-0 record would outrank a
+    46-35 one. k is the number of phantom coin-flips added; at k=25 a 10-0
+    record lands below a 46-35, which is the ordering we want.
+    """
+    k = SHRINK_K if k is None else k
+    return (wins + k * 0.5) / (games + k) if (games + k) else 0.5
+
+
+def fetch_hero_stats(account_ids):
+    """Per (account, hero) ranked stats for every candidate. No SQL."""
     ids = sorted(account_ids)
-    # ~22.7 encoded chars per id measured on real runs; //25 leaves room for the
-    # ~800-char query body. The old //8 guess was 4x too high and self-halved
-    # down to 265 ids/chunk, wasting most of the URL budget and doubling the
-    # chunk count — which matters because the HOURLY cap (20 req/hr unkeyed) is
-    # the real constraint, not the 2/min one.
-    rows, chunk, i = [], max(50, MAX_URL // 25), 0
+    out, i = {}, 0
+    # ~12 chars per id as a repeated query param; keep URLs well under the cap
+    chunk = max(50, MAX_URL // 14)
+    calls = 0
     while i < len(ids):
         part = ids[i:i + chunk]
-        q = Q_POOL.format(lookback=LOOKBACK_DAYS, ids=",".join(str(a) for a in part),
-                          keep=repr(1.0 - EMA_ALPHA), ema=EMA_WINDOW,
-                          recency=RECENCY_WINDOW, minhero=MIN_HERO_MATCHES,
-                          pool=POOL_PER_HERO, mode=MODE_SQL)
-        if len(urllib.parse.quote(q)) > MAX_URL and chunk > 50:
+        q = "&".join("account_ids=%d" % a for a in part)
+        url = "%s/v1/players/hero-stats?match_mode=%s&%s" % (BASE, MODE_API, q)
+        if len(url) > MAX_URL and chunk > 50:
             chunk = max(50, chunk // 2)
             continue
-        rows.extend(sql(q, "candidate pool %d-%d of %d" % (i + 1, i + len(part), len(ids))))
+        try:
+            rows = _get(url)
+        except Exception as e:
+            print("  [hs] chunk %d-%d failed: %s" % (i + 1, i + len(part), e),
+                  file=sys.stderr)
+            rows = []
+        calls += 1
+        for r in rows or []:
+            aid, hid = r.get("account_id"), r.get("hero_id")
+            if aid is None or hid is None:
+                continue
+            m = r.get("matches") or []
+            out[(int(aid), int(hid))] = {
+                "account_id": int(aid),
+                "hero_id": int(hid),
+                "hero_games": int(r.get("matches_played") or len(m) or 0),
+                "hero_wins": int(r.get("wins") or 0),
+                # match ids increase monotonically, so the largest is the most
+                # recent — no extra query needed to find the build to sample
+                "last_match_id": max(m) if m else None,
+                "last_played": r.get("last_played"),
+            }
         i += len(part)
-    return rows
+        time.sleep(0.2)          # 100 req/s allowed; stay well clear
+    print("  [hs] %d (account,hero) rows from %d calls (no SQL used)"
+          % (len(out), calls), file=sys.stderr)
+    return out
+
+
+def account_totals(stats):
+    """Per-account games/wins across ALL heroes, for the off-hero baseline."""
+    tot = defaultdict(lambda: [0, 0])
+    for (aid, _hid), v in stats.items():
+        tot[aid][0] += v["hero_games"]
+        tot[aid][1] += v["hero_wins"]
+    return tot
 
 
 def query_items(pairs):
@@ -513,42 +527,31 @@ def main():
         raise SystemExit("No account ids resolved from any leaderboard entry. Not writing "
                          "CSVs — leaving yesterday's output/data.json in place.")
 
-    # ~186 ids fit per chunk at MAX_URL=6000; ~8500 roughly doubles that. Printed
-    # up front because the 2026-07-31 run silently ran for 15 minutes before
-    # hitting a 429 with no way to tell in advance it would take 4+ hours.
-    est_chunk = max(50, MAX_URL // 25)
-    est_chunks = -(-len(ladder_ids) // est_chunk)
-    print("  [lb] ~%d chunks expected, ~%d min at the SQL rate limit"
-          % (est_chunks, est_chunks * SQL_PAUSE_S // 60), file=sys.stderr)
-    # The unkeyed tier allows 20 SQL requests/HOUR (SCHEMA.md quirk #5). Two runs
-    # on 2026-07-31 died at exactly chunk 21 because of this, not the 2/min rule.
-    # The item query chunks too — budget for the whole run, not just this query.
+    # Candidate stats now come from /v1/players/hero-stats (batched, 100 req/s,
+    # NOT /v1/sql), so the only SQL left in the run is the item query. That took
+    # a run from ~16 SQL calls to ~4 and is why both regions can share one run
+    # again instead of alternating.
     est_items = -(-(TARGET_BUILDS * len(heroes)) // max(20, MAX_URL // 25))
-    est_total = est_chunks + est_items
-    print("  [lb] ~%d pool + ~%d item = ~%d SQL requests this run (hourly cap %d)"
-          % (est_chunks, est_items, est_total, HOURLY_SQL_BUDGET), file=sys.stderr)
-    if not API_KEY and est_total > HOURLY_SQL_BUDGET:
-        print("  [lb] WARNING: ~%d requests exceeds the %d req/hr unkeyed cap and WILL 429 "
-              "partway through. Lower MAX_IDS_PER_ENTRY (currently %d) or set the "
-              "DEADLOCK_API_KEY secret."
-              % (est_total, HOURLY_SQL_BUDGET, MAX_IDS_PER_ENTRY), file=sys.stderr)
+    print("  [lb] 0 pool + ~%d item = ~%d SQL requests this run (hourly cap %d)"
+          % (est_items, est_items, HOURLY_SQL_BUDGET), file=sys.stderr)
 
-    print("[3/5] candidate pool query (%d ladder-sourced ids)" % len(ladder_ids),
-          file=sys.stderr)
-    stats = {}
-    for r in query_pool(ladder_ids):
-        stats[(int(r["account_id"]), int(r["hero_id"]))] = r
-    print("  [pool] %d (account,hero) rows" % len(stats), file=sys.stderr)
+    print("[3/5] ranked hero stats for %d ladder-sourced ids (no SQL)"
+          % len(ladder_ids), file=sys.stderr)
+    stats = fetch_hero_stats(ladder_ids)
     if not stats:
-        raise SystemExit("0 rows back for %d ladder-sourced ids — match_player may be down "
-                         "or LOOKBACK_DAYS too narrow. Not writing CSVs — leaving yesterday's "
-                         "output/data.json in place." % len(ladder_ids))
+        raise SystemExit("hero-stats returned nothing for %d ladder-sourced ids. "
+                         "Not writing CSVs — leaving yesterday's output/data.json "
+                         "in place." % len(ladder_ids))
+    acct_tot = account_totals(stats)
 
     # resolve each ladder entry to one account: of the possible ids, keep the one
     # with the most games on THIS hero inside the window
     for (hid, _rg), rows in ladder.items():
         for r in rows:
-            scored = [(int(stats[(a, hid)]["hero_matches"]), a)
+            # most ranked games on THIS hero wins the id. hero_matches (a
+            # recency count over the last N matches) no longer exists — the
+            # hero-stats equivalent is total ranked games on the hero.
+            scored = [(stats[(a, hid)]["hero_games"], a)
                       for a in r["ids"] if (a, hid) in stats]
             r["account_id"] = max(scored)[1] if scored else None
             r["ambiguous"] = len(scored) > 1
@@ -575,7 +578,7 @@ def main():
     for (hid, _rg), rows in ladder.items():
         for r in rows:
             if r["account_id"] is not None:
-                played[r["account_id"]][hid] = int(stats[(r["account_id"], hid)]["hero_matches"])
+                played[r["account_id"]][hid] = stats[(r["account_id"], hid)]["hero_games"]
 
     home = {}
     for aid, counts in played.items():
@@ -585,6 +588,19 @@ def main():
     chosen = defaultdict(list)
     for (hid, region), rows in sorted(ladder.items()):
         taken = 0
+        # SELECTION ORDER. Previously this was ladder order, i.e. Valve's
+        # leaderboard position — but that board is not ranked-gated (~1,000
+        # entries per region while the season needs 60 normal wins to enter),
+        # so it ranks on all-mode standing while the builds we sample are
+        # ranked-only. Ordering by shrunk ranked win rate makes selection
+        # ranked-native. Entries with no resolved account keep ladder order so
+        # the exclusion reasons below still read sensibly.
+        rows = sorted(rows, key=lambda r: (
+            -shrunk(stats[(r["account_id"], hid)]["hero_wins"],
+                    stats[(r["account_id"], hid)]["hero_games"])
+            if r.get("account_id") is not None and (r["account_id"], hid) in stats
+            else 1.0,
+            r["ladder_pos"]))
         for r in rows:
             if taken >= PER_REGION:
                 break
@@ -606,14 +622,19 @@ def main():
                 excluded.append(dict(base, reason="already sampled in another region"))
                 continue
             s = stats[(aid, hid)]
-            hg = int(s.get("hero_games") or 0)
-            hw = int(s.get("hero_wins") or 0)
-            # off-hero = everything the account played minus this hero
-            og = max(int(s.get("acct_games") or 0) - hg, 0)
-            ow = max(int(s.get("acct_wins") or 0) - hw, 0)
-            chosen[hid].append(dict(base, account_id=aid, mmr=float(s["mmr"]),
-                                    hero_matches=int(s["hero_matches"]),
-                                    best_rn=int(s["best_rn"]),
+            hg, hw = s["hero_games"], s["hero_wins"]
+            if s["last_match_id"] is None:
+                excluded.append(dict(base, reason="no ranked match id on this hero"))
+                continue
+            # off-hero = every hero this account played, minus this one
+            tg, tw = acct_tot[aid]
+            og, ow = max(tg - hg, 0), max(tw - hw, 0)
+            chosen[hid].append(dict(base, account_id=aid,
+                                    # mmr is badge-derived and badge has read 0 on
+                                    # every ranked row since 2026-07-31, so it is
+                                    # recorded as None rather than a fake -6.0
+                                    mmr=None,
+                                    ranked_rating=round(shrunk(hw, hg), 4),
                                     last_match_id=int(s["last_match_id"]),
                                     last_played=s["last_played"],
                                     hero_games=hg, hero_wins=hw,
@@ -700,7 +721,9 @@ def main():
     for hid, lst in chosen.items():
         if not lst:
             continue
-        by_mmr = sorted(lst, key=lambda c: -c["mmr"])
+        # mmr was badge-derived and badge has read 0 on every ranked row since
+        # 2026-07-31, so the *_mmr columns are replaced by the ranked rating.
+        by_rating = sorted(lst, key=lambda c: -c["ranked_rating"])
         n = builds.get(hid, 0)
         g = sum(c.get("hero_games", 0) for c in lst)
         w = sum(c.get("hero_wins", 0) for c in lst)
@@ -709,12 +732,13 @@ def main():
         og = sum(c["offhero_games"] for c in thick)
         ow = sum(c["offhero_wins"] for c in thick)
         hero_wr, off_wr = _wr(w, g), _wr(ow, og)
-        top5 = [c["mmr"] for c in by_mmr[:5]]
+        top5 = [c["ranked_rating"] for c in by_rating[:5]]
         per_reg = {rg: sum(1 for c in lst if c["region"] == rg) for rg in REGIONS}
         tier.append({"hero_id": hid, "hero": heroes.get(hid, ""),
-                     "top_mmr": round(by_mmr[0]["mmr"], 4),
-                     "top5_mmr": round(sum(top5) / len(top5), 4),
-                     "median_mmr": round(sorted(c["mmr"] for c in lst)[len(lst) // 2], 4),
+                     "top_rating": round(by_rating[0]["ranked_rating"], 4),
+                     "top5_rating": round(sum(top5) / len(top5), 4),
+                     "median_rating": round(
+                         sorted(c["ranked_rating"] for c in lst)[len(lst) // 2], 4),
                      "elite_winrate": round(hero_wr, 2) if hero_wr is not None else "",
                      "elite_games": g,
                      "elite_se": round(_se(g), 2) if g else "",
@@ -729,7 +753,7 @@ def main():
                      "players": len(lst), "builds_sampled": n,
                      "thin": "YES" if n < TARGET_BUILDS else "",
                      "by_region": " ".join("%s=%d" % (r, per_reg[r]) for r in REGIONS),
-                     "top_account_id": by_mmr[0]["account_id"],
+                     "top_account_id": by_rating[0]["account_id"],
                      "lane_split": early.get(hid, {}).get("split", ""),
                      "lane_weak": early.get(hid, {}).get("weak", ""),
                      "lane_role": {"GS": "damage"}.get(
@@ -764,15 +788,17 @@ def main():
           ["rank", "hero_id", "hero", "elite_winrate", "elite_games", "elite_se",
            "offhero_winrate", "offhero_games", "offhero_players",
            "winrate_delta", "delta_se", "delta_rank",
-           "lane_split", "lane_weak", "lane_role", "median_mmr", "top5_mmr",
-           "top_mmr", "players", "builds_sampled", "thin", "by_region",
+           "lane_split", "lane_weak", "lane_role", "median_rating", "top5_rating",
+           "top_rating", "players", "builds_sampled", "thin", "by_region",
            "top_account_id", "icon_url"])
+    # sorted by ranked_rating now, since mmr is dead while badge reads 0
     write("candidates.csv",
-          [dict(c, hero=heroes.get(c["hero_id"], ""), mmr=round(c["mmr"], 4))
-           for lst in chosen.values() for c in sorted(lst, key=lambda x: -x["mmr"])],
+          [dict(c, hero=heroes.get(c["hero_id"], ""))
+           for lst in chosen.values()
+           for c in sorted(lst, key=lambda x: -x["ranked_rating"])],
           ["hero_id", "hero", "region", "ladder_pos", "account_id", "account_name",
-           "badge_level", "mmr", "hero_games", "hero_wins",
-           "offhero_games", "offhero_wins", "hero_matches", "best_rn",
+           "ranked_rating", "hero_games", "hero_wins",
+           "offhero_games", "offhero_wins",
            "last_match_id", "last_played", "ambiguous"])
     write("item_frequency.csv", freq,
           ["hero_id", "hero", "region", "snapshot", "item_id", "item", "category", "tier",
