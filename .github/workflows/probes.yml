@@ -43,6 +43,16 @@ jobs:
       #                            server-side what the pipeline computes by hand
       #   upgrades.* vs items.*  - answered from the schema alone, no query
       #   average_badge          - has the 2026-07-31 zeroing resolved?
+      # ZERO SQL. hero-stats is 100 req/s and batched, so this cannot touch the
+      # 20/hr budget. Tests whether match_mode=ranked (lowercase, per the spec)
+      # gives a ranked-native selector to replace leaderboard position.
+      - name: Probe ranked hero-stats
+        if: always()
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+        run: python3 probe_ranked_stats.py
+
       - name: Probe remaining
         env:
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
