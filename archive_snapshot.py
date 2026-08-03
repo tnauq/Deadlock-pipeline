@@ -208,9 +208,23 @@ def build_snapshot(region, ceil_rows, item_rows, tier_rows):
         if r["region"] != region:
             continue
         t = tier.get(r["hero"], {})
+        def _num(v, cast=int):
+            try:
+                return cast(v)
+            except (TypeError, ValueError):
+                return None
         heroes[slug(r["hero"])] = {
             "name": r["hero"],
+            # BOTH orderings are archived on purpose. `rank` is the ladder
+            # ceiling — the hero's best player's position on Valve's board,
+            # which is NOT ranked-gated and so is partly a pre-season artifact.
+            # `ranked_rank` orders the same players by shrunk ranked win rate
+            # instead. Keeping both means the season series stays continuous
+            # across the 2026-08-03 switch and the two can be compared directly
+            # rather than argued about.
             "rank": int(r["ceiling_rank"]),
+            "ranked_rank": _num(r.get("ranked_rank")),
+            "ranked_rating": _num(r.get("ranked_rating"), float),
             "pos": int(r["global_pos"]),
             "depth": int(r["region_depth"]),
             # carried for reference; the site ranks by ceiling, not win rate
@@ -265,6 +279,8 @@ def update_index(date, region, snap):
         "file": "%s-%s.json" % (date, region),
         # just enough to plot movement without opening the day file
         "ranks": {s: h["rank"] for s, h in snap["heroes"].items()},
+        "ranked_ranks": {s: h["ranked_rank"] for s, h in snap["heroes"].items()
+                         if h.get("ranked_rank") is not None},
         "pos": {s: h["pos"] for s, h in snap["heroes"].items()},
     }
     days = [d for d in index.get("days", [])
