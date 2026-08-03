@@ -78,7 +78,36 @@ def account_ids(n):
                if len(e.get("ids") or []) == 1][:n]
         print("  [ids] %d from board.json" % len(ids), file=sys.stderr)
         return ids
-    raise SystemExit("no output/candidates.csv or board.json - run the pipeline first")
+    # Nothing on disk - this probe runs standalone, without the pipeline, and
+    # output/ is gitignored. Fall back to the leaderboard, which is free
+    # (100 req/s, separate bucket from /v1/sql).
+    #
+    # possible_account_ids is a CANDIDATE list, not an identity: one name can
+    # carry 30+ ids and matching on it alone put the wrong player in 110 of 371
+    # slots. For this probe that does not matter - we only need real account ids
+    # that hero-stats will recognise, not correctly attributed ones. Taking
+    # entries with exactly ONE candidate id keeps it unambiguous anyway.
+    print("  [ids] no local files - pulling from the leaderboard instead",
+          file=sys.stderr)
+    out = []
+    for region in ("NAmerica", "Europe"):
+        data, err = get(BASE + "/v1/leaderboard/%s" % region)
+        if err:
+            print("  [ids] %s -> %s" % (region, err), file=sys.stderr)
+            continue
+        entries = data.get("entries") if isinstance(data, dict) else data
+        for e in entries or []:
+            cand = e.get("possible_account_ids") or []
+            if len(cand) == 1:
+                out.append(int(cand[0]))
+            if len(out) >= n:
+                break
+        if len(out) >= n:
+            break
+    if not out:
+        raise SystemExit("could not obtain any account ids from the leaderboard")
+    print("  [ids] %d unambiguous ids from the leaderboard" % len(out), file=sys.stderr)
+    return out[:n]
 
 
 def fetch(ids, mode=None):
