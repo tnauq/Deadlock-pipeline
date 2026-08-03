@@ -149,9 +149,20 @@ def main():
         else:
             print("  >>> RECOVERED - a badge floor is viable again.", file=sys.stderr)
 
+    # These are AggregatingMergeTree tables. SELECT * returns HTTP 400 because
+    # players_state is AggregateFunction(uniq, UInt32) and an unmerged aggregate
+    # state cannot be serialised to JSON. Name the columns instead, and merge the
+    # one aggregate explicitly. (Discovered 2026-08-03.)
+    BUCKET = {"item_cohort_stats_net_worth_agg": "bucket_net_worth",
+              "item_cohort_stats_time_agg": "bucket_minute"}
     for t in TABLES:
         print("\n-- %s: grain --" % t, file=sys.stderr)
-        rows = sql("SELECT * FROM %s LIMIT 3" % t, t)
+        rows = sql("SELECT match_mode, game_mode, day, cohort_item_id, item_id, "
+                   "%s AS bucket, n_matches, n_wins, n_sold, "
+                   "uniqMerge(players_state) AS players "
+                   "FROM %s GROUP BY match_mode, game_mode, day, cohort_item_id, "
+                   "item_id, bucket, n_matches, n_wins, n_sold "
+                   "ORDER BY n_matches DESC LIMIT 3" % (BUCKET[t], t), t)
         if not rows:
             print("    (no rows - table may be empty)", file=sys.stderr)
             continue
@@ -159,10 +170,15 @@ def main():
             print("     %s" % json.dumps(r)[:420], file=sys.stderr)
         keys = sorted(rows[0].keys())
         print("     keys: %s" % keys, file=sys.stderr)
-        grain = [k for k in keys if k in
-                 ("hero_id", "item_id", "net_worth", "net_worth_bucket", "bucket",
-                  "time_bucket", "game_time_s", "match_mode", "average_badge", "region")]
-        print("     >>> likely grain: %s" % (grain or "unclear"), file=sys.stderr)
+        print("     >>> grain: one row per (match_mode, game_mode, day, "
+              "cohort_item_id, item_id, bucket)", file=sys.stderr)
+        print("     >>> cohort_item_id + item_id = item CO-OCCURRENCE: how often "
+              "item_id is held", file=sys.stderr)
+        print("         in builds that also hold cohort_item_id, with n_wins. There "
+              "is NO hero_id,", file=sys.stderr)
+        print("         so this is item-pair data pooled across heroes - it does not "
+              "replace the", file=sys.stderr)
+        print("         pipeline's per-hero item aggregation.", file=sys.stderr)
 
     print("\n%d SQL calls used. Pipeline needs ~16 of 20/hr - do not run both in the "
           "same hour." % _sql_calls, file=sys.stderr)
