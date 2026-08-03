@@ -5,20 +5,6 @@ on:
     - cron: "0 */4 * * *"   # every 4 hours, on the hour (00/04/08/12/16/20 UTC)
                             # was daily; raised while ranked mode saturates
   workflow_dispatch:
-    inputs:
-      region:
-        description: "Region to process (auto = alternate by hour)"
-        required: false
-        default: auto
-        type: choice
-        options: [auto, NAmerica, Europe]
-
-permissions:
-  contents: write
-
-concurrency:
-  group: daily-refresh
-  cancel-in-progress: false
 
 jobs:
   refresh:
@@ -49,25 +35,6 @@ jobs:
       # to qualify, the build step fails on purpose and yesterday's data.json
       # stays live — that's the safety net working, not a bug. Revisit this
       # setting once hero-region coverage looks like it did under Unranked.
-      # Runs alternate between regions. The unkeyed API allows 20 SQL
-      # requests/HOUR and processing both regions in one run projects past that
-      # as ranked saturates (~30 calls at full board depth). One region per run
-      # halves it. Cron fires 00/04/08/12/16/20 UTC, so each region refreshes
-      # every 8 hours. docs/data.json is the persistent store — build_site_data
-      # merges, carrying the region this run didn't touch forward unchanged.
-      # Manual runs (workflow_dispatch) can override with the region input.
-      - name: Pick region
-        id: region
-        run: |
-          if [ -n "${{ inputs.region }}" ] && [ "${{ inputs.region }}" != "auto" ]; then
-            REGION="${{ inputs.region }}"
-          else
-            H=$(date -u +%-H)
-            if [ $(( (H / 4) % 2 )) -eq 0 ]; then REGION=NAmerica; else REGION=Europe; fi
-          fi
-          echo "region=$REGION" >> "$GITHUB_OUTPUT"
-          echo "This run processes: $REGION"
-
       # Candidate selection no longer filters on badge at all (removed
       # 2026-07-31). average_badge_team0/1 on match_player went to a
       # populated-but-zero state across the entire ranked dataset after the
@@ -85,7 +52,7 @@ jobs:
           PER_REGION: "20"
           LEADERBOARD_DEPTH: "100"
           MATCH_MODE: "Ranked"
-          REGIONS: ${{ steps.region.outputs.region }}
+          REGIONS: "NAmerica,Europe"
         run: python3 deadlock_pipeline.py
 
       - name: Fetch any new icons
@@ -98,15 +65,11 @@ jobs:
       # Must run BEFORE the builder: the site's ordering and tiers come from
       # output/ceiling.csv. No continue-on-error now that it is load-bearing.
       - name: Ceiling ranking
-        env:
-          REGIONS: ${{ steps.region.outputs.region }}
         run: python3 ceiling_rank.py
 
       # exits non-zero on obviously broken data, which fails the job and
       # leaves the last good docs/data.json in place
       - name: Build site data
-        env:
-          REGIONS: ${{ steps.region.outputs.region }}
         run: python3 build_site_data.py
 
       # One trimmed snapshot per region per DAY, for charting change over time.
@@ -120,8 +83,6 @@ jobs:
       # these are /v1/sql, so the 20/hr budget that forced the region split is
       # untouched. Remove this step once its questions are answered.
       - name: Archive daily snapshot
-        env:
-          REGIONS: ${{ steps.region.outputs.region }}
         run: python3 archive_snapshot.py
 
       # docs/ plus archive/ are committed. output/ still stays off the repo:
