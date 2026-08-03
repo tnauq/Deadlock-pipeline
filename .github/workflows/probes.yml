@@ -14,6 +14,11 @@ on:
         required: false
         default: false
         type: boolean
+      cohort_only:
+        description: "Only the two item_cohort_stats tables (2 SQL calls; bans and badge already answered)"
+        required: false
+        default: false
+        type: boolean
       lookback_days:
         description: "Days of ranked matches to scan"
         required: false
@@ -43,4 +48,5 @@ jobs:
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
           PROBE_LOOKBACK_DAYS: ${{ inputs.lookback_days }}
           SKIP_SQL: ${{ inputs.free_only && '1' || '0' }}
+          COHORT_ONLY: ${{ inputs.cohort_only && '1' || '0' }}
         run: python3 probe_remaining.py
