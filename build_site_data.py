@@ -7,13 +7,14 @@ Turn the pipeline CSVs into one JSON file the static site reads.
 Reads  ./output/tierlist.csv, ./output/item_frequency.csv, ./output/ceiling.csv
 Writes ./docs/data.json
 
-MERGES BY REGION. The unkeyed API allows 20 SQL requests/hour, and processing
-both regions in one run projects past that as ranked saturates. So runs are
-split — one region each, alternating — and docs/data.json is the persistent
-store: output/ is gitignored and runners are ephemeral, so the previous
-region's CSVs are gone by the time the next run starts. Each run replaces only
-the region it processed and leaves the other block untouched. Set REGIONS to
-control which region a run handles.
+MERGES BY REGION. Both regions are processed in one run again as of
+2026-08-03 — the candidate pool moved off /v1/sql onto /v1/players/hero-stats,
+taking a run from ~16 SQL calls to ~4, so the alternating-region split that
+existed purely to halve SQL usage is no longer needed.
+
+The merge is KEPT anyway: it costs nothing, and it means a run that processes
+only one region (a manual REGIONS override, or a partial failure) still leaves
+the other region's block intact instead of wiping it.
 
 Heroes are ordered by CEILING — the ladder position of each hero's strongest
 player, computed per region. Win rate is carried through for reference but is
