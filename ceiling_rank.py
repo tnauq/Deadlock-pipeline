@@ -192,7 +192,9 @@ def main():
                 "pct": round(100.0 * rec["pos"] / max(depth[rg], 1), 3),
                 "badge_level": rec["badge"],
                 "hero_ladder_pos": row["ladder_pos"],
-                "mmr": row["mmr"],
+                # mmr is dead while badge reads 0; ranked_rating is the
+                # shrunk ranked win rate the pipeline now selects on
+                "ranked_rating": row.get("ranked_rating", ""),
                 "match": how,
                 # Valve's own view of what this account mains — a sanity check
                 # on the one-trick assignment, not used in the ordering
@@ -227,6 +229,21 @@ def main():
                       key=lambda d: (d["global_pos"], _lp(d), -_wr(d)))
         for i, d in enumerate(rows, 1):
             d["ceiling_rank"] = i
+
+        # SECOND ORDERING, kept alongside the first on purpose.
+        # ceiling_rank is the ladder position of the hero's best player, but
+        # Valve's board is not ranked-gated, so that ordering is partly a
+        # pre-season artifact. ranked_rank orders by the same player's shrunk
+        # ranked win rate instead. Both are written so the season archive keeps
+        # a continuous series across the switch, and so the two orderings can
+        # be compared directly rather than argued about.
+        def _rr(d):
+            try:
+                return float(d["ranked_rating"])
+            except (TypeError, ValueError):
+                return -1.0
+        for i, d in enumerate(sorted(rows, key=lambda d: (-_rr(d), d["global_pos"])), 1):
+            d["ranked_rank"] = i
         out.extend(rows)
 
     for region in REGIONS:
@@ -236,9 +253,10 @@ def main():
             print("  [warn] %s: no located pool member for %d heroes: %s"
                   % (region, len(gap), ", ".join(gap)), file=sys.stderr)
 
-    cols = ["region", "ceiling_rank", "hero", "hero_id", "ceiling_player", "global_pos",
-            "region_depth", "pct", "badge_level", "hero_ladder_pos", "mmr", "match",
-            "valve_top_hero", "pool_located", "winrate_rank", "elite_winrate"]
+    cols = ["region", "ceiling_rank", "ranked_rank", "hero", "hero_id", "ceiling_player",
+            "global_pos", "region_depth", "pct", "badge_level", "hero_ladder_pos",
+            "ranked_rating", "match", "valve_top_hero", "pool_located",
+            "winrate_rank", "elite_winrate"]
     path = os.path.join(OUT_DIR, "ceiling.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
