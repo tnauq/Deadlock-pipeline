@@ -6,6 +6,14 @@ on:
                             # was daily; raised while ranked mode saturates
   workflow_dispatch:
 
+# The commit step pushes docs/data.json, icons and the archive back to the repo,
+# so the job needs write access. Without this the default GITHUB_TOKEN may be
+# read-only and the push fails with 403 "Permission to ... denied to
+# github-actions[bot]" AFTER the commit succeeds, which reads like a pipeline
+# failure but is purely a permissions one.
+permissions:
+  contents: write
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
