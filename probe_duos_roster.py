@@ -72,19 +72,45 @@ def get(url):
         return None, str(e)
 
 
-def sql(query, label):
+def sql(query, label, tries=4):
+    """Run one query, retrying on 429.
+
+    Retry matters more here than elsewhere: a dropped chunk does not just lose
+    rows, it makes every seed in that chunk look like a NON-duo, which biases
+    the ceiling-vs-control comparison in an unpredictable direction. On
+    2026-08-04 two chunks 429'd and only 973 of 1,693 rosters were fetched.
+
+    The 429 body carries the exact wait in `next_request_in`; exponential
+    backoff from 1s is far too short for a 2/min bucket. A 429 does NOT consume
+    budget, so a retry is free apart from the wait.
+    """
     global _sql_calls
     if _sql_calls:
         print("    ... waiting %.0fs (SQL 2/min)" % SQL_PAUSE, file=sys.stderr)
         time.sleep(SQL_PAUSE)
-    _sql_calls += 1
-    rows, err = get(BASE + "/v1/sql?format=json&query=" + urllib.parse.quote(query))
-    if err:
-        print("    [%s] %s" % (label, err), file=sys.stderr)
-        return []
-    if isinstance(rows, dict):
-        rows = rows.get("data", rows.get("rows", []))
-    return rows
+    for attempt in range(tries):
+        rows, err = get(BASE + "/v1/sql?format=json&query=" + urllib.parse.quote(query))
+        if not err:
+            _sql_calls += 1
+            if isinstance(rows, dict):
+                rows = rows.get("data", rows.get("rows", []))
+            return rows
+        if "429" not in err or attempt == tries - 1:
+            print("    [%s] %s" % (label, err), file=sys.stderr)
+            return []
+        wait = SQL_PAUSE
+        try:
+            body = json.loads(err.split(": ", 1)[1])
+            hint = body.get("error", {}).get("next_request_in")
+            # next_request_in is often 0 at the moment of rejection, so never
+            # wait less than the pause the bucket actually needs
+            wait = max(int(hint or 0) + 5, SQL_PAUSE)
+        except Exception:
+            pass
+        print("    [%s] 429, retrying in %.0fs (attempt %d/%d)"
+              % (label, wait, attempt + 1, tries), file=sys.stderr)
+        time.sleep(wait)
+    return []
 
 
 def seed_accounts(n_controls):
@@ -186,8 +212,15 @@ def main():
         for r in sql(q, "roster %d-%d" % (i + 1, i + len(part))):
             roster[int(r["match_id"])][int(r["account_id"])] = (r["team"],
                                                                 int(r["hero_id"]))
-    print("  [sql] rosters for %d matches, %d SQL calls\n" % (len(roster), _sql_calls),
-          file=sys.stderr)
+    cov = 100.0 * len(roster) / max(len(wanted), 1)
+    print("  [sql] rosters for %d of %d matches (%.0f%%), %d SQL calls"
+          % (len(roster), len(wanted), cov, _sql_calls), file=sys.stderr)
+    if cov < 95:
+        print("  [warn] INCOMPLETE - seeds whose matches fell in a failed chunk "
+              "will look", file=sys.stderr)
+        print("         like non-duos. Treat the duo rates below as undercounts.",
+              file=sys.stderr)
+    print("", file=sys.stderr)
     if not roster:
         return
 
