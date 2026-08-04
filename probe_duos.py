@@ -45,7 +45,9 @@ BASE = "https://api.deadlock-api.com"
 API_KEY = os.environ.get("DEADLOCK_API_KEY")
 REGIONS = [r.strip() for r in
            (os.environ.get("REGIONS") or "NAmerica,Europe").split(",") if r.strip()]
-N_ACCOUNTS = int(os.environ.get("DUO_ACCOUNTS") or 400)
+# the board gives ~1,000 per region and hero-stats is batched at 100 req/s, so
+# reading the whole board costs little more than a fraction of it
+N_ACCOUNTS = int(os.environ.get("DUO_ACCOUNTS") or 1000)
 MIN_SHARED = int(os.environ.get("DUO_MIN_SHARED") or 5)
 MIN_RATE = float(os.environ.get("DUO_MIN_RATE") or 0.30)
 MAX_URL = int(os.environ.get("MAX_URL") or 9000)
@@ -155,6 +157,31 @@ def main():
               % (sum(1 for v in by_match.values() if len(v) > 1), len(shared_in)),
               file=sys.stderr)
 
+        # CALIBRATE FIRST. These are the top N players in one region, so they
+        # meet each other constantly as OPPONENTS — 6,040 co-occurring pairs in
+        # NA at 400 accounts. The raw pair count is therefore meaningless and
+        # the rate threshold is doing all the work, so print the null
+        # distribution before applying any cutoff.
+        rates = []
+        for (a, b), n in shared_in.items():
+            small = min(len(per_acct[a]), len(per_acct[b]))
+            if small:
+                rates.append(n / small)
+        rates.sort()
+        def pct(p):
+            return rates[min(int(len(rates) * p), len(rates) - 1)] if rates else 0.0
+        print("  overlap-rate distribution over all %d pairs:" % len(rates),
+              file=sys.stderr)
+        print("     median %.3f | 90th %.3f | 99th %.3f | 99.9th %.3f | max %.3f"
+              % (pct(0.50), pct(0.90), pct(0.99), pct(0.999),
+                 rates[-1] if rates else 0), file=sys.stderr)
+        print("     a threshold is only meaningful well above the 99th percentile",
+              file=sys.stderr)
+        over = sum(1 for r in rates if r >= MIN_RATE)
+        print("     %d pairs (%.2f%%) clear the %.0f%% cutoff\n"
+              % (over, 100.0 * over / max(len(rates), 1), 100 * MIN_RATE),
+              file=sys.stderr)
+
         # score by overlap RATE against the smaller schedule
         scored = []
         for (a, b), n in shared_in.items():
@@ -177,6 +204,20 @@ def main():
                   % (str(names.get(a, a))[:18], str(names.get(b, b))[:18], n, small,
                      100 * rate),
                   file=sys.stderr)
+
+        # players appearing in more than one candidate duo. A noise process
+        # would not produce this; people having two regular partners would.
+        seen = Counter()
+        for _r, _n, _s, a, b in scored:
+            seen[a] += 1
+            seen[b] += 1
+        rep = [(k, v) for k, v in seen.items() if v > 1]
+        if rep:
+            print("\n  players in more than one candidate duo (%d):" % len(rep),
+                  file=sys.stderr)
+            for k, v in sorted(rep, key=lambda x: -x[1]):
+                print("     %-20s %d partners" % (str(names.get(k, k))[:20], v),
+                      file=sys.stderr)
 
         # what do the duos play together?
         combo = Counter()
