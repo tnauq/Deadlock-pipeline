@@ -17,7 +17,7 @@ that missed the true ceiling on 4 — worst case Mirage NA, reported at position
 
     python3 ceiling_rank.py
 
-Reads  ./output/candidates.csv (for ranked_rating only), ./output/tierlist.csv
+Reads  ./output/tierlist.csv (for hero ids and the win-rate reference columns)
 Writes ./output/ceiling.csv
 
 Requests: one cross-hero board per region, plus one board per hero per region
@@ -152,7 +152,6 @@ def best_on_board(hero_entries, by_name):
 
 
 def main():
-    cands = list(csv.DictReader(open(os.path.join(OUT_DIR, "candidates.csv"))))
     tier = {r["hero"]: r for r in csv.DictReader(open(os.path.join(OUT_DIR, "tierlist.csv")))}
 
     print("[1/2] leaderboards", file=sys.stderr)
@@ -188,13 +187,6 @@ def main():
     if not hero_ids:
         raise SystemExit("no hero ids in tierlist.csv")
 
-    # ranked_rating per (region, account name), where the pipeline resolved it.
-    # The ceiling player often is not in our 20-player pool, so this is a
-    # reference column that may legitimately be blank.
-    rating = {}
-    for row in cands:
-        rating[(row["region"], row["account_name"])] = row.get("ranked_rating", "")
-
     per_region = defaultdict(list)
     for rg in REGIONS:
         by_name = boards[rg][0]
@@ -224,11 +216,10 @@ def main():
                 # position on the hero's OWN board - now read directly rather
                 # than inherited from whichever pool member happened to resolve
                 "hero_ladder_pos": hero_pos,
-                "ranked_rating": rating.get((rg, rec["name"]), ""),
                 "match": "confirmed",
                 "valve_top_hero": "YES" if hid in (rec["top_heroes"] or []) else "",
                 # how many of the hero board's players are on the general board
-                "pool_located": located,
+                "located_on_general": located,
                 "board_size": len(hb),
                 "winrate_rank": t.get("rank", ""),
                 "elite_winrate": t.get("elite_winrate", ""),
@@ -262,20 +253,6 @@ def main():
         for i, d in enumerate(rows, 1):
             d["ceiling_rank"] = i
 
-        # SECOND ORDERING, kept alongside the first on purpose.
-        # ceiling_rank is the ladder position of the hero's best player, but
-        # Valve's board is not ranked-gated, so that ordering is partly a
-        # pre-season artifact. ranked_rank orders by the same player's shrunk
-        # ranked win rate instead. Both are written so the season archive keeps
-        # a continuous series across the switch, and so the two orderings can
-        # be compared directly rather than argued about.
-        def _rr(d):
-            try:
-                return float(d["ranked_rating"])
-            except (TypeError, ValueError):
-                return -1.0
-        for i, d in enumerate(sorted(rows, key=lambda d: (-_rr(d), d["global_pos"])), 1):
-            d["ranked_rank"] = i
         out.extend(rows)
 
     for region in REGIONS:
@@ -285,9 +262,9 @@ def main():
             print("  [warn] %s: no located pool member for %d heroes: %s"
                   % (region, len(gap), ", ".join(gap)), file=sys.stderr)
 
-    cols = ["region", "ceiling_rank", "ranked_rank", "hero", "hero_id", "ceiling_player",
+    cols = ["region", "ceiling_rank", "hero", "hero_id", "ceiling_player",
             "global_pos", "region_depth", "pct", "badge_level", "hero_ladder_pos",
-            "ranked_rating", "match", "valve_top_hero", "pool_located", "board_size",
+            "match", "valve_top_hero", "located_on_general", "board_size",
             "winrate_rank", "elite_winrate"]
     path = os.path.join(OUT_DIR, "ceiling.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
