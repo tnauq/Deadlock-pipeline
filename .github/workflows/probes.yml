@@ -51,6 +51,19 @@ jobs:
       # approach approximates badly: on 2026-08-03 Mirage NA's reported ceiling
       # was thirkl at position 379, while rocaine is #1 on the Mirage board and
       # inside the general top 8.
+      # ZERO SQL. Infers duo-queue partners from match co-occurrence, since
+      # match_player has no party column and the only party_* fields in the API
+      # are for custom lobbies. hero-stats returns match id arrays per
+      # (account, hero); accounts that keep appearing in the same matches are
+      # queueing together.
+      - name: Probe duos
+        if: always()
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+          DUO_ACCOUNTS: "400"
+        run: python3 probe_duos.py
+
       - name: Probe board cross-reference
         if: always()
         continue-on-error: true
