@@ -37,6 +37,7 @@ COST: match ids come free from hero-stats. Rosters need SQL — about 4 calls fo
 
 import csv
 import json
+import math
 import os
 import sys
 import time
@@ -207,11 +208,11 @@ def main():
     per = max(50, MAX_URL // 25)
     for i in range(0, len(wanted), per):
         part = wanted[i:i + per]
-        q = ("SELECT match_id, account_id, team, hero_id FROM match_player "
+        q = ("SELECT match_id, account_id, team, hero_id, won FROM match_player "
              "WHERE match_id IN (%s)" % ",".join(str(m) for m in part))
         for r in sql(q, "roster %d-%d" % (i + 1, i + len(part))):
-            roster[int(r["match_id"])][int(r["account_id"])] = (r["team"],
-                                                                int(r["hero_id"]))
+            roster[int(r["match_id"])][int(r["account_id"])] = (
+                r["team"], int(r["hero_id"]), int(r["won"] or 0))
     cov = 100.0 * len(roster) / max(len(wanted), 1)
     print("  [sql] rosters for %d of %d matches (%.0f%%), %d SQL calls"
           % (len(roster), len(wanted), cov, _sql_calls), file=sys.stderr)
@@ -240,7 +241,7 @@ def main():
             if not mine:
                 run.clear()
                 continue
-            here = {b for b, (t, _h) in roster[m].items() if b != a and t == mine[0]}
+            here = {b for b, (t, _h, _w) in roster[m].items() if b != a and t == mine[0]}
             for b in here:
                 tog[b] += 1
                 run[b] += 1
@@ -284,7 +285,7 @@ def main():
                 run.clear()
                 continue
             here = set()
-            for b, (team, hid) in roster[m].items():
+            for b, (team, hid, _w) in roster[m].items():
                 if b != a and team == mine[0]:
                     here.add(b)
                     together[b] += 1
@@ -315,7 +316,7 @@ def main():
             if not mine:
                 run.clear()
                 continue
-            here = {b for b, (t, _h) in roster[m].items() if b != a and t == mine[0]}
+            here = {b for b, (t, _h, _w) in roster[m].items() if b != a and t == mine[0]}
             for b in here:
                 tog[b] += 1
                 run[b] += 1
@@ -339,6 +340,54 @@ def main():
     print("  A small one means it is just how everyone plays, and the ceiling",
           file=sys.stderr)
     print("  players are not special in this respect.", file=sys.stderr)
+
+    # ---- does playing with your partner actually help? ------------------
+    # WITHIN-PLAYER comparison: the same seed's matches, split by whether the
+    # partner was on their team. This controls for player skill completely,
+    # unlike comparing duo players against solo players, where any difference
+    # could just be that better players duo more.
+    print("\n" + "=" * 74, file=sys.stderr)
+    print("WIN RATE WITH vs WITHOUT THE PARTNER (same player, both samples)",
+          file=sys.stderr)
+    print("=" * 74, file=sys.stderr)
+    print("  %-22s %14s %14s %8s" % ("seed", "with partner", "without", "delta"),
+          file=sys.stderr)
+    tw = tg = ow = og = 0
+    shown = 0
+    for a, partners in sorted(have.items()):
+        ms = [m for m in sched[a] if m in roster and a in roster[m]]
+        if not ms:
+            continue
+        for b in partners:
+            wi = [m for m in ms if roster[m].get(b, (None,))[0] == roster[m][a][0]]
+            wo = [m for m in ms if m not in wi]
+            if not wi or not wo:
+                # a duo that plays every game together has no solo baseline;
+                # counting it would bias the pooled figure
+                continue
+            wiw = sum(roster[m][a][2] for m in wi)
+            wow = sum(roster[m][a][2] for m in wo)
+            tw += wiw; tg += len(wi); ow += wow; og += len(wo)
+            shown += 1
+            print("  %-22s %6d/%-3d %4.0f%% %6d/%-3d %4.0f%% %+7.0f"
+                  % (str(name.get(a, a))[:22], wiw, len(wi), 100.0 * wiw / len(wi),
+                     wow, len(wo), 100.0 * wow / len(wo),
+                     100.0 * wiw / len(wi) - 100.0 * wow / len(wo)), file=sys.stderr)
+    if tg and og:
+        pw, po = tw / tg, ow / og
+        se = math.sqrt(pw * (1 - pw) / tg + po * (1 - po) / og)
+        z = (pw - po) / se if se else 0
+        print("\n  pooled over %d seed-partner pairs with both samples:" % shown,
+              file=sys.stderr)
+        print("     with partner    %4d/%-4d  %.1f%%" % (tw, tg, 100 * pw), file=sys.stderr)
+        print("     without         %4d/%-4d  %.1f%%" % (ow, og, 100 * po), file=sys.stderr)
+        print("     difference      %+.1f pts   z = %.2f%s"
+              % (100 * (pw - po), z, "  (significant)" if abs(z) >= 1.96 else
+                 "  (not distinguishable from zero)"), file=sys.stderr)
+        print("\n  Duos that play EVERY game together are excluded — they have no",
+              file=sys.stderr)
+        print("  solo baseline, and including them would bias the comparison.",
+              file=sys.stderr)
 
     print("\n  %d partner relationships found across %d seeds" % (found, len(sched)),
           file=sys.stderr)
