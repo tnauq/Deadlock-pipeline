@@ -61,6 +61,23 @@ jobs:
       # are for custom lobbies. hero-stats returns match id arrays per
       # (account, hero); accounts that keep appearing in the same matches are
       # queueing together.
+      # The duo probe seeds from output/ceiling.csv, but output/ is gitignored
+      # and this workflow does not otherwise run the pipeline — without this
+      # step the probe would silently fall back to controls only, which is the
+      # opposite of the point. Cheap now: the candidate pool moved off /v1/sql
+      # onto hero-stats on 2026-08-03, so a pipeline run is ~4 SQL calls, not
+      # the ~16 it used to be. Pipeline 4 + duo probe 8 = ~12 of the 20/hr cap.
+      - name: Build ceiling data for seeding
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+          PER_REGION: "20"
+          LEADERBOARD_DEPTH: "100"
+          MATCH_MODE: "Ranked"
+          REGIONS: "NAmerica,Europe"
+        run: |
+          python3 deadlock_pipeline.py
+          python3 ceiling_rank.py
+
       # Team-confirmed duo detection from match ROSTERS. Replaces the
       # co-occurrence approach in probe_duos.py, which could not tell
       # teammates from opponents and whose 30% threshold sat at the 99th
