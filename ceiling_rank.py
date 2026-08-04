@@ -4,21 +4,32 @@ Ceiling ranking: order heroes by their single strongest player.
 
 The per-hero leaderboard gives position WITHIN a hero, so it cannot compare
 heroes against each other — every hero has a rank 1. The cross-hero board for a
-region gives one ordering over all players, and positions are unique, so the
-13 heroes whose best player is pinned at the mmr ceiling separate cleanly.
+region gives one ordering over all players, so a hero's ceiling is its best
+board player's position on the cross-hero board.
+
+This CROSS-REFERENCES the two boards directly: every player on a hero's board,
+located on the region's cross-hero board, lowest position wins. Until
+2026-08-03 it instead located the pipeline's chosen 20-player pool, so any
+hero-board player who failed identity resolution or fell outside the per-region
+cap was invisible however highly they ranked. Measured across 12 hero-regions,
+that missed the true ceiling on 4 — worst case Mirage NA, reported at position
+379 when the hero's top player sat at position 2.
 
     python3 ceiling_rank.py
 
-Reads  ./output/candidates.csv, ./output/tierlist.csv
+Reads  ./output/candidates.csv (for ranked_rating only), ./output/tierlist.csv
 Writes ./output/ceiling.csv
 
-Two requests total (one per region). No API key needed.
+Requests: one cross-hero board per region, plus one board per hero per region
+(~78 total). The leaderboard endpoint is 100 req/s and a separate bucket from
+/v1/sql, so this costs nothing against the SQL budget. No API key needed.
 """
 
 import csv
 import json
 import os
 import sys
+import time
 import urllib.request
 from collections import defaultdict
 
@@ -27,9 +38,10 @@ REGIONS = [r.strip() for r in
            (os.environ.get("REGIONS") or "NAmerica,Europe").split(",") if r.strip()]
 OUT_DIR = "output"
 
-# Accept only name+id confirmed matches. Set STRICT=0 to also allow entries
-# whose name is unique on the board but whose candidate id list omits our id.
-STRICT = (os.environ.get("STRICT") or "1") != "0"
+# Matching is always name+id confirmed now: an entry counts only when the same
+# display name appears on both boards AND their candidate id lists intersect.
+# The old STRICT toggle relaxed this to name-only, which is unsafe here — the
+# cross-hero board carries ~40,000 distinct candidate ids across 1,000 entries.
 
 # How many board entries to keep for the archive (player bar-chart-race data).
 # Costs no extra API calls — the full board is already fetched.
@@ -86,30 +98,57 @@ def fetch_board(region):
     return by_name, len(entries), ordered
 
 
-def locate(row, boards):
-    """Find a pool member on their region's cross-hero board.
+def fetch_hero_board(region, hero_id):
+    """One hero's board for one region. Position is the list index.
 
-    possible_account_ids is a CANDIDATE list, not an identity — the 1001 NA
-    entries between them reference ~34,700 distinct ids, and one name can carry
-    30+. Matching on it alone put the wrong player in 110 of 371 slots. So an
-    accepted match needs BOTH the display name and the id to agree.
+    Unlike the cross-hero board, the per-hero board's `rank` field appears to
+    be unique and sequential (1..N with no ties), but list index is used
+    anyway for consistency.
     """
-    by_name = boards[row["region"]][0]
-    aid = int(row["account_id"])
-    named = by_name.get(row["account_name"] or "", [])
-    if not named:
-        return None, "name_absent"
+    try:
+        data = get("%s/v1/leaderboard/%s/%d" % (BASE, region, hero_id))
+    except Exception as e:
+        print("  [hb] %s hero %d -> %s" % (region, hero_id, e), file=sys.stderr)
+        return []
+    entries = data.get("entries") if isinstance(data, dict) else data
+    out = []
+    for i, e in enumerate(entries or [], 1):
+        nm = e.get("account_name")
+        if not nm:
+            continue
+        out.append({"hero_pos": i, "name": nm,
+                    "ids": {int(a) for a in (e.get("possible_account_ids") or []) if a}})
+    return out
 
-    confirmed = [r for r in named if aid in r["ids"]]
-    if len(confirmed) == 1:
-        return confirmed[0], "confirmed"
-    if len(confirmed) > 1:
-        # same name, several entries, all listing this id — cannot separate them
-        return None, "ambiguous"
-    if len(named) == 1:
-        # name is unique on the board but the id isn't in its candidate list
-        return named[0], "name_only"
-    return None, "unresolved"
+
+def best_on_board(hero_entries, by_name):
+    """Best cross-hero position among a hero board's players.
+
+    This is the ceiling, done directly: every player on the hero's board,
+    located on the region's cross-hero board, lowest position wins.
+
+    The previous approach located OUR CHOSEN POOL instead, so any hero-board
+    player who failed identity resolution or fell outside the per-region cap
+    was invisible however highly they ranked. Measured 2026-08-03 on 12
+    hero-regions, that missed the true ceiling on 4 of them — worst case
+    Mirage NA, which reported position 379 when the hero's top player sat at
+    position 2.
+
+    A match needs BOTH the display name and an account id to agree, the same
+    dual confirmation used elsewhere: possible_account_ids is a candidate list
+    (~40,000 distinct ids across 1,000 NA entries) and name-only matching put
+    the wrong player in 110 of 371 slots historically.
+    """
+    best = None
+    located = 0
+    for he in hero_entries:
+        for cand in by_name.get(he["name"], []):
+            if he["ids"] & cand["ids"]:
+                located += 1
+                if best is None or cand["pos"] < best[0]["pos"]:
+                    best = (cand, he["hero_pos"])
+                break
+    return best, located
 
 
 def main():
@@ -136,73 +175,66 @@ def main():
     except Exception as e:
         print("  [warn] could not write board.json (%s)" % e, file=sys.stderr)
 
-    print("[2/2] locating pool members", file=sys.stderr)
-    by_hero = defaultdict(list)
-    tally = defaultdict(int)
-    hits = []
-    for row in cands:
-        if row["region"] not in boards:
-            continue
-        rec, how = locate(row, boards)
-        tally[how] += 1
-        if rec and not (STRICT and how == "name_only"):
-            hits.append((row, rec, how))
-
-    # One board entry is one player. Two pool accounts sharing a display name
-    # can both confirm against the same entry, because that entry's candidate
-    # list holds both ids — which made one name the ceiling for two heroes.
-    # Neither claim can be preferred, so drop both.
-    claimed = defaultdict(list)
-    for row, rec, how in hits:
-        claimed[(row["region"], rec["pos"])].append(row)
-    contested = {k for k, v in claimed.items()
-                 if len({r["account_id"] for r in v}) > 1}
-    for row, rec, how in hits:
-        if (row["region"], rec["pos"]) in contested:
-            tally["contested_entry"] += 1
-            continue
-        by_hero[row["hero"]].append((row, rec, how))
-    if contested:
-        print("  [match] dropped %d entries claimed by more than one pool account"
-              % len(contested), file=sys.stderr)
-    print("  [match] " + "  ".join("%s=%d" % kv for kv in sorted(tally.items())),
+    print("[2/2] cross-referencing hero boards against the general board",
           file=sys.stderr)
-    if STRICT:
-        print("  [match] strict mode: name_only matches excluded", file=sys.stderr)
 
-    # Each region is ranked against its own board. Nothing is compared across
-    # regions, so there is no percentile normalisation and no tiebreak convention.
+    # hero_id -> name, from tierlist (which the pipeline just wrote)
+    hero_ids = {}
+    for h, t in tier.items():
+        try:
+            hero_ids[int(t["hero_id"])] = h
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not hero_ids:
+        raise SystemExit("no hero ids in tierlist.csv")
+
+    # ranked_rating per (region, account name), where the pipeline resolved it.
+    # The ceiling player often is not in our 20-player pool, so this is a
+    # reference column that may legitimately be blank.
+    rating = {}
+    for row in cands:
+        rating[(row["region"], row["account_name"])] = row.get("ranked_rating", "")
+
     per_region = defaultdict(list)
-    for hero, pairs in by_hero.items():
-        best = defaultdict(list)
-        for row, rec, how in pairs:
-            best[row["region"]].append((row, rec, how))
-        for rg, lst in best.items():
-            lst.sort(key=lambda p: p[1]["pos"])
-            row, rec, how = lst[0]
+    for rg in REGIONS:
+        by_name = boards[rg][0]
+        n_missing = 0
+        for hid, hero in sorted(hero_ids.items(), key=lambda kv: kv[1]):
+            hb = fetch_hero_board(rg, hid)
+            time.sleep(0.15)          # 100 req/s allowed; stay well clear
+            if not hb:
+                n_missing += 1
+                continue
+            best, located = best_on_board(hb, by_name)
+            if best is None:
+                # nobody on this hero's board appears in the region's top-N
+                n_missing += 1
+                continue
+            rec, hero_pos = best
             t = tier.get(hero, {})
-            hid = int(t.get("hero_id") or row["hero_id"])
             per_region[rg].append({
                 "hero": hero,
                 "hero_id": hid,
                 "region": rg,
-                "ceiling_player": rec["name"] or row["account_name"],
+                "ceiling_player": rec["name"],
                 "global_pos": rec["pos"],
                 "region_depth": depth[rg],
                 "pct": round(100.0 * rec["pos"] / max(depth[rg], 1), 3),
                 "badge_level": rec["badge"],
-                "hero_ladder_pos": row["ladder_pos"],
-                # mmr is dead while badge reads 0; ranked_rating is the
-                # shrunk ranked win rate the pipeline now selects on
-                "ranked_rating": row.get("ranked_rating", ""),
-                "match": how,
-                # Valve's own view of what this account mains — a sanity check
-                # on the one-trick assignment, not used in the ordering
+                # position on the hero's OWN board - now read directly rather
+                # than inherited from whichever pool member happened to resolve
+                "hero_ladder_pos": hero_pos,
+                "ranked_rating": rating.get((rg, rec["name"]), ""),
+                "match": "confirmed",
                 "valve_top_hero": "YES" if hid in (rec["top_heroes"] or []) else "",
-                "pool_located": len(lst),
+                # how many of the hero board's players are on the general board
+                "pool_located": located,
+                "board_size": len(hb),
                 "winrate_rank": t.get("rank", ""),
                 "elite_winrate": t.get("elite_winrate", ""),
             })
+        print("  [xref] %-9s %d heroes ranked, %d with no locatable player"
+              % (rg, len(per_region[rg]), n_missing), file=sys.stderr)
 
     out = []
     for rg in REGIONS:
@@ -255,7 +287,7 @@ def main():
 
     cols = ["region", "ceiling_rank", "ranked_rank", "hero", "hero_id", "ceiling_player",
             "global_pos", "region_depth", "pct", "badge_level", "hero_ladder_pos",
-            "ranked_rating", "match", "valve_top_hero", "pool_located",
+            "ranked_rating", "match", "valve_top_hero", "pool_located", "board_size",
             "winrate_rank", "elite_winrate"]
     path = os.path.join(OUT_DIR, "ceiling.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
