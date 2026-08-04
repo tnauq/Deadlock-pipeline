@@ -46,6 +46,18 @@ jobs:
       # ZERO SQL. hero-stats is 100 req/s and batched, so this cannot touch the
       # 20/hr budget. Tests whether match_mode=ranked (lowercase, per the spec)
       # gives a ranked-native selector to replace leaderboard position.
+      # ZERO SQL - leaderboard is 100 req/s. Cross-references each hero board
+      # against the general board, which is the ceiling definition the pool
+      # approach approximates badly: on 2026-08-03 Mirage NA's reported ceiling
+      # was thirkl at position 379, while rocaine is #1 on the Mirage board and
+      # inside the general top 8.
+      - name: Probe board cross-reference
+        if: always()
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+        run: python3 probe_board_xref.py
+
       - name: Probe ranked hero-stats
         if: always()
         continue-on-error: true
