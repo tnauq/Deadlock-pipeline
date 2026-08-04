@@ -143,10 +143,14 @@ def best_on_board(hero_entries, by_name):
     located = 0
     for he in hero_entries:
         for cand in by_name.get(he["name"], []):
-            if he["ids"] & cand["ids"]:
+            common = he["ids"] & cand["ids"]
+            if common:
                 located += 1
                 if best is None or cand["pos"] < best[0]["pos"]:
-                    best = (cand, he["hero_pos"])
+                    # the id that appears on BOTH boards - the strongest
+                    # identity available, and what downstream probes need to
+                    # follow this player's matches without re-resolving names
+                    best = (cand, he["hero_pos"], min(common))
                 break
     return best, located
 
@@ -202,13 +206,14 @@ def main():
                 # nobody on this hero's board appears in the region's top-N
                 n_missing += 1
                 continue
-            rec, hero_pos = best
+            rec, hero_pos, acct_id = best
             t = tier.get(hero, {})
             per_region[rg].append({
                 "hero": hero,
                 "hero_id": hid,
                 "region": rg,
                 "ceiling_player": rec["name"],
+                "account_id": acct_id,
                 "global_pos": rec["pos"],
                 "region_depth": depth[rg],
                 "pct": round(100.0 * rec["pos"] / max(depth[rg], 1), 3),
@@ -263,7 +268,7 @@ def main():
                   % (region, len(gap), ", ".join(gap)), file=sys.stderr)
 
     cols = ["region", "ceiling_rank", "hero", "hero_id", "ceiling_player",
-            "global_pos", "region_depth", "pct", "badge_level", "hero_ladder_pos",
+            "account_id", "global_pos", "region_depth", "pct", "badge_level", "hero_ladder_pos",
             "match", "valve_top_hero", "located_on_general", "board_size",
             "winrate_rank", "elite_winrate"]
     path = os.path.join(OUT_DIR, "ceiling.csv")
