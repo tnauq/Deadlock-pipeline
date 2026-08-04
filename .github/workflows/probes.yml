@@ -20,9 +20,9 @@ on:
         default: false
         type: boolean
       duo_accounts:
-        description: "Accounts per region for the duo probe (board holds ~1000)"
+        description: "CONTROL accounts for the duo probe (ceiling players are always seeded)"
         required: false
-        default: "1000"
+        default: "60"
         type: string
       lookback_days:
         description: "Days of ranked matches to scan"
@@ -61,13 +61,20 @@ jobs:
       # are for custom lobbies. hero-stats returns match id arrays per
       # (account, hero); accounts that keep appearing in the same matches are
       # queueing together.
-      - name: Probe duos
+      # Team-confirmed duo detection from match ROSTERS. Replaces the
+      # co-occurrence approach in probe_duos.py, which could not tell
+      # teammates from opponents and whose 30% threshold sat at the 99th
+      # percentile of chance. match_player carries account_id AND team, so a
+      # teammate is a fact; the discriminator is the longest run of
+      # CONSECUTIVE matches together, which matchmaking does not produce.
+      # ~4 SQL calls at 60 seeds - do not run in the pipeline's hour.
+      - name: Probe duos (rosters)
         if: always()
         continue-on-error: true
         env:
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
-          DUO_ACCOUNTS: ${{ inputs.duo_accounts }}
-        run: python3 probe_duos.py
+          DUO_CONTROLS: ${{ inputs.duo_accounts }}
+        run: python3 probe_duos_roster.py
 
       - name: Probe board cross-reference
         if: always()
