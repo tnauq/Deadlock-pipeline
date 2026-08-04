@@ -146,6 +146,12 @@ def main():
                 hero[s].sort(key=lambda p: (-p[0], meta[p[1]]["name"]))
 
     # ---- per-region ordering, from the ceiling ---------------------------
+    # ceiling_rank is the hero's best player's position on the region's
+    # cross-hero board, computed by cross-referencing the hero board against
+    # the general board (see ceiling_rank.py). Until 2026-08-03 that lookup ran
+    # over the pipeline's chosen 20-player pool instead, which missed the true
+    # ceiling on 4 of 12 sampled hero-regions — worst case Mirage NA at
+    # position 379 when its top player sat at position 2.
     regions = {}
     for rg in REGIONS:
         rows = sorted((r for r in ceil_rows if r["region"] == rg),
