@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       free_only:
-        description: "Schemas only - zero SQL queries, safe to run any time"
+        description: "Schemas and assets only - zero SQL queries, safe to run any time"
         required: false
         default: false
         type: boolean
@@ -40,6 +40,22 @@ jobs:
         with:
           python-version: "3.12"
 
+      # ZERO SQL, no key. /v1/assets/heroes and /v1/assets/items only, so this
+      # is safe in any hour and runs first — nothing downstream depends on it
+      # and nothing it does can spoil the SQL budget for the steps that follow.
+      # Answers the build-calculator questions: which hero stat fields exist and
+      # their ranges, what an item `properties` entry actually looks like, the
+      # distinct provided_property_type vocabulary, how many items carry
+      # conditions or scaling, and the byte size of a trimmed client payload.
+      # Field names are NOT assumed anywhere — it is a recursive key census over
+      # whatever is present, because the shape of `properties` is the unknown.
+      - name: Probe calculator data
+        if: always()
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+        run: python3 probe_calc_data.py
+
       # Closes the open items in PROBES.md:
       #   banned_hero_ids        - ranked has a pregame lobby showing the enemy
       #                            team with one swap allowed, so counterpicking
@@ -67,7 +83,9 @@ jobs:
       # opposite of the point. Cheap now: the candidate pool moved off /v1/sql
       # onto hero-stats on 2026-08-03, so a pipeline run is ~4 SQL calls, not
       # the ~16 it used to be. Pipeline 4 + duo probe 8 = ~12 of the 20/hr cap.
+      # Skipped under free_only, which spends SQL and so must not claim to be free.
       - name: Build ceiling data for seeding
+        if: ${{ !inputs.free_only }}
         env:
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
           PER_REGION: "20"
@@ -86,7 +104,7 @@ jobs:
       # CONSECUTIVE matches together, which matchmaking does not produce.
       # ~4 SQL calls at 60 seeds - do not run in the pipeline's hour.
       - name: Probe duos (rosters)
-        if: always()
+        if: ${{ always() && !inputs.free_only }}
         continue-on-error: true
         env:
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
@@ -114,3 +132,16 @@ jobs:
           SKIP_SQL: ${{ inputs.free_only && '1' || '0' }}
           COHORT_ONLY: ${{ inputs.cohort_only && '1' || '0' }}
         run: python3 probe_remaining.py
+
+      # Probe findings only reached the run log before, which expires and cannot
+      # be diffed. probe_calc_data.py in particular writes JSON that is meant to
+      # be read, not scrolled past.
+      - name: Upload probe output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-output
+          path: |
+            probe_out/
+            output/
+          if-no-files-found: warn
