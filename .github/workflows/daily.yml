@@ -14,6 +14,16 @@ on:
 permissions:
   contents: write
 
+# Three workflows can now push to docs/ (this one, probes.yml, comps.yml) and
+# every push triggers a Pages deployment. Pages runs ONE deployment at a time,
+# so overlapping pushes leave deployments sitting in `deployment_queued` until
+# they hit the 600s timeout and cancel — with no error anywhere in this job.
+# cancel-in-progress stays FALSE: a superseded data refresh should still finish
+# committing, it just publishes a moment later.
+concurrency:
+  group: site-publish
+  cancel-in-progress: false
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
@@ -80,6 +90,25 @@ jobs:
       - name: Build site data
         run: python3 build_site_data.py
 
+      # Build-calculator bundles: 156 shop items and 38 hero stat blocks, read
+      # by docs/index.html at runtime. ZERO SQL — /v1/assets only, so this
+      # cannot touch the 20/hr budget and is safe in the same run as the
+      # pipeline. Rebuilt every run so a Valve patch shows up within 4 hours
+      # rather than waiting for someone to trigger probes.yml by hand.
+      #
+      # continue-on-error is deliberate: the build FAILS if the catalogue is
+      # not exactly 156 items, which is the intended alarm for a patch. That
+      # alarm must not take the data refresh down with it — the previous
+      # bundles stay live and the tier list publishes as normal.
+      - name: Build calculator data
+        if: always()
+        continue-on-error: true
+        run: python3 build_calc_data.py
+
+      # docs/ plus archive/ are committed. output/ still stays off the repo:
+      # candidates.csv and excluded.csv carry Steam account IDs and display
+      # names. Nothing in the archive contains account-level data.
+      #
       # One trimmed snapshot per region per DAY, for charting change over time.
       # The pipeline runs 6x/day but builds are a 20-player sample, so runs 4h
       # apart differ mostly by noise — the script no-ops if today's file for
@@ -87,25 +116,25 @@ jobs:
       # the site can fetch it directly (Pages gzips text in transit anyway);
       # raw CSVs go to archive/ OUTSIDE docs/ so they don't count against the
       # 1GB published-Pages limit. ~53MB/yr in docs/, ~33MB/yr in archive/.
-      # TEMPORARY — one-shot probe of endpoints we aren't using yet. None of
-      # these are /v1/sql, so the 20/hr budget that forced the region split is
-      # untouched. Remove this step once its questions are answered.
       - name: Archive daily snapshot
         run: python3 archive_snapshot.py
 
-      # docs/ plus archive/ are committed. output/ still stays off the repo:
-      # candidates.csv and excluded.csv carry Steam account IDs and display
-      # names. Nothing in the archive contains account-level data.
+      # `git add -f` on docs/calc: a broad gitignore rule (output/, *.json)
+      # can swallow it silently, which is exactly how the folder failed to
+      # appear the first time. The 2>/dev/null guard lets the commit proceed
+      # when the calculator step was skipped or failed.
       - name: Commit if changed
         run: |
           git config user.name  "deadlock-bot"
           git config user.email "actions@users.noreply.github.com"
           git add docs/data.json docs/icons docs/archive archive
+          git add -f docs/calc 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "no change"
           else
             git commit -m "data: refresh $(date -u +%Y-%m-%d)"
-            git push
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
 
       # Artifacts on a public repo are downloadable by anyone, so the
