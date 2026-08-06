@@ -38,6 +38,10 @@ on:
 jobs:
   probe:
     runs-on: ubuntu-latest
+    # Needed by the calculator commit step at the bottom. Without it the push
+    # 403s, which is how daily.yml failed silently before 2026-08-03.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -171,3 +175,32 @@ jobs:
             docs/calc/
             raw/
           if-no-files-found: warn
+
+      # probes.yml uploads artifacts; it does not otherwise write to the repo.
+      # The calculator bundles are the exception: they are static site data
+      # that docs/index.html fetches at runtime, so they have to be committed,
+      # not just archived. Only changes when Valve patches the catalogue, so
+      # this is a no-op commit on most runs.
+      #
+      # `git add -f` is deliberate: docs/calc/ can be swept up by a broad
+      # gitignore rule (output/, *.json), and a silently ignored path is
+      # exactly how this folder failed to appear the first time.
+      - name: Commit calculator data
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ ! -f docs/calc/items.json ]; then
+            echo "no docs/calc/items.json - the build step did not produce one"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f docs/calc/
+          if git diff --staged --quiet; then
+            echo "calculator bundles unchanged"
+          else
+            git commit -m "calc: rebuild item and hero bundles"
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+            echo "committed docs/calc/"
+          fi
