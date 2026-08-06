@@ -748,7 +748,15 @@ function drawCalc(wrap){
   const rng = el('input'); rng.type = 'range'; rng.id = 'calc-lvl';
   rng.min = 1; rng.max = MAX_LEVEL; rng.value = build.level;
   const val = el('div','v'); val.textContent = build.level;
-  rng.oninput = () => { build.level = +rng.value; val.textContent = rng.value; drawCalc(wrap); };
+  // Only the numbers depend on level, so redraw the panels and leave the item
+  // tiles alone. Rebuilding them per tick was the whole slider lag: twelve
+  // icon() calls, each spawning an <img>, a load listener and a 6s fallback
+  // timer, ~60 times a second.
+  rng.oninput = () => {
+    build.level = +rng.value;
+    val.textContent = rng.value;
+    scheduleStats(wrap);
+  };
   lvl.append(l1, rng, val);
   wrap.appendChild(lvl);
 
@@ -787,7 +795,7 @@ function drawCalc(wrap){
   bar.style.padding = '10px 0 0';
   const seed = el('button','btn');
   seed.type = 'button';
-  seed.textContent = 'Load elite build';
+  seed.textContent = 'Load build';
   seed.onclick = () => { loadEliteBuild(); drawCalc(wrap); };
   const clr = el('button','btn ghost');
   clr.type = 'button';
@@ -823,7 +831,22 @@ function drawCalc(wrap){
     wrap.appendChild(fx);
   }
 
-  // panels
+  // stats live in their own host so the slider can replace just this part
+  const host = el('div');
+  wrap.appendChild(host);
+  wrap._statsHost = host;
+  wrap._spendN = spendN;
+  drawStats(wrap, out);
+}
+
+/* ---------- stats only: cheap enough to run on every slider tick --------- */
+
+function drawStats(wrap, out){
+  out = out || resolve();
+  wrap._spendN.textContent = out.total.toLocaleString();
+  const host = wrap._statsHost;
+  host.replaceChildren();
+
   const panels = el('div','panels');
   for (const c of ['G','V','S']){
     const p = el('div','panel');
@@ -843,9 +866,8 @@ function drawCalc(wrap){
     }
     panels.appendChild(p);
   }
-  wrap.appendChild(panels);
+  host.appendChild(panels);
 
-  // anything with no panel row
   if (out.other.length){
     const o = el('div','other');
     const h4 = el('h4'); h4.textContent = 'Other bonuses';
@@ -857,23 +879,63 @@ function drawCalc(wrap){
       d.append(b, document.createTextNode(' ' + label + ' \u00b7 ' + item));
       o.appendChild(d);
     }
-    wrap.appendChild(o);
+    host.appendChild(o);
   }
+}
+
+// Coalesce bursts of slider events into one redraw per animation frame.
+let _statsFrame = 0;
+function scheduleStats(wrap){
+  if (_statsFrame) return;
+  _statsFrame = requestAnimationFrame(() => { _statsFrame = 0; drawStats(wrap); });
 }
 
 /* ---------- seed from the ladder build ----------------------------------- */
 
+// id -> Set of ids it shares an upgrade path with, in BOTH directions. An item
+// and the item it upgrades into are the same slot in practice, so a build must
+// never hold both. Built once, on first use.
+let _related = null;
+function relatedIds(){
+  if (_related) return _related;
+  _related = new Map();
+  const link = (a, b) => {
+    if (!_related.has(a)) _related.set(a, new Set());
+    _related.get(a).add(b);
+  };
+  for (const it of CALC.items)
+    for (const c of (it.components || [])){
+      link(it.id, Number(c));
+      link(Number(c), it.id);
+    }
+  return _related;
+}
+
+function conflicts(id){
+  const rel = relatedIds().get(id);
+  if (!rel) return false;
+  return build.slots.some(s => s != null && rel.has(s));
+}
+
+// Walks the postgame column in descending frequency and takes the first SLOTS
+// items that fit. Three reasons to skip and move to the next candidate:
+// already held, would break the 4-active cap, or shares an upgrade path with
+// something already taken (the higher-frequency one wins, which is why
+// descending order matters).
 function loadEliteBuild(){
   const b = (R().builds[build.slug] || {}).postgame || [];
   build.slots = Array(SLOTS).fill(null);
   build.fx.clear();
-  let n = 0;
-  for (const [, itemId] of b){            // already sorted by count descending
+  let n = 0, actives = 0;
+  for (const [, itemId] of b){
     if (n >= SLOTS) break;
     const it = CALC.byId[Number(itemId)];
-    if (!it) continue;                    // component or non-shop item
+    if (!it) continue;                       // not a shop item
     if (build.slots.includes(it.id)) continue;
+    if (it.active && actives >= MAX_ACTIVE) continue;
+    if (conflicts(it.id)) continue;
     build.slots[n++] = it.id;
+    if (it.active) actives++;
   }
 }
 
@@ -928,9 +990,12 @@ function openPicker(slotIndex, wrap){
     b.append(nm, meta);
     const already = build.slots.includes(it.id);
     const activeFull = it.active && equipped().filter(x => x.active).length >= MAX_ACTIVE;
-    if (already || activeFull){
+    const clash = !already && conflicts(it.id);
+    if (already || activeFull || clash){
       b.disabled = true;
-      b.title = already ? 'Already in this build' : 'Active item limit reached';
+      b.title = already ? 'Already in this build'
+              : clash  ? 'Shares an upgrade path with an item you already have'
+                       : 'Active item limit reached';
     } else {
       b.onclick = () => { build.slots[slotIndex] = it.id; shut(); drawCalc(wrap); };
     }
