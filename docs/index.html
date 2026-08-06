@@ -576,14 +576,32 @@ function calcLoad(){
 
 function equipped(){ return build.slots.filter(Boolean).map(id => CALC.byId[id]); }
 
+// Does this property reach a stat panel at all? Enemy debuffs and `info`
+// entries never do, so they must not make an item look toggleable.
+function contributes(p){
+  const def = CALC.table[p.type];
+  return !!(def && def.row && def.kind !== 'enemy' && def.kind !== 'info');
+}
+
+function isConditional(p){
+  return !!(p.unresolved || p.cond || p.section === 'active');
+}
+
+// An item earns a checkbox only if ticking it would actually move a number.
+// Vortex Web is the case that caught this: its one conditional property is a
+// slow applied to the ENEMY, which the property table discards, so its box
+// did nothing. Its other three properties are unconditional self-buffs.
+function hasToggle(it){
+  return it.props.some(p => isConditional(p) && contributes(p));
+}
+
 // A property counts unless it is conditional and its item's box is unticked.
 function activeProps(){
   const out = [];
   for (const it of equipped()){
     const on = build.fx.has(it.id);
     for (const p of it.props){
-      const conditional = p.unresolved || p.cond || p.section === 'active';
-      if (conditional && !on) continue;
+      if (isConditional(p) && !on) continue;
       out.push([it, p]);
     }
   }
@@ -806,8 +824,7 @@ function drawCalc(wrap){
   wrap.appendChild(bar);
 
   // effects — one box per equipped item that has a conditional property
-  const condItems = equipped().filter(it =>
-    it.props.some(p => p.unresolved || p.cond || p.section === 'active'));
+  const condItems = equipped().filter(hasToggle);
   if (condItems.length){
     const fx = el('div','fx');
     const h4 = el('h4'); h4.textContent = 'Effects';
@@ -822,7 +839,7 @@ function drawCalc(wrap){
       };
       const nm = el('span'); nm.textContent = it.name;
       const hint = el('span','hint');
-      const c = it.props.find(p => p.cond);
+      const c = it.props.find(p => p.cond && contributes(p));
       hint.textContent = c ? c.cond : (it.active ? 'while active' : 'conditional');
       lb.append(cb, nm, hint);
       fx.appendChild(lb);
