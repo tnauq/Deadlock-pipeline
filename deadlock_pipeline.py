@@ -193,6 +193,7 @@ def _pick(d, keys):
 
 def load_assets():
     heroes, hero_icon = {}, {}
+    _hero_sig_classes = {}
     for h in _get(BASE + "/v1/assets/heroes"):
         hid = h.get("id")
         if hid is None or h.get("disabled") or h.get("in_development"):
@@ -202,9 +203,28 @@ def load_assets():
                                     ("icon_hero_card", "icon_image_small",
                                      "icon_hero_card_webp", "icon_image_small_webp",
                                      "minimap_image"))
+        _hero_sig_classes[int(hid)] = [(h.get("items") or {}).get("signature%d" % k)
+                                       for k in (1, 2, 3, 4)]
 
-    raw = [it for it in _get(BASE + "/v1/assets/items")
+    _assets = _get(BASE + "/v1/assets/items")
+    raw = [it for it in _assets
            if it.get("type") == "upgrade" and it.get("id") is not None]
+
+    # Hero abilities share the items.item_id space in match_player (PROBES.md
+    # finding 6). They used to be discarded as noise; they are the ability
+    # point data. Probed 2026-08-06: 4,093 of 4,093 sampled ability rows fell
+    # inside the hero's own signature1-4, so the join below is exact.
+    abilities, abil_by_class = {}, {}
+    for it in _assets:
+        if it.get("type") != "ability" or it.get("id") is None:
+            continue
+        aid = int(it["id"])
+        abilities[aid] = {"name": it.get("name") or ("ability_%d" % aid),
+                          "upgrades": len(it.get("upgrades") or []),
+                          "icon": _pick(it, ("image", "image_webp",
+                                             "shop_image", "shop_image_small"))}
+        if it.get("class_name"):
+            abil_by_class[it["class_name"]] = aid
 
     by_class = {}
     for it in raw:
@@ -245,11 +265,20 @@ def load_assets():
         print("  [assets] WARNING: no component linkage. Sample item keys: %s"
               % (sorted(sample.keys())[:20] if sample else "none had component_items"),
               file=sys.stderr)
+    # signature class names -> ability ids, in slot order (1-4)
+    hero_sigs = {}
+    for hid, classes in _hero_sig_classes.items():
+        if hid in heroes:
+            hero_sigs[hid] = [abil_by_class.get(c) for c in classes]
+    n_sig = sum(1 for v in hero_sigs.values() if all(x is not None for x in v))
+    print("  [assets] %d abilities, %d/%d heroes with all 4 signatures resolved"
+          % (len(abilities), n_sig, len(hero_sigs)), file=sys.stderr)
+
     have_icons = sum(1 for v in items.values() if v["icon"])
     print("  [assets] icons: %d/%d heroes, %d/%d items"
           % (sum(1 for v in hero_icon.values() if v), len(heroes), have_icons, len(items)),
           file=sys.stderr)
-    return heroes, hero_icon, items, component_of
+    return heroes, hero_icon, items, component_of, abilities, hero_sigs
 
 
 # --------------------------------------------------------------------------
@@ -513,7 +542,7 @@ def main():
     excluded = []
 
     print("[1/5] assets", file=sys.stderr)
-    heroes, hero_icon, items, component_of = load_assets()
+    heroes, hero_icon, items, component_of, abilities, hero_sigs = load_assets()
 
     print("[2/5] ladders (%s), depth %d, target %d per region, exclusivity %s"
           % (", ".join(REGIONS), LEADERBOARD_DEPTH, PER_REGION,
@@ -654,12 +683,24 @@ def main():
     print("[5/5] aggregating", file=sys.stderr)
     keep = {(m, a) for m, a in wanted}
     per_build, skipped_abilities = defaultdict(list), set()
+    per_build_abil = defaultdict(list)
     for r in item_rows:
         key = (int(r["match_id"]), int(r["account_id"]))
         if key not in keep:          # the IN-pair filter is done here, not in SQL
             continue
         iid = int(r["item_id"])
-        if iid not in items:     # hero abilities also appear in items.item_id
+        if iid in abilities:
+            # One row per POINT SPENT: an ability appears up to 4 times (the
+            # unlock, then its three upgrades). Probed 2026-08-06 — repeats run
+            # 1-4, mean 14.2 points per build, max 16 = 4 abilities x 4.
+            # `upgrade_id` is 0 on the unlock and a distinct id after, but the
+            # asset `upgrades` array carries no ids to join it against, so TIER
+            # IS THE OCCURRENCE INDEX in game_time_s order. Upgrades can only
+            # be bought in sequence, which is what makes that sound.
+            per_build_abil[(int(r["hero_id"]),) + key].append(
+                (int(r["game_time_s"] or 0), iid))
+            continue
+        if iid not in items:     # anything else that is not a shop item
             skipped_abilities.add(iid)
             continue
         per_build[(int(r["hero_id"]),) + key].append(
@@ -685,6 +726,86 @@ def main():
                 meta = items.get(iid)
                 if meta and meta["cat"] and meta["cost"]:
                     souls[(hid, snap)][meta["cat"]] += meta["cost"]
+
+    # ---- ability points -------------------------------------------------
+    # Two products from the same rows. `count` is bare, of_builds-denominated,
+    # exactly like item_hold_count (ONTOLOGY.yml) — 3 of 4 shows the thin
+    # sample that 75% would hide. `seed_rank` is the derived one: mean pick
+    # position across builds, ranked 1..16, never displayed, used only to seed
+    # the build calculator in a plausible order.
+    abil_counts = defaultdict(int)          # (hid, rg, aid, tier) -> builds
+    abil_pos = defaultdict(list)            # (hid, rg, aid, tier) -> [order idx]
+    abil_builds = defaultdict(int)          # (hid, rg) -> builds with any points
+    abil_order = []                         # one row per sampled build
+    for (hid, _m, _a), picks in per_build_abil.items():
+        rg = build_region.get((_m, _a), "")
+        picks.sort()                        # by game_time_s
+        abil_builds[(hid, rg)] += 1
+        seen = defaultdict(int)
+        seq = []
+        for order_idx, (_t, aid) in enumerate(picks):
+            tier = seen[aid]                # 0 = unlock, 1-3 = upgrades
+            seen[aid] += 1
+            if tier > 3:                    # defensive: never observed
+                continue
+            abil_counts[(hid, rg, aid, tier)] += 1
+            abil_pos[(hid, rg, aid, tier)].append(order_idx)
+            seq.append("%d:%d" % (aid, tier))
+        abil_order.append({"hero_id": hid, "hero": heroes.get(hid, ""), "region": rg,
+                           "account_id": _a, "match_id": _m,
+                           "points": len(seq), "sequence": " ".join(seq)})
+
+    sig_slot = {}                           # (hid, aid) -> 1-4
+    for hid, sig in hero_sigs.items():
+        for k, aid in enumerate(sig, 1):
+            if aid is not None:
+                sig_slot[(hid, aid)] = k
+
+    # rank every (ability, tier) within a hero-region by mean pick position
+    mean_pos = {k: sum(v) / len(v) for k, v in abil_pos.items()}
+    seed_rank = {}
+    by_hr = defaultdict(list)
+    for k in mean_pos:
+        by_hr[(k[0], k[1])].append(k)
+    # Mean position alone produces impossible orders on a thin sample — one
+    # build upgrading an ability early can rank tier 1 ahead of its own unlock.
+    # Emit in mean-position order but hold anything whose previous tier has not
+    # been emitted yet, so a seeded build is always legally purchasable.
+    for hr, keys in by_hr.items():
+        pending = sorted(keys, key=lambda x: mean_pos[x])
+        done, rank = set(), 1
+        while pending:
+            progressed = False
+            for k in list(pending):
+                aid, tier = k[2], k[3]
+                if tier == 0 or (hr[0], hr[1], aid, tier - 1) in done:
+                    seed_rank[k] = rank
+                    done.add(k)
+                    pending.remove(k)
+                    rank += 1
+                    progressed = True
+                    break
+            if not progressed:            # unreachable tier, e.g. a gap in the
+                for k in pending:         # data; emit the rest in place order
+                    seed_rank[k] = rank
+                    rank += 1
+                break
+
+    abil_freq = []
+    for (hid, rg, aid, tier), c in abil_counts.items():
+        meta = abilities.get(aid, {})
+        abil_freq.append({
+            "hero_id": hid, "hero": heroes.get(hid, ""), "region": rg,
+            "ability_id": aid, "ability": meta.get("name", "ability_%d" % aid),
+            "slot": sig_slot.get((hid, aid), ""),
+            "tier": tier, "count": c,
+            "of_builds": abil_builds[(hid, rg)],
+            "seed_rank": seed_rank.get((hid, rg, aid, tier), ""),
+            "icon_url": meta.get("icon", ""),
+        })
+    abil_freq.sort(key=lambda d: (d["hero"], d["region"],
+                                  d["slot"] if d["slot"] != "" else 9, d["tier"]))
+    abil_order.sort(key=lambda d: (d["hero"], d["region"], -d["points"]))
 
     freq = []
     for (hid, rg, snap), counter in holds.items():
@@ -803,6 +924,14 @@ def main():
     write("item_frequency.csv", freq,
           ["hero_id", "hero", "region", "snapshot", "item_id", "item", "category", "tier",
            "count", "of_builds", "icon_url"])
+    write("ability_frequency.csv", abil_freq,
+          ["hero_id", "hero", "region", "ability_id", "ability", "slot", "tier",
+           "count", "of_builds", "seed_rank", "icon_url"])
+    # account_id is here so build_site_data.py can pick out the ceiling
+    # player's own sequence. output/ is gitignored; nothing account-level is
+    # published to the site.
+    write("ability_order.csv", abil_order,
+          ["hero_id", "hero", "region", "account_id", "match_id", "points", "sequence"])
     write("hero_splits.csv", splits,
           ["hero_id", "hero", "snapshot", "split", "weak", "V_pct", "G_pct", "S_pct"])
     write("excluded.csv", excluded,
@@ -830,8 +959,9 @@ def main():
               % ", ".join("%s %d->%d" % (t["hero"], t["rank"], t["delta_rank"])
                           for t in moved[:10]), file=sys.stderr)
 
-    print("\nDone. %d heroes, %d builds, %d item rows, %d SQL calls."
-          % (len(tier), sum(builds.values()), len(freq), _sql_calls[0]), file=sys.stderr)
+    print("\nDone. %d heroes, %d builds, %d item rows, %d ability rows, %d SQL calls."
+          % (len(tier), sum(builds.values()), len(freq), len(abil_freq),
+             _sql_calls[0]), file=sys.stderr)
 
 
 def write(name, rows, cols):
