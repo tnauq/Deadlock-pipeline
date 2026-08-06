@@ -1045,6 +1045,27 @@ function loadEliteBuild(){
   // reads as the order you would actually buy them in.
   chosen.sort((a, b) => (a.cost || 0) - (b.cost || 0) || a.name.localeCompare(b.name));
   chosen.forEach((it, k) => { build.slots[k] = it.id; });
+
+  build.level = levelForSouls(chosen.reduce((n, it) => n + (it.cost || 0), 0));
+}
+
+// Souls -> hero level, from level_info.required_gold: the highest level whose
+// threshold the spend has reached. The table is identical across all 38
+// heroes, 36 levels running 0 to 48,600.
+//
+// Level and item spend come from the SAME souls — you level on gold earned and
+// buy on gold spent — so a build's cost is a fair read of the net worth behind
+// it. Modelling the earned/spent gap would be more fidelity than this
+// calculator wants; the two are deliberately treated as one number.
+function levelForSouls(souls){
+  const li = (CALC.heroes[build.slug] || {}).level_info || {};
+  let best = 1;
+  for (const k of Object.keys(li)){
+    const lvl = parseInt(k, 10);
+    const need = (li[k] || {}).required_gold || 0;
+    if (lvl <= MAX_LEVEL && souls >= need && lvl > best) best = lvl;
+  }
+  return best;
 }
 
 /* ---------- picker ------------------------------------------------------- */
