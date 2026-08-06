@@ -1,0 +1,288 @@
+{
+ "n_items": 156,
+ "n_heroes": 38,
+ "n_props": 437,
+ "n_unresolved_conditionals": 107,
+ "n_toggled": 12,
+ "toggles": {
+  "close_range": 2,
+  "vs_npc": 5,
+  "long_range": 2,
+  "after_proc": 3
+ },
+ "property_types": 58,
+ "property_type_counts": [
+  [
+   "MODIFIER_VALUE_HEALTH_MAX",
+   48
+  ],
+  [
+   "MODIFIER_VALUE_TECH_POWER",
+   32
+  ],
+  [
+   "MODIFIER_VALUE_WEAPON_DAMAGE_INCREASE",
+   31
+  ],
+  [
+   "MODIFIER_VALUE_OUT_OF_COMBAT_HEALTH_REGEN",
+   28
+  ],
+  [
+   "MODIFIER_VALUE_MOVEMENT_SPEED_MAX",
+   25
+  ],
+  [
+   "MODIFIER_VALUE_TECH_RESIST",
+   24
+  ],
+  [
+   "MODIFIER_VALUE_FIRE_RATE",
+   22
+  ],
+  [
+   "MODIFIER_VALUE_BULLET_ARMOR_DAMAGE_RESIST",
+   22
+  ],
+  [
+   "MODIFIER_VALUE_SPRINT_SPEED_BONUS",
+   19
+  ],
+  [
+   "MODIFIER_VALUE_MOVEMENT_SPEED_SLOW_PERCENT",
+   16
+  ],
+  [
+   "MODIFIER_VALUE_TECH_RANGE_PERCENT",
+   12
+  ],
+  [
+   "MODIFIER_VALUE_TECH_RADIUS_PERCENT",
+   12
+  ],
+  [
+   "MODIFIER_VALUE_BARRIER_HEALTH",
+   9
+  ],
+  [
+   "MODIFIER_VALUE_AMMO_CLIP_SIZE_PERCENT",
+   8
+  ],
+  [
+   "MODIFIER_VALUE_STATUS_RESISTANCE",
+   8
+  ],
+  [
+   "MODIFIER_VALUE_TECH_LIFESTEAL",
+   8
+  ],
+  [
+   "MODIFIER_VALUE_BULLET_LIFESTEAL",
+   7
+  ],
+  [
+   "MODIFIER_VALUE_MELEE_DAMAGE_INCREASE",
+   7
+  ],
+  [
+   "MODIFIER_VALUE_COOLDOWN_REDUCTION_PERCENTAGE",
+   7
+  ],
+  [
+   "MODIFIER_VALUE_BONUS_BULLET_SPEED_PERCENT",
+   6
+  ],
+  [
+   "MODIFIER_VALUE_BONUS_ABILITY_DURATION_PERCENTAGE",
+   6
+  ],
+  [
+   "MODIFIER_VALUE_MELEE_RESIST",
+   5
+  ],
+  [
+   "MODIFIER_VALUE_STAMINA_REGEN_PER_SECOND_PERCENTAGE",
+   5
+  ],
+  [
+   "MODIFIER_VALUE_STAMINA",
+   4
+  ],
+  [
+   "MODIFIER_VALUE_FIRE_RATE_SLOW",
+   4
+  ],
+  [
+   "MODIFIER_VALUE_ALL_DAMAGE_MULTIPLIER",
+   4
+  ],
+  [
+   "MODIFIER_VALUE_HEALTH_REGEN_PER_SECOND",
+   4
+  ],
+  [
+   "MODIFIER_VALUE_WEAPON_DAMAGE_TO_NPC_INCREASE",
+   3
+  ],
+  [
+   "MODIFIER_VALUE_MOVEMENT_SLOW_RESISTANCE",
+   3
+  ],
+  [
+   "MODIFIER_VALUE_MOVEMENT_SPEED_WHILE_SHOOTING_PENALTY_REDUCTION_PERCENT",
+   3
+  ],
+  [
+   "MODIFIER_VALUE_BONUS_ABILITY_CHARGES",
+   3
+  ],
+  [
+   "MODIFIER_VALUE_AIR_CONTROL_PERCENT",
+   3
+  ],
+  [
+   "MODIFIER_VALUE_HEAL_AMP_REGEN_PERCENT",
+   3
+  ],
+  [
+   "MODIFIER_VALUE_CLOSE_RANGE_WEAPON_DAMAGE_INCREASE",
+   2
+  ],
+  [
+   "MODIFIER_VALUE_BONUS_WEAPON_DAMAGE_CLOSE_RANGE_MAX_RANGE",
+   2
+  ],
+  [
+   "MODIFIER_VALUE_BULLET_RESIST_NON_HERO",
+   2
+  ],
+  [
+   "MODIFIER_VALUE_MOVEMENT_SLIDE_DISTANCE_SCALE",
+   2
+  ],
+  [
+   "MODIFIER_VALUE_MOVEMENT_SPEED_WHILE_ZOOMED_PENALTY_REDUCTION_PERCENT",
+   2
+  ],
+  [
+   "MODIFIER_VALUE_BONUS_ATTACK_RANGE_PERCENT",
+   2
+  ],
+  [
+   "MODIFIER_VALUE_LONG_RANGE_BULLET_DAMAGE_INCREASE",
+   2
+  ],
+  [
+   "MODIFIER_VALUE_BONUS_BULLET_DAMAGE_LONG_RANGE_MIN_RANGE",
+   2
+  ],
+  [
+   "MODIFIER_VALUE_MELEE_TRAVEL_DISTANCE_PERCENTAGE",
+   2
+  ],
+  [
+   "MODIFIER_VALUE_TECH_DAMAGE_TAKEN_HEALS_ATTACKER",
+   2
+  ],
+  [
+   "MODIFIER_VALUE_HEAL_AMP_CAST_PERCENT",
+   2
+  ],
+  [
+   "MODIFIER_VALUE_AMMO_CLIP_SIZE",
+   1
+  ],
+  [
+   "MODIFIER_VALUE_ZOOM_INCREASE_PERCENT",
+   1
+  ],
+  [
+   "MODIFIER_VALUE_HEALTH_MAX_PERCENT",
+   1
+  ],
+  [
+   "MODIFIER_VALUE_COOLDOWN_BETWEEN_CHARGE_REDUCTION_PERCENTAGE",
+   1
+  ],
+  [
+   "MODIFIER_VALUE_TECH_POWER_PERCENT",
+   1
+  ],
+  [
+   "MODIFIER_VALUE_ANIMATION_FRAME_SKIP_RATE",
+   1
+  ],
+  [
+   "MODIFIER_VALUE_MOVE_SPEED_LIMIT",
+   1
+  ],
+  [
+   "MODIFIER_VALUE_TECH_DAMAGE_MULTIPLIER",
+   1
+  ],
+  [
+   "MODIFIER_VALUE_ITEM_COOLDOWN_REDUCTION_PERCENTAGE",
+   1
+  ],
+  [
+   "MODIFIER_VALUE_PARRY_COOLDOWN_REDUCTION_FIXED",
+   1
+  ],
+  [
+   "MODIFIER_VALUE_MOVEMENT_GROUND_DASH_REDUCTION_PERCENT",
+   1
+  ],
+  [
+   "MODIFIER_VALUE_AIR_MOVE_DISTANCE_INCREASE_PERCENT",
+   1
+  ],
+  [
+   "MODIFIER_VALUE_HEAL_AMP_RECEIVE_PERCENT",
+   1
+  ],
+  [
+   "MODIFIER_VALUE_BASE_HEALTH_PERCENT",
+   1
+  ]
+ ],
+ "units": {
+  "%": 252,
+  "m": 48,
+  "null": 135,
+  "m/s": 1,
+  "s": 1
+ },
+ "items_kb": 150.6,
+ "items_gz_kb": 15.7,
+ "heroes_kb": 428.8,
+ "heroes_gz_kb": 13.4,
+ "slot_model": {
+  "total": 12,
+  "unlocked_at_start": 9,
+  "unlocked_by_objective": 3,
+  "max_active": 4,
+  "per_category_limit": null
+ },
+ "exclusions": {
+  "disabled": 78,
+  "not_shopable": 78,
+  "not_in_wiki_list": 94,
+  "unnamed": 56,
+  "alt_mode": 23,
+  "lost_class_pin": 1
+ },
+ "exclusion_overlaps": {
+  "_disabled+not_shopable+not_in_wiki_list": 15,
+  "_unnamed+disabled+not_shopable+not_in_wiki_list": 56,
+  "_alt_mode+disabled+not_shopable+not_in_wiki_list": 6,
+  "_disabled+not_shopable+lost_class_pin": 1,
+  "_alt_mode+not_in_wiki_list": 17
+ },
+ "n_excluded": 95,
+ "expected_items": 156,
+ "n_slot_or_cost_mismatch": 0,
+ "n_self_penalties": 12,
+ "n_effect_only": 5,
+ "dps_checked": 38,
+ "dps_failed": 0
+}
