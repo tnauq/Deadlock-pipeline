@@ -5,6 +5,7 @@ Turn the pipeline CSVs into one JSON file the static site reads.
     python3 build_site_data.py
 
 Reads  ./output/tierlist.csv, ./output/item_frequency.csv, ./output/ceiling.csv
+       ./output/ability_frequency.csv, ./output/ability_order.csv  (both optional)
 Writes ./docs/data.json
 
 MERGES BY REGION. Both regions are processed in one run again as of
@@ -98,6 +99,10 @@ def main():
     tier_rows = [r for r in read("tierlist.csv") if r.get("elite_winrate")]
     item_rows = read("item_frequency.csv")
     ceil_rows = read("ceiling.csv")
+    # Optional, so a run against an older pipeline still publishes. The site
+    # simply hides the ability panel when the block is missing.
+    abil_rows = read("ability_frequency.csv", required=False)
+    order_rows = read("ability_order.csv", required=False)
 
     if len(tier_rows) < MIN_HEROES:
         raise SystemExit("refusing to build: only %d heroes" % len(tier_rows))
@@ -128,6 +133,65 @@ def main():
                 "cat": r["category"] or "?",
                 "icon": icon_ref(r["icon_url"]),
             }
+
+    # ---- deduped ability lookup -------------------------------------------
+    abil_meta = {}
+    for r in abil_rows:
+        aid = r["ability_id"]
+        if aid not in abil_meta:
+            abil_meta[aid] = {"name": r["ability"], "icon": icon_ref(r.get("icon_url", ""))}
+
+    # ---- per-region ability points ----------------------------------------
+    # Two products from the same rows, kept apart on purpose:
+    #   count      bare, denominated in builds, for display. Same convention as
+    #              item hold counts — "3 of 4" shows the thin sample that 75%
+    #              would hide.
+    #   seed_rank  mean pick position ranked 1..16. NEVER displayed; it exists
+    #              only so the build calculator can seed picks in a plausible
+    #              and legally purchasable order.
+    # tier 0 is an UNLOCK and spends its own currency (4 of them, at levels
+    # 1/3/5/8). Tiers 1-3 are upgrades costing 1, 2 and 5 ability points, 32 in
+    # total. Two budgets, not one 16-step track — the site needs the split.
+    abilities = {rg: defaultdict(lambda: {"slots": {}, "of_builds": 0}) for rg in REGIONS}
+    for r in abil_rows:
+        rg, hs = r["region"], slug(r["hero"])
+        if rg not in abilities:
+            continue
+        blk = abilities[rg][hs]
+        entry = blk["slots"].setdefault(str(r.get("slot") or ""),
+                                        {"id": r["ability_id"], "steps": {}})
+        entry["steps"][str(r["tier"])] = [
+            int(r["count"]),
+            int(r["seed_rank"]) if (r.get("seed_rank") or "").isdigit() else 0,
+            int(r.get("point_cost") or 0),
+        ]
+        blk["of_builds"] = max(blk["of_builds"], int(r.get("of_builds") or 0))
+
+    # ---- the ceiling player's own pick order ------------------------------
+    # ceiling.csv carries a confirmed account_id — the id present on both the
+    # hero board and the general board. Join it to the sampled builds to
+    # publish that one player's sequence. The ACCOUNT ID IS NOT PUBLISHED, only
+    # the ordered picks, consistent with withholding ladder position and name.
+    by_acct = {(r["region"], slug(r["hero"]), (r.get("account_id") or "").strip()): r
+               for r in order_rows}
+    ceiling_seq = {}
+    for r in ceil_rows:
+        acct = (r.get("account_id") or "").strip()
+        if not acct:
+            continue
+        row = by_acct.get((r["region"], slug(r["hero"]), acct))
+        if not row or not row.get("sequence"):
+            continue
+        seq = []
+        for tok in row["sequence"].split():
+            a, _, t = tok.partition(":")
+            if t.isdigit():
+                seq.append([a, int(t)])
+        if seq:
+            ceiling_seq[(r["region"], slug(r["hero"]))] = seq
+    if abil_rows:
+        print("  [abilities] %d rows, %d ceiling sequences matched of %d ceiling rows"
+              % (len(abil_rows), len(ceiling_seq), len(ceil_rows)), file=sys.stderr)
 
     # ---- per-region builds ------------------------------------------------
     builds = {rg: defaultdict(lambda: {s: [] for s in SNAPSHOTS}) for rg in REGIONS}
@@ -181,6 +245,9 @@ def main():
             "depth": int(rows[0]["region_depth"]),
             "order": order,
             "builds": {k: v for k, v in builds[rg].items()},
+            "abilities": {k: {"slots": v["slots"], "of_builds": v["of_builds"],
+                              "ceiling": ceiling_seq.get((rg, k), [])}
+                          for k, v in abilities[rg].items()},
         }
         print("  [%s] %d heroes, tiers %s" % (rg, len(order), dict(zip(TIER_NAMES, sizes))),
               file=sys.stderr)
@@ -222,6 +289,8 @@ def main():
     merged_heroes.update(heroes)
     merged_items = dict(prev.get("items") or {})
     merged_items.update(meta)
+    merged_abilities = dict(prev.get("ability_meta") or {})
+    merged_abilities.update(abil_meta)
 
     # only advertise regions that actually have data
     order = [rg for rg in ALL_REGIONS if rg in merged_regions]
@@ -233,14 +302,15 @@ def main():
         "region_order": order,
         "heroes": merged_heroes,
         "items": merged_items,
+        "ability_meta": merged_abilities,
         "regions": merged_regions,
     }
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, separators=(",", ":"), ensure_ascii=False)
-    print("  -> %s (%.0f KB, %d heroes, %d items, regions %s)"
+    print("  -> %s (%.0f KB, %d heroes, %d items, %d abilities, regions %s)"
           % (path, os.path.getsize(path) / 1024, len(merged_heroes), len(merged_items),
-             ", ".join(order)), file=sys.stderr)
+             len(merged_abilities), ", ".join(order)), file=sys.stderr)
 
 
 if __name__ == "__main__":
