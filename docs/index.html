@@ -1035,7 +1035,7 @@ function loadEliteBuild(){
                     (firstSeen.get(x.it.id) ?? 9) - (firstSeen.get(y.it.id) ?? 9) ||
                     x.it.name.localeCompare(y.it.name));
 
-  const chosen = [], spent = {G: 0, S: 0, V: 0};
+  const chosen = [], early = [], spent = {G: 0, S: 0, V: 0};
   const rel = relatedIds();
   const fits = it =>
     chosen.length < SLOTS &&
@@ -1053,6 +1053,7 @@ function loadEliteBuild(){
       if (spent[cat] + (c.it.cost || 0) > EARLY_BUDGET) continue;
       if (!fits(c.it)) continue;
       take(c.it);
+      early.push(c.it);
     }
 
   // pass 2 — the rest, plain frequency order
@@ -1061,10 +1062,26 @@ function loadEliteBuild(){
     if (fits(c.it)) take(c.it);
   }
 
-  // Frequency picks WHICH items; cost decides where they sit. Cheapest first
-  // reads as the order you would actually buy them in.
-  chosen.sort((a, b) => (a.cost || 0) - (b.cost || 0) || a.name.localeCompare(b.name));
-  chosen.forEach((it, k) => { build.slots[k] = it.id; });
+  // Grid order. The 4,800 picks come FIRST and stay batched by category —
+  // gun beside gun, spirit beside spirit — with the category groups ordered by
+  // whichever was bought earliest (lowest snapshot any of its items appears
+  // in). Everything after that is plain cost order.
+  //
+  // Cost-sorting the whole list, which is what this used to do, interleaved
+  // the early core with late filler and lost the shape of the opening buy.
+  const catFirstSeen = {};
+  for (const it of early){
+    const si = firstSeen.get(it.id) ?? 9;
+    if (catFirstSeen[it.cat] === undefined || si < catFirstSeen[it.cat])
+      catFirstSeen[it.cat] = si;
+  }
+  const byCost = (a, b) => (a.cost || 0) - (b.cost || 0) || a.name.localeCompare(b.name);
+  const earlyOrdered = Object.keys(catFirstSeen)
+    .sort((x, y) => catFirstSeen[x] - catFirstSeen[y] || x.localeCompare(y))
+    .flatMap(cat => early.filter(it => it.cat === cat).sort(byCost));
+
+  const rest = chosen.filter(it => !early.includes(it)).sort(byCost);
+  earlyOrdered.concat(rest).forEach((it, k) => { build.slots[k] = it.id; });
 
   build.level = levelForSouls(chosen.reduce((n, it) => n + (it.cost || 0), 0));
 }
