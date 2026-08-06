@@ -891,21 +891,57 @@ function scheduleStats(wrap){
 
 /* ---------- seed from the ladder build ----------------------------------- */
 
-// id -> Set of ids it shares an upgrade path with, in BOTH directions. An item
-// and the item it upgrades into are the same slot in practice, so a build must
-// never hold both. Built once, on first use.
+// id -> Set of ids on the SAME upgrade chain, i.e. every ancestor and every
+// descendant. Grit upgrades into Guardian Ward upgrades into Divine Barrier,
+// so holding any two of those three is holding one slot twice.
+//
+// Siblings are NOT a conflict. Grit is a component of Guardian Ward, Reactive
+// Barrier, Spirit Shielding, Weapon Shielding and Indomitable, but those are
+// five separate items that each absorbed their own Grit — a build can hold
+// them together. Only the ancestor/descendant relation is exclusive.
+//
+// `components` holds CLASS NAMES ("upgrade_guardian_ward"), not numeric ids.
+// An earlier version did Number(c) here, got NaN for every entry, and matched
+// nothing at all — which is why Guardian Ward and Divine Barrier both loaded.
 let _related = null;
 function relatedIds(){
   if (_related) return _related;
+  const byClass = {};
+  for (const it of CALC.items) if (it.class_name) byClass[it.class_name] = it.id;
+
+  // direct edges: item -> the items it is built from
+  const parts = new Map();
+  for (const it of CALC.items){
+    const list = [];
+    for (const c of (it.components || [])){
+      const cid = typeof c === 'number' ? c : byClass[c];
+      if (cid != null && cid !== it.id) list.push(cid);
+    }
+    parts.set(it.id, list);
+  }
+
+  // every ancestor of an item, walked down the chain
+  const memo = new Map();
+  const ancestors = id => {
+    if (memo.has(id)) return memo.get(id);
+    const out = new Set();
+    memo.set(id, out);                       // guards a malformed cycle
+    for (const c of (parts.get(id) || [])){
+      out.add(c);
+      for (const deep of ancestors(c)) out.add(deep);
+    }
+    return out;
+  };
+
   _related = new Map();
-  const link = (a, b) => {
+  const add = (a, b) => {
     if (!_related.has(a)) _related.set(a, new Set());
     _related.get(a).add(b);
   };
   for (const it of CALC.items)
-    for (const c of (it.components || [])){
-      link(it.id, Number(c));
-      link(Number(c), it.id);
+    for (const anc of ancestors(it.id)){     // both directions of the same pair
+      add(it.id, anc);
+      add(anc, it.id);
     }
   return _related;
 }
