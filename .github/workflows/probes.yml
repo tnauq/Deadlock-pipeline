@@ -29,6 +29,11 @@ on:
         required: false
         default: "3"
         type: string
+      calc_expected_items:
+        description: "Shop catalogue size the calculator build asserts (156 as of 2026-08-05)"
+        required: false
+        default: "156"
+        type: string
 
 jobs:
   probe:
@@ -55,6 +60,25 @@ jobs:
         env:
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
         run: python3 probe_calc_data.py
+
+      # ZERO SQL, no key. Emits docs/calc/{items,heroes,meta}.json — the static
+      # bundles the build calculator reads — and, with --dump-raw, keeps the
+      # unprocessed asset payloads so the transform can be iterated offline
+      # without re-fetching. Commit docs/calc/ when the catalogue changes.
+      #
+      # The step FAILS if the catalogue is not exactly 156 items. That is
+      # deliberate: a patch adding or removing an item should surface as a red
+      # step with a diff in the log, not as a silently stale bundle. When it
+      # trips, update ref/shop_items_wiki.json from deadlock.wiki/Items and
+      # bump CALC_EXPECTED_ITEMS. continue-on-error keeps it from blocking the
+      # rest of the run.
+      - name: Build calculator data
+        if: always()
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+          CALC_EXPECTED_ITEMS: ${{ inputs.calc_expected_items }}
+        run: python3 build_calc_data.py --dump-raw raw
 
       # Closes the open items in PROBES.md:
       #   banned_hero_ids        - ranked has a pregame lobby showing the enemy
@@ -144,4 +168,6 @@ jobs:
           path: |
             probe_out/
             output/
+            docs/calc/
+            raw/
           if-no-files-found: warn
