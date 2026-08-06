@@ -690,9 +690,15 @@ def main():
             continue
         iid = int(r["item_id"])
         if iid in abilities:
-            # One row per POINT SPENT: an ability appears up to 4 times (the
-            # unlock, then its three upgrades). Probed 2026-08-06 — repeats run
-            # 1-4, mean 14.2 points per build, max 16 = 4 abilities x 4.
+            # One row per ACQUISITION: an ability appears up to 4 times — the
+            # unlock, then its three upgrades. Probed 2026-08-06 — repeats run
+            # 1-4, mean 14.2 per build, max 16 = 4 abilities x 4.
+            #
+            # The unlock and the upgrades are DIFFERENT CURRENCIES, confirmed
+            # from level_info: 36 levels grant 4 EAbilityUnlocks (levels 1, 3,
+            # 5, 8) and 32 EAbilityPoints. Upgrades cost 1/2/5 points, so
+            # 8 per ability x 4 = exactly 32. `step` below records which:
+            # step 0 is an unlock and costs no points.
             # `upgrade_id` is 0 on the unlock and a distinct id after, but the
             # asset `upgrades` array carries no ids to join it against, so TIER
             # IS THE OCCURRENCE INDEX in game_time_s order. Upgrades can only
@@ -733,6 +739,9 @@ def main():
     # sample that 75% would hide. `seed_rank` is the derived one: mean pick
     # position across builds, ranked 1..16, never displayed, used only to seed
     # the build calculator in a plausible order.
+    # tier 0 is an UNLOCK (its own currency, no point cost); 1-3 are upgrades
+    # costing 1, 2 and 5 ability points.
+    POINT_COST = {0: 0, 1: 1, 2: 2, 3: 5}
     abil_counts = defaultdict(int)          # (hid, rg, aid, tier) -> builds
     abil_pos = defaultdict(list)            # (hid, rg, aid, tier) -> [order idx]
     abil_builds = defaultdict(int)          # (hid, rg) -> builds with any points
@@ -769,6 +778,9 @@ def main():
         by_hr[(k[0], k[1])].append(k)
     # Mean position alone produces impossible orders on a thin sample — one
     # build upgrading an ability early can rank tier 1 ahead of its own unlock.
+    # Unlocks and upgrades spend different currencies, but the dependency still
+    # holds in one direction: an ability must be unlocked before it can be
+    # upgraded, and upgrades are bought 1 -> 2 -> 3.
     # Emit in mean-position order but hold anything whose previous tier has not
     # been emitted yet, so a seeded build is always legally purchasable.
     for hr, keys in by_hr.items():
@@ -798,7 +810,10 @@ def main():
             "hero_id": hid, "hero": heroes.get(hid, ""), "region": rg,
             "ability_id": aid, "ability": meta.get("name", "ability_%d" % aid),
             "slot": sig_slot.get((hid, aid), ""),
-            "tier": tier, "count": c,
+            "tier": tier,
+            "kind": "unlock" if tier == 0 else "upgrade",
+            "point_cost": POINT_COST[tier],
+            "count": c,
             "of_builds": abil_builds[(hid, rg)],
             "seed_rank": seed_rank.get((hid, rg, aid, tier), ""),
             "icon_url": meta.get("icon", ""),
@@ -926,7 +941,7 @@ def main():
            "count", "of_builds", "icon_url"])
     write("ability_frequency.csv", abil_freq,
           ["hero_id", "hero", "region", "ability_id", "ability", "slot", "tier",
-           "count", "of_builds", "seed_rank", "icon_url"])
+           "kind", "point_cost", "count", "of_builds", "seed_rank", "icon_url"])
     # account_id is here so build_site_data.py can pick out the ceiling
     # player's own sequence. output/ is gitignored; nothing account-level is
     # published to the site.
