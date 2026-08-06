@@ -973,32 +973,77 @@ function conflicts(id){
   return build.slots.some(s => s != null && rel.has(s));
 }
 
-// Walks the postgame column in descending frequency and takes the first SLOTS
-// items that fit. Three reasons to skip and move to the next candidate:
-// already held, would break the 4-active cap, or shares an upgrade path with
-// something already taken (the higher-frequency one wins, which is why
-// descending order matters).
+// Seeds from the POSTGAME column, filtered in two passes.
+//
+// Pass 1 gives each category 4,800 souls and fills it WITHOUT going over, most
+// frequent first. Pass 2 spends the remaining slots on ordinary frequency
+// order.
+//
+// The budget is what matters, NOT a fixed tier shape. 4,800 is a T2 plus a T3,
+// or three T2s, or six T1s, or any other combination that lands on it —
+// whatever the frequency order happens to produce. Doorman comes out
+// Opening Rounds + Sharpshooter, Trophy Collector + Veil Walker, Improved
+// Spirit + Greater Expansion; another hero may well take three of one tier.
+//
+// Frequency ties are broken by whichever item shows up in an EARLIER snapshot,
+// which is why the snapshot columns are read even though the picks all come
+// from postgame. Sharpshooter and Ballistic Enchantment tie on Doorman; the
+// one held sooner wins.
+//
+// An overshooting budget was the bug in the first version: allowing the 4,800
+// to be exceeded let three 800-soul items in ahead of the real pair.
+const EARLY_BUDGET = 4800;
+
 function loadEliteBuild(){
-  const b = (R().builds[build.slug] || {}).postgame || [];
+  const cols = R().builds[build.slug] || {};
   build.slots = Array(SLOTS).fill(null);
   build.fx.clear();
-  let n = 0, actives = 0;
-  for (const [, itemId] of b){
-    if (n >= SLOTS) break;
-    const it = CALC.byId[Number(itemId)];
-    if (!it) continue;                       // not a shop item
-    if (build.slots.includes(it.id)) continue;
-    if (it.active && actives >= MAX_ACTIVE) continue;
-    if (conflicts(it.id)) continue;
-    build.slots[n++] = it.id;
-    if (it.active) actives++;
+
+  // earliest snapshot each item appears in, for the tiebreak
+  const firstSeen = new Map();
+  DATA.snapshots.forEach((snap, si) => {
+    for (const [, itemId] of (cols[snap] || [])){
+      const k = Number(itemId);
+      if (!firstSeen.has(k)) firstSeen.set(k, si);
+    }
+  });
+
+  const cands = (cols.postgame || [])
+    .map(([count, itemId]) => ({count, it: CALC.byId[Number(itemId)]}))
+    .filter(c => c.it)
+    .sort((x, y) => y.count - x.count ||
+                    (firstSeen.get(x.it.id) ?? 9) - (firstSeen.get(y.it.id) ?? 9) ||
+                    x.it.name.localeCompare(y.it.name));
+
+  const chosen = [], spent = {G: 0, S: 0, V: 0};
+  const rel = relatedIds();
+  const fits = it =>
+    chosen.length < SLOTS &&
+    !chosen.includes(it) &&
+    !(it.active && chosen.filter(x => x.active).length >= MAX_ACTIVE) &&
+    !(rel.get(it.id) && chosen.some(c => rel.get(it.id).has(c.id)));
+
+  const take = it => { chosen.push(it); spent[it.cat] += it.cost || 0; };
+
+  // pass 1 — each category up to 4,800, never past it
+  for (const cat of ['G', 'S', 'V'])
+    for (const c of cands){
+      if (spent[cat] >= EARLY_BUDGET) break;
+      if (c.it.cat !== cat) continue;
+      if (spent[cat] + (c.it.cost || 0) > EARLY_BUDGET) continue;
+      if (!fits(c.it)) continue;
+      take(c.it);
+    }
+
+  // pass 2 — the rest, plain frequency order
+  for (const c of cands){
+    if (chosen.length >= SLOTS) break;
+    if (fits(c.it)) take(c.it);
   }
+
   // Frequency picks WHICH items; cost decides where they sit. Cheapest first
   // reads as the order you would actually buy them in.
-  const chosen = build.slots.filter(Boolean)
-    .map(id => CALC.byId[id])
-    .sort((a, b) => (a.cost || 0) - (b.cost || 0) || a.name.localeCompare(b.name));
-  build.slots = Array(SLOTS).fill(null);
+  chosen.sort((a, b) => (a.cost || 0) - (b.cost || 0) || a.name.localeCompare(b.name));
   chosen.forEach((it, k) => { build.slots[k] = it.id; });
 }
 
