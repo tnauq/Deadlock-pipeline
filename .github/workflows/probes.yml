@@ -84,6 +84,21 @@ jobs:
           CALC_EXPECTED_ITEMS: ${{ inputs.calc_expected_items }}
         run: python3 build_calc_data.py --dump-raw raw
 
+      # ONE /v1/sql call. Answers whether ability upgrade picks can be
+      # displayed the way item frequency is: do ability ids repeat within a
+      # build (one row per point), what upgrade_id holds, whether game_time_s
+      # gives pick order, and whether picks line up with signature1-4.
+      # The pipeline already reads these rows off items.* and discards them as
+      # noise (PROBES.md finding 6) - this checks what is being thrown away.
+      # Budget: pipeline 4 + duo 8 + this 1 = ~13 of the 20/hr cap.
+      - name: Probe ability upgrades
+        if: ${{ always() && !inputs.free_only }}
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+          PROBE_LOOKBACK_DAYS: ${{ inputs.lookback_days }}
+        run: python3 probe_abilities.py
+
       # Closes the open items in PROBES.md:
       #   banned_hero_ids        - ranked has a pregame lobby showing the enemy
       #                            team with one swap allowed, so counterpicking
