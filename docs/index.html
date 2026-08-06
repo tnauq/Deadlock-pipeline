@@ -548,7 +548,11 @@ if (window.__DATA__) {
 
 const CALC = {items:null, heroes:null, table:null, loading:null, err:null};
 const CAT_NAME = {G:'Weapon', V:'Vitality', S:'Spirit'};
-const SLOTS = 12, MAX_ACTIVE = 4, MAX_LEVEL = 20;
+const SLOTS = 12, MAX_ACTIVE = 4;
+// 36 levels, from level_info. They grant TWO separate currencies: 4
+// EAbilityUnlocks (levels 1, 3, 5, 8) and 32 EAbilityPoints. Upgrades cost
+// 1/2/5 points, so 8 per ability x 4 abilities = exactly 32 at max level.
+const MAX_LEVEL = 36;
 // weapon_info distances are in engine units. Verified: Abrams bullet_speed
 // 24000 / 39.37 = 609.6 m/s, matching the in-game figure exactly.
 const UNITS_PER_M = 39.37;
