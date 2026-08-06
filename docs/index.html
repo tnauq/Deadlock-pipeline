@@ -663,8 +663,15 @@ function resolve(){
 
   // ---- weapon
   const wdmg = A('G.weapon_damage_pct');
-  const shotBase = (w.damage_per_shot || 0) *
-        (1 + lv * (lu.MODIFIER_VALUE_BASE_BULLET_DAMAGE_FROM_LEVEL || 0));
+  // level_up values are FLAT per-level additions, not fractions. Bullet damage
+  // grows PER BULLET (Abrams +0.1/level on a 3.6 base), so it has to be added
+  // to bullet_damage and re-multiplied by pellet count — damage_per_shot
+  // already folds pellets in, and scaling that directly overstated the growth
+  // enormously (x4.5 at level 36 instead of +3.5 per bullet).
+  const pellets = w.bullets || 1;
+  const perBullet = (w.bullet_damage || 0) +
+        lv * (lu.MODIFIER_VALUE_BASE_BULLET_DAMAGE_FROM_LEVEL || 0);
+  const shotBase = w.bullet_damage ? perBullet * pellets : (w.damage_per_shot || 0);
   const shot = shotBase * (1 + wdmg/100);
   const burst = w.burst_shot_count || 1;
   const period = (w.cycle_time || 1) + burst * (w.intra_burst_cycle_time || 0);
@@ -694,12 +701,17 @@ function resolve(){
   Row('G','Total Spent', souls.G, '', 0);
 
   // ---- vitality
+  // these level_up fields are flat per-level too, and were being dropped
+  const lvlResistB = lv * (lu.MODIFIER_VALUE_BULLET_ARMOR_DAMAGE_RESIST || 0);
+  const lvlResistS = lv * (lu.MODIFIER_VALUE_TECH_RESIST || 0);
   const hp = (base('max_health','MODIFIER_VALUE_BASE_HEALTH_FROM_LEVEL') + F('V.max_health'))
              * (1 + A('V.max_health')/100);
   Row('V','Max Health', hp, '', 0);
   Row('V','Health Regen', (st.base_health_regen || 0) + F('V.health_regen'), '', 1);
-  Row('V','Bullet Resist', M('V.bullet_resist'), '%', 1);
-  Row('V','Spirit Resist', M('V.spirit_resist'), '%', 1);
+  Row('V','Bullet Resist', 100 * (1 - (1 - M('V.bullet_resist')/100) *
+                                       (1 - lvlResistB/100)), '%', 1);
+  Row('V','Spirit Resist', 100 * (1 - (1 - M('V.spirit_resist')/100) *
+                                      (1 - lvlResistS/100)), '%', 1);
   Row('V','Melee Resist', M('V.melee_resist'), '%', 1);
   Row('V','Barrier', F('V.bullet_shield'), '', 0);
   Row('V','Heal Amp', A('V.heal_amp'), '%', 0);
@@ -712,8 +724,12 @@ function resolve(){
   Row('V','Total Spent', souls.V, '', 0);
 
   // ---- spirit
-  Row('S','Spirit Power', F('S.spirit_power') * (1 + A('S.spirit_power')/100), '', 2);
-  Row('S','Spirit Damage', A('S.spirit_damage_pct'), '%', 0);
+  Row('S','Spirit Power',
+      (F('S.spirit_power') + lv * (lu.MODIFIER_VALUE_TECH_POWER || 0)) *
+      (1 + A('S.spirit_power')/100), '', 2);
+  Row('S','Spirit Damage',
+      A('S.spirit_damage_pct') + lv * (lu.MODIFIER_VALUE_TECH_DAMAGE_MULTIPLIER || 0),
+      '%', 0);
   Row('S','Ability Cooldown', -A('S.ability_cooldown'), '%', 0);
   Row('S','Ability Duration', A('S.ability_duration'), '%', 0);
   Row('S','Ability Range', A('S.ability_range'), '%', 0);
