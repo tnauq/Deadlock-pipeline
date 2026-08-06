@@ -695,7 +695,6 @@ function resolve(){
   Row('S','Ability Cooldown', -A('S.ability_cooldown'), '%', 0);
   Row('S','Ability Duration', A('S.ability_duration'), '%', 0);
   Row('S','Ability Range', A('S.ability_range'), '%', 0);
-  Row('S','Ability Radius', A('S.ability_radius'), '%', 0);
   Row('S','Spirit Lifesteal', A('S.spirit_lifesteal'), '%', 0);
   Row('S','Charges Increase', F('S.charges_increase'), '', 0);
   Row('S','Charge Cooldown', -A('S.charge_cooldown'), '%', 0);
@@ -937,6 +936,13 @@ function loadEliteBuild(){
     build.slots[n++] = it.id;
     if (it.active) actives++;
   }
+  // Frequency picks WHICH items; cost decides where they sit. Cheapest first
+  // reads as the order you would actually buy them in.
+  const chosen = build.slots.filter(Boolean)
+    .map(id => CALC.byId[id])
+    .sort((a, b) => (a.cost || 0) - (b.cost || 0) || a.name.localeCompare(b.name));
+  build.slots = Array(SLOTS).fill(null);
+  chosen.forEach((it, k) => { build.slots[k] = it.id; });
 }
 
 /* ---------- picker ------------------------------------------------------- */
