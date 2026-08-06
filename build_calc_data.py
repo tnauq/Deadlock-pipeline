@@ -332,12 +332,20 @@ def recompute_dps(w):
     Valve ships damage_per_second precomputed, which makes it a free oracle for
     the resolver's weapon maths. If this disagrees, the resolver is wrong.
     """
-    dmg = w.get("bullet_damage")
+    # Burst weapons fire `burst_shot_count` shots spaced by
+    # intra_burst_cycle_time, then wait cycle_time. Verified exact against
+    # Valve's own shots_per_second and damage_per_second on all 38 heroes.
+    #
+    # `damage_per_shot` ALREADY includes pellet count (Abrams: 9 x 3.6 = 32.4),
+    # so `bullets` must NOT be multiplied in again.
+    dmg = w.get("damage_per_shot")
     cycle = w.get("cycle_time")
-    bullets = w.get("bullets") or 1
+    burst = w.get("burst_shot_count") or 1
+    intra = w.get("intra_burst_cycle_time") or 0.0
     if not dmg or not cycle:
         return None
-    return dmg * bullets / cycle
+    period = cycle + burst * intra
+    return dmg * burst / period if period else None
 
 
 def check_dps(heroes, problems, tol=0.01):
