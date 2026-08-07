@@ -289,6 +289,16 @@ def build_items(items, allow):
             # 9 of the 156 are IMBUE items: their effect applies to a single
             # chosen ability, not to everything. Treating them as global was
             # stacking Compress Cooldown onto every ability at once.
+            # Only the asset's own flag: 9 items, all base-tier. Their upgrades
+            # (Superior Cooldown, Greater Expansion, Superior Duration) are
+            # GLOBAL — there is no imbue choice when buying them.
+            #
+            # match_player DOES show imbued_ability_id populated on those
+            # upgrades, which briefly looked like inheritance. It is residue:
+            # the target set on the component carries forward through the
+            # upgrade. The counts give it away — Superior Cooldown 13 against
+            # Compress Cooldown's 120, not the comparable figure a real choice
+            # would produce.
             "imbue": it.get("imbue") or "",
             "charge_only": it.get("class_name") in CHARGE_ONLY,
             "components": it.get("component_items") or [],
