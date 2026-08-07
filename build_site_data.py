@@ -103,6 +103,7 @@ def main():
     # simply hides the ability panel when the block is missing.
     abil_rows = read("ability_frequency.csv", required=False)
     order_rows = read("ability_order.csv", required=False)
+    imbue_rows = read("imbue_frequency.csv", required=False)
 
     if len(tier_rows) < MIN_HEROES:
         raise SystemExit("refusing to build: only %d heroes" % len(tier_rows))
@@ -268,6 +269,32 @@ def main():
               % (len(abil_rows), len(orders), n_ceil,
                  len(orders) - n_ceil, n_two), file=sys.stderr)
 
+    # ---- imbue targets ----------------------------------------------------
+    # Which ability the cohort imbues each item into, so the calculator can
+    # preselect instead of leaving an unassigned item doing nothing. Choices
+    # are highly concentrated — median top-choice share 100%, 242 of 349
+    # hero-region-item groups unanimous — so a default is safe. The split is
+    # published too: on a flexible hero (Kelvin NA spreads Compress Cooldown
+    # across four abilities) the absence of consensus is the useful part.
+    #
+    # NOTE this file also carries rows for Superior Cooldown, Greater Expansion
+    # and Superior Duration. Those are NOT imbue items; the target is residue
+    # carried forward from the component they upgrade from. The calculator
+    # ignores them because items.json does not flag them.
+    imbue = {rg: defaultdict(dict) for rg in REGIONS}
+    for r in imbue_rows:
+        rg, hs = r["region"], slug(r["hero"])
+        if rg not in imbue:
+            continue
+        cur = imbue[rg][hs].setdefault(r["item_id"], {"top": None, "of": 0, "picks": []})
+        cur["picks"].append([r["ability_id"], int(r["count"])])
+        cur["of"] = max(cur["of"], int(r.get("of_holders") or 0))
+    for rg in REGIONS:
+        for hero in imbue[rg].values():
+            for v in hero.values():
+                v["picks"].sort(key=lambda p: -p[1])
+                v["top"] = v["picks"][0][0] if v["picks"] else None
+
     # ---- per-region builds ------------------------------------------------
     builds = {rg: defaultdict(lambda: {s: [] for s in SNAPSHOTS}) for rg in REGIONS}
     of_builds = {rg: {} for rg in REGIONS}
@@ -320,6 +347,7 @@ def main():
             "depth": int(rows[0]["region_depth"]),
             "order": order,
             "builds": {k: v for k, v in builds[rg].items()},
+            "imbue": {k: v for k, v in imbue[rg].items()},
             "abilities": {k: {"slots": v["slots"], "of_builds": v["of_builds"],
                               "orders": orders.get((rg, k), []),
                               "seq_from": seq_source.get((rg, k), "")}
