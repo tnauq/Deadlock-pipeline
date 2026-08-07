@@ -137,6 +137,8 @@ def main():
     # ---- deduped ability lookup -------------------------------------------
     abil_meta = {}
     for r in abil_rows:
+        if not (r.get("slot") or "").strip():
+            continue
         aid = r["ability_id"]
         if aid not in abil_meta:
             abil_meta[aid] = {"name": r["ability"], "icon": icon_ref(r.get("icon_url", ""))}
@@ -156,6 +158,11 @@ def main():
     for r in abil_rows:
         rg, hs = r["region"], slug(r["hero"])
         if rg not in abilities:
+            continue
+        # Rows with no slot are abilities outside signature1-4. In practice
+        # that is only Silver's werewolf form, whose upgrades mirror her base
+        # kit, so showing both would duplicate the same choices.
+        if not (r.get("slot") or "").strip():
             continue
         blk = abilities[rg][hs]
         entry = blk["slots"].setdefault(str(r.get("slot") or ""),
