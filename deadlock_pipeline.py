@@ -101,7 +101,18 @@ SNAPSHOTS = [int(x) for x in
              (os.environ.get("SNAPSHOTS") or "4800,9600,14400,20800").split(",")]
 
 MAX_URL = _env("MAX_URL", 9000)   # ~9KB is documented as working (SCHEMA.md quirk #4)
-SQL_PAUSE_S = _env("SQL_PAUSE_S", 35)
+# The SQL quota is 2 requests per 60s and the window SLIDES. A 429 response
+# still counts as a request, so retrying inside the window burns another slot
+# and pushes the window forward instead of clearing it — a 2026-08-07 run died
+# after retries at 9s, 17s and 35s, each of which made things worse.
+#
+# 35s spacing puts two calls inside one 60s window by construction: #1 at
+# t=0 and #2 at t=35 leaves 2 requests in the trailing minute, so #2 is at the
+# limit and any retry is refused. Spacing must exceed HALF the window with
+# margin; 32s is the theoretical floor and 40s is the safe one.
+SQL_PAUSE_S = _env("SQL_PAUSE_S", 40)
+# On a 429 the only reliable recovery is to let the whole window drain.
+SQL_429_WAIT_S = _env("SQL_429_WAIT_S", 65)
 # Unkeyed /v1/sql allows 2 req/min AND 20 req/hr (SCHEMA.md quirk #5). The
 # hourly cap is the binding one for chunked queries — it is what killed the
 # 2026-07-31 runs at chunk 21 both times. An X-API-Key raises this.
@@ -133,17 +144,26 @@ def _get(url, tries=_env("HTTP_TRIES", 4)):
             if e.code in (429, 500, 502, 503) and attempt < tries - 1:
                 wait = 2 ** attempt
                 if e.code == 429:
-                    # The 429 body carries the exact wait, e.g.
-                    # {"error":{"quota":{...},"next_request_in":18}}. The old
-                    # 2**attempt backoff (1s, 2s) was far too short to clear it.
+                    # `next_request_in` is when the NEXT slot frees, not when
+                    # the window is clear. Waiting exactly that long lands at
+                    # the limit again, and the failed attempt has meanwhile
+                    # consumed a slot of its own — which is how a 2026-08-07 run
+                    # died after retries at 9s, 17s and 35s. Wait for the whole
+                    # window to drain, taking the hint only if it is LONGER.
+                    wait = SQL_429_WAIT_S
                     try:
                         body = json.loads(e.read().decode("utf-8", "replace"))
-                        hint = body.get("error", {}).get("next_request_in")
+                        err = body.get("error", {}) or {}
+                        hint = err.get("next_request_in")
+                        period = (err.get("quota") or {}).get("period")
+                        if period:
+                            wait = max(wait, int(period) + 5)
                         if hint:
-                            wait = int(hint) + 2
+                            wait = max(wait, int(hint) + 2)
                     except Exception:
-                        wait = 60
-                    print("  [http] 429, waiting %ds" % wait, file=sys.stderr)
+                        pass
+                    print("  [http] 429, waiting %ds for the window to drain"
+                          % wait, file=sys.stderr)
                 time.sleep(wait)
                 continue
             raise
