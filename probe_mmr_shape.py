@@ -46,6 +46,7 @@ BASE = "https://api.deadlock-api.com"
 API_KEY = os.environ.get("DEADLOCK_API_KEY")
 OUT = "probe_out"
 PACE_S = int(os.environ.get("MMR_PACE_S") or 13)
+REGION = os.environ.get("PROBE_REGION") or "NAmerica"
 
 
 def call(path, query):
@@ -82,6 +83,12 @@ def call(path, query):
 
 
 def ceiling_ids(n=3):
+    """
+    Prefer output/ceiling.csv — those ids are dual-confirmed across the hero
+    and general boards. It only exists when the pipeline step has run, which
+    free_only skips, so fall back to the leaderboard endpoint directly. That
+    keeps this probe genuinely SQL-free and runnable in any hour.
+    """
     path = os.path.join("output", "ceiling.csv")
     out = []
     if os.path.exists(path):
@@ -90,7 +97,27 @@ def ceiling_ids(n=3):
                 a = (r.get("account_id") or "").strip()
                 if a.isdigit():
                     out.append(int(a))
-    return sorted(set(out))[:n]
+    if out:
+        return sorted(set(out))[:n]
+
+    print("  [ids] no ceiling.csv — taking top ids from the leaderboard",
+          file=sys.stderr)
+    rec = call("/v1/leaderboard/%s" % urllib.parse.quote(REGION), "")
+    try:
+        rows = json.loads(rec.get("body") or "[]")
+    except Exception:
+        rows = []
+    if isinstance(rows, dict):
+        rows = rows.get("entries") or rows.get("data") or []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        # possible_account_ids is best-match-first: 92% resolve from slot 0
+        for a in (r.get("possible_account_ids") or [])[:1]:
+            out.append(int(a))
+        if len(out) >= n:
+            break
+    return out[:n]
 
 
 def hero_stats_ids(seed_ids, n=3):
@@ -121,7 +148,7 @@ def main():
     seeds = ceiling_ids(3)
     report["ceiling_ids"] = seeds
     if not seeds:
-        raise SystemExit("no output/ceiling.csv — run the pipeline first")
+        raise SystemExit("could not source any account ids")
     a = seeds[0]
 
     print("[T1] parameter form", file=sys.stderr)
