@@ -677,6 +677,12 @@ def main():
     # reported per region rather than pooled
     build_region = {(c["last_match_id"], c["account_id"]): c["region"]
                     for lst in chosen.values() for c in lst}
+    # shrunk ranked win rate per sampled build, so the ability display can fall
+    # back to the strongest player in the cohort when the ceiling player's own
+    # match was not among the 20 sampled. Volume-aware by construction:
+    # (wins + k*0.5)/(games + k) with k=25 pulls a 5-0 player to 0.583.
+    build_rating = {(c["last_match_id"], c["account_id"]): c["ranked_rating"]
+                    for lst in chosen.values() for c in lst}
     print("[4/5] item query (%d player-matches)" % len(wanted), file=sys.stderr)
     item_rows = query_items(wanted) if wanted else []
 
@@ -762,6 +768,7 @@ def main():
             seq.append("%d:%d" % (aid, tier))
         abil_order.append({"hero_id": hid, "hero": heroes.get(hid, ""), "region": rg,
                            "account_id": _a, "match_id": _m,
+                           "ranked_rating": build_rating.get((_m, _a), ""),
                            "points": len(seq), "sequence": " ".join(seq)})
 
     sig_slot = {}                           # (hid, aid) -> 1-4
@@ -946,7 +953,8 @@ def main():
     # player's own sequence. output/ is gitignored; nothing account-level is
     # published to the site.
     write("ability_order.csv", abil_order,
-          ["hero_id", "hero", "region", "account_id", "match_id", "points", "sequence"])
+          ["hero_id", "hero", "region", "account_id", "match_id", "ranked_rating",
+           "points", "sequence"])
     write("hero_splits.csv", splits,
           ["hero_id", "hero", "snapshot", "split", "weak", "V_pct", "G_pct", "S_pct"])
     write("excluded.csv", excluded,
