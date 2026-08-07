@@ -70,6 +70,13 @@ DROP_ENEMY_FACING = True
 # other dropped. Keyed by name -> the ONLY class_name allowed to claim it.
 CLASS_PINS = {"Silencer": "upgrade_proc_silence"}
 
+# Items whose ability-cooldown reduction applies ONLY to abilities that have
+# charges. Nothing in the asset says so — Rapid Recharge simply carries both a
+# charge-cooldown property and a general one, and in game both are gated on
+# charges. It was cutting Doorman's Luggage Cart, which has none. Most heroes
+# have one charged ability; Infernus has two, and it applies to both.
+CHARGE_ONLY = {"upgrade_rapid_recharge"}
+
 # Slot model, confirmed against the game rather than `item_slot_info`
 # (whose max_purchases_for_tier [6,6,6] measures something else).
 # The site speaks G/S/V (docs/data.json, --cat-g/s/v in the stylesheet).
@@ -279,6 +286,11 @@ def build_items(items, allow):
             "cost": cost,
             "shopable": it.get("shopable"),
             "active": bool(it.get("is_active_item")),
+            # 9 of the 156 are IMBUE items: their effect applies to a single
+            # chosen ability, not to everything. Treating them as global was
+            # stacking Compress Cooldown onto every ability at once.
+            "imbue": it.get("imbue") or "",
+            "charge_only": it.get("class_name") in CHARGE_ONLY,
             "components": it.get("component_items") or [],
             "icon": icon_ref(it.get("shop_image") or it.get("image")),
             "props": props,
