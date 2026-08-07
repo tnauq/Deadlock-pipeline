@@ -150,6 +150,34 @@ h1{font-size:clamp(24px,7vw,38px);letter-spacing:.04em;margin-top:4px}
   font-weight:800;color:var(--dim);min-width:1.1em;text-align:right}
 .seq .s .c{font-family:var(--mono);font-size:11px;font-weight:800;color:var(--text)}
 
+/* ---------- ability calculator ---------- */
+.apts{margin-top:14px;border:1px solid var(--frame);border-radius:12px;
+  background:var(--panel);padding:10px}
+.apts-h{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:9px}
+.apts-h h4{margin:0;font:700 10px/1 var(--sans);letter-spacing:.2em;
+  text-transform:uppercase;color:var(--dim)}
+.apts-h .budget{margin-left:auto;font-size:11.5px;color:var(--dim)}
+.apts-h .budget b{font-family:var(--mono);color:var(--text);font-weight:800}
+.apts-h .budget b.over{color:var(--s)}
+.apg{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+.apc{min-width:0;display:flex;flex-direction:column;align-items:center;gap:6px}
+.apc .ic{width:42px;height:42px;border-radius:9px;border:1px solid var(--frame)}
+.apc .nm{font-size:10px;line-height:1.2;color:var(--dim);text-align:center;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+.pips{display:flex;gap:3px}
+.pip{width:22px;height:22px;padding:0;border-radius:6px;cursor:pointer;
+  background:var(--panel-2);border:1px solid var(--frame);color:var(--dim);
+  font:800 10px/1 var(--mono);display:grid;place-items:center}
+.pip:hover:not([disabled]){border-color:var(--dim);color:var(--text)}
+.pip[aria-pressed=true]{background:var(--cat-s);border-color:var(--cat-s);color:#fff}
+.pip[disabled]{opacity:.35;cursor:not-allowed}
+.pip:focus-visible{outline:2px solid var(--text);outline-offset:2px}
+@media (max-width:520px){
+  .apc .ic{width:34px;height:34px}
+  .pip{width:19px;height:19px;font-size:9px}
+  .apts{padding:8px}
+}
+
 /* ---------- build calculator ---------- */
 .calc{margin-top:26px}
 .calc-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:12px}
@@ -835,6 +863,123 @@ function resolve(){
   return {rows, other, souls, total: souls.G + souls.S + souls.V};
 }
 
+
+/* ---------- ability points -----------------------------------------------
+   Two budgets, not one track. level_info grants 4 EAbilityUnlocks (levels 1,
+   3, 5 and 8) and 32 EAbilityPoints; upgrades cost 1, 2 and 5, so 8 per
+   ability x 4 = exactly 32 at max level. Unlocking costs no points.
+
+   State is build.abil = {abilityId: steps taken}, 0-4, where 1 means unlocked
+   and 4 means fully upgraded. Steps are strictly ordered, so a pip sets the
+   ability to that step and clicking the current step steps back one.
+   ------------------------------------------------------------------------ */
+
+const PIP_COST = [0, 1, 2, 5];           // by step index beyond the unlock
+
+function abilSlots(){
+  const blk = (R().abilities || {})[build.slug];
+  return (blk && blk.slots) || {};
+}
+
+function abilBudget(){
+  const li = (CALC.heroes[build.slug] || {}).level_info || {};
+  let unlocks = 0, points = 0;
+  for (const k of Object.keys(li)){
+    if (parseInt(k, 10) > build.level) continue;
+    for (const c of ((li[k] || {}).bonus_currencies || [])){
+      if (c === 'EAbilityUnlocks') unlocks++;
+      else if (c === 'EAbilityPoints') points++;
+    }
+  }
+  let usedU = 0, usedP = 0;
+  for (const [, n] of Object.entries(build.abil || {})){
+    if (n >= 1) usedU++;
+    for (let i = 1; i < n; i++) usedP += PIP_COST[i];
+  }
+  return {unlocks, points, usedU, usedP};
+}
+
+function drawAbilities(host){
+  const slots = abilSlots();
+  if (!Object.keys(slots).length) return;
+  const meta = DATA.ability_meta || {};
+  const b = abilBudget();
+
+  const box = el('div','apts');
+  const head = el('div','apts-h');
+  const h4 = el('h4'); h4.textContent = 'Ability points';
+  const budget = el('div','budget');
+  const u = el('b'); u.textContent = b.usedU + '/' + b.unlocks;
+  if (b.usedU > b.unlocks) u.className = 'over';
+  const pt = el('b'); pt.textContent = b.usedP + '/' + b.points;
+  if (b.usedP > b.points) pt.className = 'over';
+  budget.append(document.createTextNode('Unlocks '), u,
+                document.createTextNode('  \u00b7  Points '), pt);
+  head.append(h4, budget);
+  box.appendChild(head);
+
+  const grid = el('div','apg');
+  for (const slot of ['1','2','3','4']){
+    const a = slots[slot];
+    if (!a) continue;
+    const m = meta[a.id] || {name: 'ability ' + a.id, icon: ['','']};
+    const taken = (build.abil || {})[a.id] || 0;
+    const col = el('div','apc');
+    col.appendChild(icon(m.icon, m.name));
+    const nm = el('div','nm'); nm.textContent = m.name; nm.title = m.name;
+    col.appendChild(nm);
+
+    const pips = el('div','pips');
+    for (let step = 1; step <= 4; step++){
+      const p = el('button','pip');
+      p.type = 'button';
+      p.textContent = step === 1 ? '\u25c6' : PIP_COST[step - 1];
+      const on = taken >= step;
+      p.setAttribute('aria-pressed', String(on));
+      const cost = step === 1 ? 0 : PIP_COST[step - 1];
+      const wouldU = b.usedU + (taken >= 1 ? 0 : 1);
+      let wouldP = b.usedP;
+      for (let i = taken + 1; i <= step; i++) if (i > 1) wouldP += PIP_COST[i - 1];
+      // affordable only if the budget covers everything up to this step
+      if (!on && (wouldU > b.unlocks || wouldP > b.points)) p.disabled = true;
+      p.title = (step === 1 ? 'Unlock' : cost + ' point' + (cost > 1 ? 's' : '')) +
+                ' \u00b7 ' + m.name;
+      p.onclick = () => {
+        build.abil = build.abil || {};
+        build.abil[a.id] = (taken === step) ? step - 1 : step;
+        if (!build.abil[a.id]) delete build.abil[a.id];
+        drawCalc(host);
+      };
+      pips.appendChild(p);
+    }
+    col.appendChild(pips);
+    grid.appendChild(col);
+  }
+  box.appendChild(grid);
+  host.appendChild(box);
+}
+
+// Seeds ability points from the order currently shown above, spending only
+// what the level actually grants. Same source the reader is looking at, so the
+// calculator agrees with the page rather than inventing its own order.
+function loadAbilityOrder(){
+  const blk = (R().abilities || {})[build.slug];
+  const orders = blk && blk.orders;
+  build.abil = {};
+  if (!orders || !orders.length) return;
+  const seq = orders[Math.min(abilOrder, orders.length - 1)];
+  for (const [aid, tier] of seq){
+    const b = abilBudget();
+    const taken = build.abil[aid] || 0;
+    const step = tier + 1;                 // tier 0 is the unlock
+    if (step !== taken + 1) continue;      // sequences are already in order
+    if (step === 1){
+      if (b.usedU >= b.unlocks) continue;
+    } else if (b.usedP + PIP_COST[step - 1] > b.points) continue;
+    build.abil[aid] = step;
+  }
+}
+
 /* ---------- render ------------------------------------------------------- */
 
 function mountCalc(parent, slug){
@@ -851,7 +996,7 @@ function mountCalc(parent, slug){
       return;
     }
     if (!build || build.slug !== slug)
-      build = {slug, level: 1, slots: Array(SLOTS).fill(null), fx: new Set()};
+      build = {slug, level: 1, slots: Array(SLOTS).fill(null), fx: new Set(), abil: {}};
     drawCalc(wrap);
   }).catch(() => {
     pending.textContent = 'Could not load calculator data (' + (CALC.err || 'unknown') + ').';
@@ -927,15 +1072,22 @@ function drawCalc(wrap){
   const seed = el('button','btn');
   seed.type = 'button';
   seed.textContent = 'Load build';
-  seed.onclick = () => { loadEliteBuild(); drawCalc(wrap); };
+  seed.onclick = () => { loadEliteBuild(); loadAbilityOrder(); drawCalc(wrap); };
   const clr = el('button','btn ghost');
   clr.type = 'button';
   clr.textContent = 'Clear';
-  clr.onclick = () => { build.slots = Array(SLOTS).fill(null); build.fx.clear(); drawCalc(wrap); };
+  clr.onclick = () => {
+    build.slots = Array(SLOTS).fill(null);
+    build.fx.clear();
+    build.abil = {};
+    drawCalc(wrap);
+  };
   const note = el('div','note');
   note.textContent = nActive + ' of ' + MAX_ACTIVE + ' active';
   bar.append(seed, clr, note);
   wrap.appendChild(bar);
+
+  drawAbilities(wrap);
 
   // effects — one box per equipped item that has a conditional property
   const condItems = equipped().filter(hasToggle);
