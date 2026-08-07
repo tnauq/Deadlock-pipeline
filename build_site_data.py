@@ -320,8 +320,19 @@ def main():
     # position 379 when its top player sat at position 2.
     regions = {}
     for rg in REGIONS:
-        rows = sorted((r for r in ceil_rows if r["region"] == rg),
-                      key=lambda r: int(r["global_pos"]))
+        # ORDER BY ceiling_rank, which ceiling_rank.py already computed from
+        # ranked NET WINS. Sorting on global_pos here would silently keep the
+        # OLD ordering — Valve's cross-hero board position — while ceiling.csv
+        # carried the new one, and the two agree on only 61-69% of hero pairs.
+        # global_pos is still written to the CSV as a reference column; it is
+        # deliberately not what the site orders by.
+        def _rank(r):
+            v = (r.get("ceiling_rank") or "").strip()
+            if v.lstrip("-").isdigit():
+                return int(v)
+            # a CSV from before 2026-08-07 has no ceiling_rank
+            return int(r.get("global_pos") or 10**9)
+        rows = sorted((r for r in ceil_rows if r["region"] == rg), key=_rank)
         if not rows:
             raise SystemExit("no ceiling rows for %s" % rg)
         sizes = allocate(len(rows))
