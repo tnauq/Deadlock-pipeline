@@ -77,31 +77,102 @@ def try_get(path, params=None, pairs=None):
         return None, 0, str(e)
 
 
-def sql(q, label=""):
+def sql(q, label="", tries=4):
+    """
+    Retries a 429 honouring next_request_in. The pipeline step runs immediately
+    before this probe and leaves the 2/min IP bucket empty, so the first call
+    here reliably 429s — exponential backoff from 1s is far too short, the body
+    says exactly how long to wait.
+    """
     url = BASE + "/v1/sql?format=json&query=" + urllib.parse.quote(q)
     print("  [sql] %s (%d char url)" % (label, len(url)), file=sys.stderr)
-    try:
-        with urllib.request.urlopen(
-                urllib.request.Request(url, headers={"User-Agent": "probe/1.0"}),
-                timeout=180) as r:
-            rows = json.loads(r.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raise SystemExit("SQL failed (%s): %s"
-                         % (e.code, e.read().decode("utf-8", "replace")[:400]))
+    for attempt in range(tries):
+        try:
+            with urllib.request.urlopen(
+                    urllib.request.Request(url, headers={"User-Agent": "probe/1.0"}),
+                    timeout=180) as r:
+                rows = json.loads(r.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace")
+            if e.code == 429 and attempt < tries - 1:
+                wait = 35
+                try:
+                    wait = int(json.loads(body)["error"]["quota"].get("period", 60))
+                    wait = int(json.loads(body)["error"].get("next_request_in", wait)) + 2
+                except Exception:
+                    pass
+                print("  [sql] 429, waiting %ds" % wait, file=sys.stderr)
+                time.sleep(wait)
+                continue
+            raise SystemExit("SQL failed (%s): %s" % (e.code, body[:400]))
+    else:
+        raise SystemExit("SQL still rate limited after %d tries" % tries)
     if isinstance(rows, dict):
         rows = rows.get("data", rows.get("rows", []))
     print("  [sql] %d rows" % len(rows), file=sys.stderr)
     return rows
 
 
+# The first attempt returned 200 with ZERO rows for a single id, which means
+# the parameter name or the response shape is wrong — not that the batch was
+# too large. Try the plausible spellings and report what each gives back
+# rather than parsing blind and calling it truncation.
+MMR_PATHS = [
+    ("/v1/players/mmr", "account_ids"),
+    ("/v1/players/mmr", "account_id"),
+    ("/v1/players/mmr-history", "account_ids"),
+]
+_mmr_shape = {"path": None, "param": None, "sample": None}
+
+
+def _rows_from(payload):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for k in ("data", "players", "results", "mmr"):
+            if isinstance(payload.get(k), list):
+                return payload[k]
+        # a bare object keyed by account id is also plausible
+        if payload and all(str(k).isdigit() for k in payload):
+            return [{"account_id": k, **(v if isinstance(v, dict) else {"value": v})}
+                    for k, v in payload.items()]
+    return []
+
+
+def _score_of(r):
+    for k in ("player_score", "score", "rank", "mmr"):
+        if isinstance(r.get(k), (int, float)):
+            return r[k]
+    return None
+
+
+def discover_mmr_shape(one_id):
+    """Find the working path+param once, and keep a sample response."""
+    for path, param in MMR_PATHS:
+        payload, url_len, err = try_get(path, pairs=[(param, str(one_id))])
+        rows = _rows_from(payload)
+        print("   probe %-26s %-12s -> %s rows %s"
+              % (path, param, len(rows), err or ""), file=sys.stderr)
+        if rows:
+            _mmr_shape.update({"path": path, "param": param, "sample": rows[0]})
+            return True
+        if payload is not None and not rows:
+            _mmr_shape["sample"] = payload if not isinstance(payload, list) else None
+        time.sleep(13)
+    return False
+
+
 def mmr_for(ids):
     """One batched call. Returns {account_id: player_score}."""
-    pairs = [("account_ids", str(i)) for i in ids]
-    payload, url_len, err = try_get("/v1/players/mmr", pairs=pairs)
+    if not _mmr_shape["path"]:
+        return {}, 0, "mmr shape unknown"
+    pairs = [(_mmr_shape["param"], str(i)) for i in ids]
+    payload, url_len, err = try_get(_mmr_shape["path"], pairs=pairs)
     out = {}
-    for r in (payload or []):
+    for r in _rows_from(payload):
         if isinstance(r, dict) and r.get("account_id") is not None:
-            out[int(r["account_id"])] = r.get("player_score")
+            out[int(r["account_id"])] = _score_of(r)
     return out, url_len, err
 
 
@@ -146,11 +217,15 @@ def main():
 
     # ---- A. how many ids fit in one /v1/players/mmr call? ---------------
     print("[2/3] mmr batch size", file=sys.stderr)
+    if not discover_mmr_shape(seeds[0]):
+        print("   NO working mmr path/param found — recording the response and "
+              "skipping part A", file=sys.stderr)
+    report["mmr_shape"] = _mmr_shape
     # pad the seed list by repeating it, so a large batch can be attempted
     pool = (seeds * 200)[:max(BATCH_STEPS)]
     batch = {}
     best = 0
-    for n in BATCH_STEPS:
+    for n in (BATCH_STEPS if _mmr_shape["path"] else []):
         ids = pool[:n]
         got, url_len, err = mmr_for(ids)
         distinct = len(set(ids))
@@ -171,6 +246,7 @@ def main():
 
     # ---- B. are lobby-mates comparable to the seed? ---------------------
     print("[3/3] lobby expansion", file=sys.stderr)
+    time.sleep(35)          # let the 2/min IP bucket refill after the pipeline
     rows = sql(Q_ROSTER.format(seeds=",".join(str(s) for s in seeds),
                                days=LOOKBACK_DAYS), "rosters")
     mates = Counter()
@@ -217,6 +293,8 @@ def main():
     json.dump(report, open(os.path.join(OUT, "mmr_pool.json"), "w"), indent=1)
 
     print("\n=== A  /v1/players/mmr batching ===")
+    print("  working shape: path=%s param=%s" % (_mmr_shape["path"], _mmr_shape["param"]))
+    print("  sample row: %s" % json.dumps(_mmr_shape["sample"])[:300])
     for k, v in batch.items():
         print("  %4s ids -> %3d rows  url %5d  %s%s"
               % (k, v["returned"], v["url_chars"],
