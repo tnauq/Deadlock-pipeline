@@ -167,8 +167,13 @@ def main():
         blk = abilities[rg][hs]
         entry = blk["slots"].setdefault(str(r.get("slot") or ""),
                                         {"id": r["ability_id"], "steps": {}})
+        # [modal position, builds agreeing, of_builds denominator is on the
+        # block, seed_rank, point cost]. The plain count is deliberately NOT
+        # carried: "took it eventually" is ~everything and says nothing, while
+        # the ORDER is the actual decision being made.
         entry["steps"][str(r["tier"])] = [
-            int(r["count"]),
+            int(r["modal_pos"]) if (r.get("modal_pos") or "").isdigit() else 0,
+            int(r.get("modal_count") or 0),
             int(r["seed_rank"]) if (r.get("seed_rank") or "").isdigit() else 0,
             int(r.get("point_cost") or 0),
         ]
