@@ -163,6 +163,16 @@ jobs:
           python3 deadlock_pipeline.py
           python3 ceiling_rank.py
 
+      # ZERO SQL. /v1/players/mmr answers 200 with an EMPTY list for real
+      # accounts. Separates "wrong parameter form" from "player_score is gone
+      # the way of badge" — the two lead opposite ways for the ranked ceiling.
+      - name: Probe MMR shape
+        if: always()
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+        run: python3 probe_mmr_shape.py
+
       # ~2 SQL calls plus MMR calls (separate bucket). Two questions: how many
       # ids fit one /v1/players/mmr call, which decides whether a DAILY ranked
       # ceiling from player_score is viable; and whether a ceiling player's
