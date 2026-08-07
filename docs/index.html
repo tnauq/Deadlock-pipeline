@@ -687,6 +687,8 @@ function renderAbilities(hostSlug){
   const head = el('div','calc-head');
   const lab = el('div','section-label');
   lab.style.margin = '0';
+  // With one order published, the two agreed on a path and there is nothing to
+  // toggle between — the heading still says which build it is.
   lab.textContent = which === 0 && blk.seq_from === 'ceiling'
     ? 'Ability order \u00b7 top player'
     : 'Ability order \u00b7 most common';
