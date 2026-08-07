@@ -210,6 +210,18 @@ def main():
         if seq:
             by_hr[(o["region"], slug(o["hero"]))].append((o, seq))
 
+    def same_path(a, b):
+        """
+        One sequence being a prefix of the other is the SAME path, just cut
+        short by a shorter game. Length is not a build decision, so a
+        truncated copy of the ceiling player's order must not qualify as the
+        second, different order.
+        """
+        if a is None or b is None:
+            return False
+        n = min(len(a), len(b))
+        return a[:n] == b[:n]
+
     def representative(entries, exclude=None):
         at = defaultdict(Counter)
         for _o, seq in entries:
@@ -217,7 +229,7 @@ def main():
                 at[i][tuple(step)] += 1
         best = None
         for o, seq in entries:
-            if exclude is not None and seq == exclude:
+            if same_path(seq, exclude):
                 continue
             score = sum(at[i][tuple(step)] for i, step in enumerate(seq))
             # longer builds see more positions, so normalise by length
@@ -240,7 +252,10 @@ def main():
                 break
         first = ceil if ceil else representative(entries)
         second = representative(entries, exclude=first)
-        got = [x for x in (first, second) if x]
+        got = [first] if first else []
+        # only publish a second order if it actually diverges
+        if second and not same_path(second, first):
+            got.append(second)
         if got:
             orders[key] = got
             seq_source[key] = "ceiling" if ceil else "cohort"
