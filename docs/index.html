@@ -637,7 +637,11 @@ function renderAbilities(hostSlug){
   // the ceiling player's own order, if it was sampled
   if (blk.ceiling && blk.ceiling.length){
     const lab2 = el('div','section-label');
-    lab2.textContent = 'Top player\u2019s order';
+    // The label has to change with the source: one named player's choices and
+    // the cohort's best sampled player are different claims.
+    lab2.textContent = blk.seq_from === 'cohort'
+      ? 'Strongest sampled build\u2019s order'
+      : 'Top player\u2019s order';
     lab2.style.marginBottom = '6px';
     wrap.appendChild(lab2);
     const seq = el('div','seq');
