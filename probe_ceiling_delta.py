@@ -114,15 +114,25 @@ def hero_stats(ids):
 
 def main():
     os.makedirs(OUT, exist_ok=True)
-    tier_path = os.path.join("output", "tierlist.csv")
-    if not os.path.exists(tier_path):
-        raise SystemExit("no output/tierlist.csv — run the pipeline first")
+    # Prefer the pipeline's hero list, but fall back to /v1/assets/heroes so
+    # this stays runnable on a free_only run, where output/ does not exist.
     heroes = {}
-    for r in csv.DictReader(open(tier_path, newline="", encoding="utf-8-sig")):
-        try:
-            heroes[int(r["hero_id"])] = r["hero"]
-        except (KeyError, ValueError):
-            continue
+    tier_path = os.path.join("output", "tierlist.csv")
+    if os.path.exists(tier_path):
+        for r in csv.DictReader(open(tier_path, newline="", encoding="utf-8-sig")):
+            try:
+                heroes[int(r["hero_id"])] = r["hero"]
+            except (KeyError, ValueError):
+                continue
+    if not heroes:
+        print("  [heroes] no tierlist.csv — using /v1/assets/heroes", file=sys.stderr)
+        for h in get(BASE + "/v1/assets/heroes") or []:
+            hid = h.get("id", h.get("hero_id"))
+            if hid is None or h.get("disabled"):
+                continue
+            heroes[int(hid)] = h.get("name") or ("hero_%s" % hid)
+    if not heroes:
+        raise SystemExit("could not source a hero list")
 
     changed, unchanged = [], 0
     all_new_pos, all_old_pos = [], []
