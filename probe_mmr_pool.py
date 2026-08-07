@@ -123,7 +123,7 @@ MMR_PATHS = [
     ("/v1/players/mmr", "account_id"),
     ("/v1/players/mmr-history", "account_ids"),
 ]
-_mmr_shape = {"path": None, "param": None, "sample": None}
+_mmr_shape = {"path": None, "param": None, "sample": None, "attempts": []}
 
 
 def _rows_from(payload):
@@ -152,6 +152,12 @@ def discover_mmr_shape(one_id):
     for path, param in MMR_PATHS:
         payload, url_len, err = try_get(path, pairs=[(param, str(one_id))])
         rows = _rows_from(payload)
+        # record the outcome IN THE REPORT, not just stderr — the first run of
+        # this probe failed on every path and the artifact could not say why
+        _mmr_shape["attempts"].append({
+            "path": path, "param": param, "rows": len(rows), "error": err,
+            "payload_head": json.dumps(payload)[:300] if payload is not None else None,
+        })
         print("   probe %-26s %-12s -> %s rows %s"
               % (path, param, len(rows), err or ""), file=sys.stderr)
         if rows:
