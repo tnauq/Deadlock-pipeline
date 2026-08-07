@@ -750,6 +750,7 @@ def main():
     POINT_COST = {0: 0, 1: 1, 2: 2, 3: 5}
     abil_counts = defaultdict(int)          # (hid, rg, aid, tier) -> builds
     abil_pos = defaultdict(list)            # (hid, rg, aid, tier) -> [order idx]
+    abil_at = defaultdict(Counter)          # (hid, rg, aid, tier) -> {order idx: n}
     abil_builds = defaultdict(int)          # (hid, rg) -> builds with any points
     abil_order = []                         # one row per sampled build
     for (hid, _m, _a), picks in per_build_abil.items():
@@ -765,6 +766,7 @@ def main():
                 continue
             abil_counts[(hid, rg, aid, tier)] += 1
             abil_pos[(hid, rg, aid, tier)].append(order_idx)
+            abil_at[(hid, rg, aid, tier)][order_idx] += 1
             seq.append("%d:%d" % (aid, tier))
         abil_order.append({"hero_id": hid, "hero": heroes.get(hid, ""), "region": rg,
                            "account_id": _a, "match_id": _m,
@@ -778,7 +780,11 @@ def main():
                 sig_slot[(hid, aid)] = k
 
     # rank every (ability, tier) within a hero-region by mean pick position
-    mean_pos = {k: sum(v) / len(v) for k, v in abil_pos.items()}
+    # Abilities outside signature1-4 (only Silver's werewolf form, whose
+    # upgrades mirror her base kit) are excluded before ranking, so every hero
+    # gets a clean 1..16 rather than Silver's 1..19 with gaps.
+    mean_pos = {k: sum(v) / len(v) for k, v in abil_pos.items()
+                if (k[0], k[2]) in sig_slot}
     seed_rank = {}
     by_hr = defaultdict(list)
     for k in mean_pos:
@@ -813,6 +819,13 @@ def main():
     abil_freq = []
     for (hid, rg, aid, tier), c in abil_counts.items():
         meta = abilities.get(aid, {})
+        # WHEN a step is taken, and how much builds agree on it. The plain
+        # count says "took it eventually", which is ~everything and carries no
+        # information; the order is the actual decision. modal_pos is the most
+        # common position in the pick sequence (1-based) and modal_count is how
+        # many builds put it exactly there.
+        at = abil_at[(hid, rg, aid, tier)]
+        pos, agree = (at.most_common(1)[0] if at else (0, 0))
         abil_freq.append({
             "hero_id": hid, "hero": heroes.get(hid, ""), "region": rg,
             "ability_id": aid, "ability": meta.get("name", "ability_%d" % aid),
@@ -821,6 +834,8 @@ def main():
             "kind": "unlock" if tier == 0 else "upgrade",
             "point_cost": POINT_COST[tier],
             "count": c,
+            "modal_pos": pos + 1 if at else "",
+            "modal_count": agree,
             "of_builds": abil_builds[(hid, rg)],
             "seed_rank": seed_rank.get((hid, rg, aid, tier), ""),
             "icon_url": meta.get("icon", ""),
@@ -948,7 +963,8 @@ def main():
            "count", "of_builds", "icon_url"])
     write("ability_frequency.csv", abil_freq,
           ["hero_id", "hero", "region", "ability_id", "ability", "slot", "tier",
-           "kind", "point_cost", "count", "of_builds", "seed_rank", "icon_url"])
+           "kind", "point_cost", "count", "modal_pos", "modal_count",
+           "of_builds", "seed_rank", "icon_url"])
     # account_id is here so build_site_data.py can pick out the ceiling
     # player's own sequence. output/ is gitignored; nothing account-level is
     # published to the site.
