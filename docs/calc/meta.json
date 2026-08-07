@@ -1,8 +1,8 @@
 {
  "n_items": 156,
  "n_heroes": 38,
- "n_props": 437,
- "n_unresolved_conditionals": 107,
+ "n_props": 445,
+ "n_unresolved_conditionals": 115,
  "n_toggled": 12,
  "toggles": {
   "close_range": 2,
@@ -17,12 +17,12 @@
    48
   ],
   [
-   "MODIFIER_VALUE_TECH_POWER",
+   "MODIFIER_VALUE_WEAPON_DAMAGE_INCREASE",
    32
   ],
   [
-   "MODIFIER_VALUE_WEAPON_DAMAGE_INCREASE",
-   31
+   "MODIFIER_VALUE_TECH_POWER",
+   32
   ],
   [
    "MODIFIER_VALUE_OUT_OF_COMBAT_HEALTH_REGEN",
@@ -34,15 +34,15 @@
   ],
   [
    "MODIFIER_VALUE_TECH_RESIST",
-   24
+   25
   ],
   [
    "MODIFIER_VALUE_FIRE_RATE",
-   22
+   24
   ],
   [
    "MODIFIER_VALUE_BULLET_ARMOR_DAMAGE_RESIST",
-   22
+   23
   ],
   [
    "MODIFIER_VALUE_SPRINT_SPEED_BONUS",
@@ -61,12 +61,12 @@
    12
   ],
   [
-   "MODIFIER_VALUE_BARRIER_HEALTH",
-   9
+   "MODIFIER_VALUE_AMMO_CLIP_SIZE_PERCENT",
+   11
   ],
   [
-   "MODIFIER_VALUE_AMMO_CLIP_SIZE_PERCENT",
-   8
+   "MODIFIER_VALUE_BARRIER_HEALTH",
+   9
   ],
   [
    "MODIFIER_VALUE_STATUS_RESISTANCE",
@@ -246,14 +246,14 @@
   ]
  ],
  "units": {
-  "%": 252,
+  "%": 260,
   "m": 48,
   "null": 135,
   "m/s": 1,
   "s": 1
  },
- "items_kb": 155.5,
- "items_gz_kb": 15.8,
+ "items_kb": 157.3,
+ "items_gz_kb": 15.9,
  "heroes_kb": 428.8,
  "heroes_gz_kb": 13.4,
  "slot_model": {
@@ -282,7 +282,7 @@
  "expected_items": 156,
  "n_slot_or_cost_mismatch": 0,
  "n_self_penalties": 12,
- "n_effect_only": 5,
+ "n_effect_only": 4,
  "n_abilities": 221,
  "abilities_kb": 470.6,
  "abilities_gz_kb": 62.9,
