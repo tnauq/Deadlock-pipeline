@@ -377,15 +377,20 @@ def fetch_ladders(heroes):
 # /v1/players/hero-stats (batched, no SQL). See fetch_hero_stats().
 
 
+# imbued_ability_id rides along in the SAME array join, so it costs no extra
+# SQL call. Nine of the 156 items are imbue items whose effect applies to one
+# chosen ability; this is the only place the game records which one was picked.
 Q_ITEMS = """
 SELECT account_id, hero_id, match_id,
-       item_id, nwb AS net_worth_at_buy, bought AS game_time_s, sold AS sold_time_s
+       item_id, nwb AS net_worth_at_buy, bought AS game_time_s, sold AS sold_time_s,
+       imbued AS imbued_ability_id
 FROM match_player
 ARRAY JOIN
-    items.item_id          AS item_id,
-    items.net_worth_at_buy AS nwb,
-    items.game_time_s      AS bought,
-    items.sold_time_s      AS sold
+    items.item_id           AS item_id,
+    items.net_worth_at_buy  AS nwb,
+    items.game_time_s       AS bought,
+    items.sold_time_s       AS sold,
+    items.imbued_ability_id AS imbued
 WHERE match_id IN ({mids}) AND account_id IN ({aids})
 """
 
@@ -689,6 +694,8 @@ def main():
     print("[5/5] aggregating", file=sys.stderr)
     keep = {(m, a) for m, a in wanted}
     per_build, skipped_abilities = defaultdict(list), set()
+    imbue_pick = Counter()      # (hid, rg, item, ability) -> builds
+    imbue_item = Counter()      # (hid, rg, item)          -> builds holding it
     per_build_abil = defaultdict(list)
     for r in item_rows:
         key = (int(r["match_id"]), int(r["account_id"]))
@@ -715,6 +722,10 @@ def main():
         if iid not in items:     # anything else that is not a shop item
             skipped_abilities.add(iid)
             continue
+        imb = int(r.get("imbued_ability_id") or 0)
+        if imb:
+            imbue_pick[(int(r["hero_id"]), build_region.get(key, ""), iid, imb)] += 1
+            imbue_item[(int(r["hero_id"]), build_region.get(key, ""), iid)] += 1
         per_build[(int(r["hero_id"]),) + key].append(
             (iid, int(r["net_worth_at_buy"] or 0),
              int(r["game_time_s"] or 0), int(r["sold_time_s"] or 0)))
@@ -961,6 +972,21 @@ def main():
     write("item_frequency.csv", freq,
           ["hero_id", "hero", "region", "snapshot", "item_id", "item", "category", "tier",
            "count", "of_builds", "icon_url"])
+    imbue_rows = []
+    for (hid, rg, iid, aid), c in sorted(imbue_pick.items()):
+        imbue_rows.append({
+            "hero_id": hid, "hero": heroes.get(hid, ""), "region": rg,
+            "item_id": iid, "item": items.get(iid, {}).get("name", ""),
+            "ability_id": aid,
+            "ability": abilities.get(aid, {}).get("name", "ability_%d" % aid),
+            "slot": sig_slot.get((hid, aid), ""),
+            "count": c, "of_holders": imbue_item[(hid, rg, iid)],
+        })
+    imbue_rows.sort(key=lambda d: (d["hero"], d["region"], d["item"], -d["count"]))
+    write("imbue_frequency.csv", imbue_rows,
+          ["hero_id", "hero", "region", "item_id", "item", "ability_id", "ability",
+           "slot", "count", "of_holders"])
+
     write("ability_frequency.csv", abil_freq,
           ["hero_id", "hero", "region", "ability_id", "ability", "slot", "tier",
            "kind", "point_cost", "count", "modal_pos", "modal_count",
