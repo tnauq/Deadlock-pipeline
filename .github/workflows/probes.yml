@@ -185,6 +185,20 @@ jobs:
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
         run: python3 probe_mmr_shape.py
 
+      # Part A is free (leaderboard + hero-stats); part B costs ~2 SQL.
+      # A measures what the candidate pool becomes if the general-board
+      # requirement is dropped and identity is confirmed by "has ranked games
+      # on this hero" instead — the general board currently costs 58% of the
+      # pool and no longer feeds the ordering. B tests whether lobby-mates are
+      # of comparable standing, which volume alone did not establish.
+      - name: Probe pool expansion
+        if: ${{ always() && !inputs.free_only }}
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+          PROBE_LOOKBACK_DAYS: ${{ inputs.lookback_days }}
+        run: python3 probe_pool_expansion.py
+
       # ~2 SQL calls plus MMR calls (separate bucket). Two questions: how many
       # ids fit one /v1/players/mmr call, which decides whether a DAILY ranked
       # ceiling from player_score is viable; and whether a ceiling player's
