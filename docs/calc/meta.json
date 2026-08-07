@@ -252,8 +252,8 @@
   "m/s": 1,
   "s": 1
  },
- "items_kb": 150.6,
- "items_gz_kb": 15.7,
+ "items_kb": 155.5,
+ "items_gz_kb": 15.8,
  "heroes_kb": 428.8,
  "heroes_gz_kb": 13.4,
  "slot_model": {
@@ -283,6 +283,9 @@
  "n_slot_or_cost_mismatch": 0,
  "n_self_penalties": 12,
  "n_effect_only": 5,
+ "n_abilities": 221,
+ "abilities_kb": 470.6,
+ "abilities_gz_kb": 62.9,
  "dps_checked": 38,
  "dps_failed": 0
 }
