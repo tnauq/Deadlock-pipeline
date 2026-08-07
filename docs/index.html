@@ -1045,16 +1045,77 @@ function loadEliteBuild(){
 
   const take = it => { chosen.push(it); spent[it.cat] += it.cost || 0; };
 
-  // pass 1 — each category up to 4,800, never past it
-  for (const cat of ['G', 'S', 'V'])
-    for (const c of cands){
-      if (spent[cat] >= EARLY_BUDGET) break;
-      if (c.it.cat !== cat) continue;
-      if (spent[cat] + (c.it.cost || 0) > EARLY_BUDGET) continue;
-      if (!fits(c.it)) continue;
-      take(c.it);
-      early.push(c.it);
+  // pass 1 — each category fills to 4,800.
+  //
+  // GREEDY FIRST, in plain frequency order. If that reaches the threshold, keep
+  // it: greedy is frequency-led and picks what the cohort actually built.
+  //
+  // Only when greedy falls SHORT does a subset-sum search take over, because
+  // the souls bonus lands AT a threshold and not below it — 800+1600+1600 is
+  // strictly worse than two 3200s even though it starts earlier. Greedy cannot
+  // see that; it commits to the cheap high-frequency item and then finds
+  // nothing that fits the remainder. Doorman EU is the case: greedy stalls at
+  // 4,000, the search reaches 4,800 with Opening Rounds + Shadow Weave.
+  //
+  // Running the search second rather than always keeps its one bad habit in
+  // check: maximising spend will reach for count-2 noise to complete a set,
+  // and this way it only does so where greedy had already failed.
+  for (const cat of ['G', 'S', 'V']){
+    const pool = cands
+      .filter(c => c.it.cat === cat && (c.it.cost || 0) <= EARLY_BUDGET && fits(c.it))
+      .slice(0, 14);                       // bound the search; frequency-ordered
+    const rel2 = relatedIds();
+
+    // conflict-aware check for a candidate against a provisional set
+    const ok = (it, set) => {
+      if (set.includes(it)) return false;
+      const chain = rel2.get(it.id);
+      if (chain && set.some(x => chain.has(x.id))) return false;
+      if (it.active && chosen.filter(x => x.active).length +
+                       set.filter(x => x.active).length >= MAX_ACTIVE) return false;
+      return true;
+    };
+
+    // --- greedy, frequency order
+    const greedy = [];
+    let gs = 0;
+    for (const c of pool){
+      if (gs >= EARLY_BUDGET) break;
+      if (gs + (c.it.cost || 0) > EARLY_BUDGET) continue;
+      if (!ok(c.it, greedy)) continue;
+      greedy.push(c.it);
+      gs += c.it.cost || 0;
     }
+
+    let pick = greedy;
+    if (gs < EARLY_BUDGET){
+      // --- subset-sum fallback: spend, then frequency, then earliest held
+      const best = {spend: gs, freq: -1, seen: Infinity, set: greedy.slice()};
+      (function walk(i, set, spend, freq, seen){
+        if (spend > EARLY_BUDGET) return;
+        if (spend > best.spend ||
+           (spend === best.spend && (freq > best.freq ||
+           (freq === best.freq && seen < best.seen)))){
+          best.spend = spend; best.freq = freq; best.seen = seen;
+          best.set = set.slice();
+        }
+        if (spend === EARLY_BUDGET || i >= pool.length ||
+            set.length >= SLOTS - chosen.length) return;
+        for (let k = i; k < pool.length; k++){
+          const c = pool[k];
+          if (!ok(c.it, set)) continue;
+          set.push(c.it);
+          walk(k + 1, set, spend + (c.it.cost || 0), freq + c.count,
+               seen + (firstSeen.get(c.it.id) ?? 9));
+          set.pop();
+        }
+      })(0, [], 0, 0, 0);
+      pick = best.set;
+    }
+
+    for (const it of pick)
+      if (fits(it)){ take(it); early.push(it); }
+  }
 
   // pass 2 — the rest, plain frequency order
   for (const c of cands){
