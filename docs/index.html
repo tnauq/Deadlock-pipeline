@@ -689,7 +689,7 @@ function renderAbilities(hostSlug){
   lab.style.margin = '0';
   lab.textContent = which === 0 && blk.seq_from === 'ceiling'
     ? 'Ability order \u00b7 top player'
-    : 'Ability order \u00b7 most common build';
+    : 'Ability order \u00b7 most common';
   head.appendChild(lab);
 
   if (orders.length > 1){
@@ -704,8 +704,8 @@ function renderAbilities(hostSlug){
       b.style.minWidth = '38px';
       b.title = k === 0
         ? (blk.seq_from === 'ceiling' ? 'The top player\u2019s build'
-                                      : 'The most common build')
-        : 'The next most common build';
+                                      : 'The most common')
+        : 'The next most common';
       b.setAttribute('aria-pressed', String(k === which));
       b.onclick = () => { abilOrder = k; renderDetail(); };
       grp.appendChild(b);
