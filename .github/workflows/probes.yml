@@ -163,6 +163,20 @@ jobs:
           python3 deadlock_pipeline.py
           python3 ceiling_rank.py
 
+      # ~2 SQL calls plus MMR calls (separate bucket). Two questions: how many
+      # ids fit one /v1/players/mmr call, which decides whether a DAILY ranked
+      # ceiling from player_score is viable; and whether a ceiling player's
+      # lobby-mates are of comparable standing, which would fix thin build
+      # pools on boards too short to fill 20 samples.
+      # Runs after the pipeline so output/ceiling.csv exists to seed from.
+      - name: Probe MMR pool
+        if: ${{ always() && !inputs.free_only }}
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+          PROBE_LOOKBACK_DAYS: ${{ inputs.lookback_days }}
+        run: python3 probe_mmr_pool.py
+
       # Team-confirmed duo detection from match ROSTERS. Replaces the
       # co-occurrence approach in probe_duos.py, which could not tell
       # teammates from opponents and whose 30% threshold sat at the 99th
