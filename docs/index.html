@@ -157,6 +157,7 @@ h1{font-size:clamp(24px,7vw,38px);letter-spacing:.04em;margin-top:4px}
 .slot .imb.set{color:var(--cat-s);border-color:var(--cat-s)}
 .imb-row{display:flex;align-items:center;gap:8px;padding:4px 0;flex-wrap:wrap}
 .imb-row .nm{font-size:12.5px;flex:1;min-width:100px}
+.imb-row .imb-note{font:700 10.5px/1 var(--mono);color:var(--dim);flex:0 0 auto}
 .imb-row .regions button .ic{width:22px;height:22px;border-radius:5px;display:block}
 
 /* ---------- ability calculator ---------- */
@@ -612,11 +613,27 @@ if (window.__DATA__) {
 
 // One row per equipped imbue item: which ability is it imbued into? Nine of
 // the 156 items work this way and they do nothing at all until assigned.
+// Preselect the ability the cohort imbues this item into. Choices are highly
+// concentrated (median top-choice share 100%), so the default is usually the
+// only thing anyone does — but it stays overridable, and the split is shown so
+// a hero with no consensus reads as one.
+function imbueDefault(itemId){
+  const blk = (R().imbue || {})[build.slug] || {};
+  const rec = blk[String(itemId)];
+  return rec && rec.top ? rec.top : null;
+}
+
 function drawImbue(host){
   const items = equipped().filter(i => i.imbue);
   if (!items.length) return;
   const slots = abilSlots();
   const meta = DATA.ability_meta || {};
+  build.imbue = build.imbue || {};
+  for (const it of items)
+    if (build.imbue[it.id] === undefined){
+      const d = imbueDefault(it.id);
+      if (d) build.imbue[it.id] = d;
+    }
   const box = el('div','fx');
   const h4 = el('h4'); h4.textContent = 'Imbue';
   box.appendChild(h4);
@@ -624,6 +641,16 @@ function drawImbue(host){
     const row = el('div','imb-row');
     const nm = el('span','nm'); nm.textContent = it.name;
     row.appendChild(nm);
+    const rec = ((R().imbue || {})[build.slug] || {})[String(it.id)];
+    if (rec && rec.picks && rec.picks.length){
+      const note = el('span','imb-note');
+      const top = rec.picks[0];
+      note.textContent = top[1] + '/' + rec.of;
+      note.title = rec.picks
+        .map(([a, c]) => c + ' \u00d7 ' + ((meta[a] || {}).name || a)).join(', ') +
+        '  \u00b7  of ' + rec.of + ' builds holding it';
+      row.appendChild(note);
+    }
     const grp = el('div','regions');
     grp.style.margin = '0';
     for (const slot of ['1','2','3','4']){
@@ -947,11 +974,27 @@ function resolve(){
 
 // One row per equipped imbue item: which ability is it imbued into? Nine of
 // the 156 items work this way and they do nothing at all until assigned.
+// Preselect the ability the cohort imbues this item into. Choices are highly
+// concentrated (median top-choice share 100%), so the default is usually the
+// only thing anyone does — but it stays overridable, and the split is shown so
+// a hero with no consensus reads as one.
+function imbueDefault(itemId){
+  const blk = (R().imbue || {})[build.slug] || {};
+  const rec = blk[String(itemId)];
+  return rec && rec.top ? rec.top : null;
+}
+
 function drawImbue(host){
   const items = equipped().filter(i => i.imbue);
   if (!items.length) return;
   const slots = abilSlots();
   const meta = DATA.ability_meta || {};
+  build.imbue = build.imbue || {};
+  for (const it of items)
+    if (build.imbue[it.id] === undefined){
+      const d = imbueDefault(it.id);
+      if (d) build.imbue[it.id] = d;
+    }
   const box = el('div','fx');
   const h4 = el('h4'); h4.textContent = 'Imbue';
   box.appendChild(h4);
@@ -959,6 +1002,16 @@ function drawImbue(host){
     const row = el('div','imb-row');
     const nm = el('span','nm'); nm.textContent = it.name;
     row.appendChild(nm);
+    const rec = ((R().imbue || {})[build.slug] || {})[String(it.id)];
+    if (rec && rec.picks && rec.picks.length){
+      const note = el('span','imb-note');
+      const top = rec.picks[0];
+      note.textContent = top[1] + '/' + rec.of;
+      note.title = rec.picks
+        .map(([a, c]) => c + ' \u00d7 ' + ((meta[a] || {}).name || a)).join(', ') +
+        '  \u00b7  of ' + rec.of + ' builds holding it';
+      row.appendChild(note);
+    }
     const grp = el('div','regions');
     grp.style.margin = '0';
     for (const slot of ['1','2','3','4']){
