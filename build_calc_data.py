@@ -65,6 +65,25 @@ WIKI_LIST = os.environ.get("CALC_WIKI_LIST") or os.path.join("ref", "shop_items_
 # -13% health and Sharpshooter's move-speed cost are part of what those items do.
 DROP_ENEMY_FACING = True
 
+# Some real stat properties carry NO provided_property_type and were dropped
+# silently. Vampiric Burst's active +34% fire rate is one — the wiki lists it,
+# the asset holds it as ActiveBonusFireRate, and nothing linked it to a panel.
+#
+# 338 properties across 196 keys lack a type, but almost all are timings,
+# thresholds and proc chances with no panel row. These six are the ones that
+# belong in a panel; the rest stay out on purpose.
+#
+# `section` is forced because these are all conditional: active-only, or gated
+# on a health threshold. Without it they would count as standing bonuses.
+UNTYPED_PROPS = {
+    "ActiveBonusFireRate":       ("MODIFIER_VALUE_FIRE_RATE", "active"),
+    "ActiveReloadPercent":       ("MODIFIER_VALUE_AMMO_CLIP_SIZE_PERCENT", "active"),
+    "AmmoReloadPercent":         ("MODIFIER_VALUE_AMMO_CLIP_SIZE_PERCENT", "active"),
+    "BulletResistBelowThreshold": ("MODIFIER_VALUE_BULLET_ARMOR_DAMAGE_RESIST", "passive"),
+    "TechResistBelowThreshold":  ("MODIFIER_VALUE_TECH_RESIST", "passive"),
+    "WeaponDamagePerStack":      ("MODIFIER_VALUE_WEAPON_DAMAGE_INCREASE", "passive"),
+}
+
 # Two asset records share the display name "Silencer", both weapon/6400. The
 # allowlist matches on name, so the live one is pinned by class_name and the
 # other dropped. Keyed by name -> the ONLY class_name allowed to claim it.
@@ -193,8 +212,15 @@ def bearing_props(item):
     """A property grants a stat iff it declares provided_property_type."""
     out = []
     for key, p in (item.get("properties") or {}).items():
-        if not isinstance(p, dict) or "provided_property_type" not in p:
+        if not isinstance(p, dict):
             continue
+        forced = None
+        if not p.get("provided_property_type"):
+            if key not in UNTYPED_PROPS:
+                continue
+            ptype, forced = UNTYPED_PROPS[key]
+        else:
+            ptype = p["provided_property_type"]
         val = parse_value(p.get("value"))
         if val is None or val == 0.0:
             continue          # boilerplate sits at "0" on almost every item
@@ -206,17 +232,17 @@ def bearing_props(item):
             continue
         out.append({
             "key": key,
-            "type": p["provided_property_type"],
+            "type": ptype,
             "value": val,
             "unit": parse_unit(p),
             "label": p.get("label"),
-            "section": p.get("tooltip_section"),
+            "section": forced or p.get("tooltip_section"),
             "flags": flags,
             "cond": cond,
             "toggle": COND_TOGGLES.get(cond),
             # flagged conditional but no readable condition string: the
             # condition exists only in tooltip prose. Excluded from totals.
-            "unresolved": bool(
+            "unresolved": bool(forced) or bool(
                 [f for f in flags if str(f).startswith("Conditionally")]
                 and not COND_TOGGLES.get(cond)),
             "negative": bool(p.get("negative_attribute")),
