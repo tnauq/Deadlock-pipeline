@@ -31,7 +31,7 @@ import hashlib
 import json
 import os
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from math import erf, sqrt
 
 OUT = "output"
@@ -187,47 +187,71 @@ def main():
     def parse_seq(row):
         seq = []
         for tok in (row.get("sequence") or "").split():
-            a, _, t = tok.partition(":")
+            aid, _, t = tok.partition(":")
             if t.isdigit():
-                seq.append([a, int(t)])
+                seq.append([aid, int(t)])
         return seq
 
-    by_acct = {(r["region"], slug(r["hero"]), (r.get("account_id") or "").strip()): r
-               for r in order_rows}
-    ceiling_seq, seq_source = {}, {}
+    # Two orders per hero-region, shown one at a time behind a 1/2 toggle:
+    #   1  the ceiling player's own build
+    #   2  the most REPRESENTATIVE cohort build
+    #
+    # "Most common" cannot mean an exact duplicate: a sequence is ~16 steps, so
+    # essentially every build is unique and a modal count would be 1 of 20.
+    # Representativeness is scored instead — for each position, how many other
+    # builds made the same pick there — so the winner is the build that agrees
+    # most with the cohort rather than one that happens to repeat.
+    #
+    # If the top-scoring build IS the ceiling player's, the runner-up takes
+    # slot 2, so the toggle always shows two different things.
+    by_hr = defaultdict(list)
+    for o in order_rows:
+        seq = parse_seq(o)
+        if seq:
+            by_hr[(o["region"], slug(o["hero"]))].append((o, seq))
+
+    def representative(entries, exclude=None):
+        at = defaultdict(Counter)
+        for _o, seq in entries:
+            for i, step in enumerate(seq):
+                at[i][tuple(step)] += 1
+        best = None
+        for o, seq in entries:
+            if exclude is not None and seq == exclude:
+                continue
+            score = sum(at[i][tuple(step)] for i, step in enumerate(seq))
+            # longer builds see more positions, so normalise by length
+            score = score / max(len(seq), 1)
+            if best is None or score > best[0]:
+                best = (score, seq)
+        return best[1] if best else None
+
+    orders, seq_source = {}, {}
     for r in ceil_rows:
         key = (r["region"], slug(r["hero"]))
-        acct = (r.get("account_id") or "").strip()
-        row = by_acct.get((r["region"], slug(r["hero"]), acct)) if acct else None
-        seq = parse_seq(row) if row else []
-        if seq:
-            ceiling_seq[key] = seq
-            seq_source[key] = "ceiling"
+        entries = by_hr.get(key) or []
+        if not entries:
             continue
-        # FALLBACK. The ceiling player tops the general board, but the sampled
-        # pool is chosen by shrunk ranked win rate on the hero and capped at
-        # PER_REGION, so their own match is only among the 20 about half the
-        # time. When it is not, show the strongest player in the cohort that
-        # WAS sampled — same volume-aware rating the pool was selected on.
-        best = None
-        for o in order_rows:
-            if o["region"] != r["region"] or slug(o["hero"]) != slug(r["hero"]):
-                continue
-            try:
-                rating = float(o.get("ranked_rating") or 0)
-            except ValueError:
-                rating = 0.0
-            if best is None or rating > best[0]:
-                best = (rating, o)
-        if best and parse_seq(best[1]):
-            ceiling_seq[key] = parse_seq(best[1])
-            seq_source[key] = "cohort"
+        acct = (r.get("account_id") or "").strip()
+        ceil = None
+        for o, seq in entries:
+            if acct and (o.get("account_id") or "").strip() == acct:
+                ceil = seq
+                break
+        first = ceil if ceil else representative(entries)
+        second = representative(entries, exclude=first)
+        got = [x for x in (first, second) if x]
+        if got:
+            orders[key] = got
+            seq_source[key] = "ceiling" if ceil else "cohort"
+
     if abil_rows:
         n_ceil = sum(1 for v in seq_source.values() if v == "ceiling")
-        print("  [abilities] %d rows, %d sequences of %d hero-regions "
-              "(%d ceiling player, %d cohort fallback)"
-              % (len(abil_rows), len(ceiling_seq), len(ceil_rows),
-                 n_ceil, len(ceiling_seq) - n_ceil), file=sys.stderr)
+        n_two = sum(1 for v in orders.values() if len(v) > 1)
+        print("  [abilities] %d rows, %d hero-regions with an order "
+              "(%d ceiling player, %d cohort only), %d with both"
+              % (len(abil_rows), len(orders), n_ceil,
+                 len(orders) - n_ceil, n_two), file=sys.stderr)
 
     # ---- per-region builds ------------------------------------------------
     builds = {rg: defaultdict(lambda: {s: [] for s in SNAPSHOTS}) for rg in REGIONS}
@@ -282,7 +306,7 @@ def main():
             "order": order,
             "builds": {k: v for k, v in builds[rg].items()},
             "abilities": {k: {"slots": v["slots"], "of_builds": v["of_builds"],
-                              "ceiling": ceiling_seq.get((rg, k), []),
+                              "orders": orders.get((rg, k), []),
                               "seq_from": seq_source.get((rg, k), "")}
                           for k, v in abilities[rg].items()},
         }
