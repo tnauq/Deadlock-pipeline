@@ -138,7 +138,10 @@ jobs:
           fi
 
       # Artifacts on a public repo are downloadable by anyone, so the
-      # player-level CSVs are excluded here too.
+      # player-level CSVs are excluded here too. That is why
+      # output/ability_order.csv is NOT listed: it carries account ids so that
+      # build_site_data.py can pick out the ceiling player's pick order, and it
+      # must stay on the runner. ability_frequency.csv is aggregate and safe.
       - name: Upload aggregate CSVs
         if: always()
         uses: actions/upload-artifact@v4
@@ -150,3 +153,4 @@ jobs:
             output/item_frequency.csv
             output/hero_splits.csv
             output/ceiling.csv
+            output/ability_frequency.csv
