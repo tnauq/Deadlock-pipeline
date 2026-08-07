@@ -153,8 +153,16 @@ def _get(url, tries=3):
 _sql_calls = [0]
 
 
+# The exact string sql() measures, so callers can size a chunk against the same
+# number instead of guessing at the prefix. query_items() measured quote(q)
+# alone, which is ~50 chars short of the real URL — a chunk could clear its own
+# check at 8,997 and then die inside sql() at 9,007.
+def sql_url(query):
+    return BASE + "/v1/sql?format=json&query=" + urllib.parse.quote(query)
+
+
 def sql(query, label=""):
-    url = BASE + "/v1/sql?format=json&query=" + urllib.parse.quote(query)
+    url = sql_url(query)
     if len(url) > MAX_URL:
         raise SystemExit("Query URL is %d chars (limit %d) — %s would 414. "
                          "Reduce the batch size." % (len(url), MAX_URL, label or "query"))
@@ -438,7 +446,7 @@ def fetch_hero_stats(account_ids):
         q = "&".join("account_ids=%d" % a for a in part)
         url = "%s/v1/players/hero-stats?match_mode=%s&%s" % (BASE, MODE_API, q)
         if len(url) > MAX_URL and chunk > 50:
-            chunk = max(50, chunk // 2)
+            chunk = max(50, chunk // 2)   # url here is already the full string
             continue
         try:
             rows = _get(url)
@@ -483,13 +491,25 @@ def query_items(pairs):
     # ~22 encoded chars per (match_id, account_id) pair; //25 leaves room for
     # the query body. The old //40 was undersized and cost 3 extra requests —
     # which matters against the 20 req/HR unkeyed cap, not the 2/min one.
+    # Halving on overflow wasted requests: a 360-pair chunk that missed by ten
+    # characters dropped to 180 and left the URL half empty, turning 4 calls
+    # into 8 against a 20/HOUR cap. Measure the real URL and resize in
+    # proportion instead, so a chunk lands just under the limit.
     rows, chunk, i = [], max(20, MAX_URL // 25), 0
     while i < len(pairs):
         part = pairs[i:i + chunk]
         q = Q_ITEMS.format(mids=",".join(str(m) for m, _ in part),
                            aids=",".join(str(a) for _, a in part))
-        if len(urllib.parse.quote(q)) > MAX_URL and chunk > 20:
-            chunk = max(20, chunk // 2)
+        n = len(sql_url(q))
+        if n > MAX_URL:
+            if chunk <= 20:
+                raise SystemExit(
+                    "items chunk of %d pairs is %d chars, over the %d limit, and "
+                    "cannot be shrunk further. Raise MAX_URL or shorten Q_ITEMS."
+                    % (len(part), n, MAX_URL))
+            fixed = len(sql_url(Q_ITEMS.format(mids="", aids="")))
+            per = max((n - fixed) / len(part), 1.0)
+            chunk = max(20, min(chunk - 1, int((MAX_URL - fixed) / per * 0.97)))
             continue
         rows.extend(sql(q, "items %d-%d of %d" % (i + 1, i + len(part), len(pairs))))
         i += len(part)
