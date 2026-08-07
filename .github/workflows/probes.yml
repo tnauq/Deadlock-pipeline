@@ -84,6 +84,18 @@ jobs:
           CALC_EXPECTED_ITEMS: ${{ inputs.calc_expected_items }}
         run: python3 build_calc_data.py --dump-raw raw
 
+      # ZERO SQL — leaderboard is 100 req/s on its own bucket. Establishes
+      # whether a RANKED leaderboard exists to cross-reference against, since
+      # only ~42% of hero-board entries locate on the general board and
+      # deadlock-api's own MMR spans Unranked too. Also re-tests whether
+      # ranked_rank / badge_level have populated since the badge collapse.
+      - name: Probe ranked leaderboard
+        if: always()
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+        run: python3 probe_leaderboard_ranked.py
+
       # ONE /v1/sql call. Answers whether ability upgrade picks can be
       # displayed the way item frequency is: do ability ids repeat within a
       # build (one row per point), what upgrade_id holds, whether game_time_s
