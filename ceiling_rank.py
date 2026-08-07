@@ -243,8 +243,15 @@ def fetch_ranked_records(account_ids):
             a = r.get("account_id")
             if a is None:
                 continue
-            g = r.get("matches") or r.get("matches_played") or 0
+            # `matches` is a LIST OF MATCH IDS on this endpoint; the count is
+            # `matches_played`. Taking `matches` first handed a list to int().
+            g = r.get("matches_played")
+            if g is None:
+                m = r.get("matches")
+                g = len(m) if isinstance(m, list) else (m or 0)
             w = r.get("wins") or 0
+            if isinstance(w, list):
+                w = len(w)
             rec = out[int(a)]
             rec["games"] += int(g)
             rec["wins"] += int(w)
