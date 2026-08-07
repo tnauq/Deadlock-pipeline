@@ -159,7 +159,8 @@ h1{font-size:clamp(24px,7vw,38px);letter-spacing:.04em;margin-top:4px}
 .ab-r .bar i{display:block;height:100%;background:var(--a);opacity:.55}
 .ab-r .n{flex:0 0 auto;font-family:var(--mono);font-variant-numeric:tabular-nums;
   font-weight:800;color:var(--text);font-size:11.5px}
-.ab-r .n b{color:var(--dim);font-weight:600}
+.ab-r .n em{font-style:normal;color:var(--text)}
+.ab-r .n b{color:var(--dim);font-weight:600;font-size:10.5px}
 .ab-r.none .n{color:var(--dim)}
 .seq{display:flex;flex-wrap:wrap;gap:4px;margin-top:10px}
 .seq .s{display:flex;align-items:center;gap:4px;padding:3px 7px 3px 4px;border-radius:99px;
@@ -587,6 +588,11 @@ if (window.__DATA__) {
    number for that reason.
    ------------------------------------------------------------------------ */
 
+function ordinal(n){
+  const s = ['th','st','nd','rd'], v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
 function renderAbilities(hostSlug){
   const blk = (R().abilities || {})[hostSlug];
   if (!blk || !blk.slots || !Object.keys(blk.slots).length) return null;
@@ -611,23 +617,31 @@ function renderAbilities(hostSlug){
     col.appendChild(head);
 
     for (const tier of ['0','1','2','3']){
-      const step = a.steps[tier];
-      const count = step ? step[0] : 0;
-      const cost = step ? step[2] : [0,1,2,5][+tier];
+      const step = a.steps[tier] || [];
+      const pos = step[0] || 0;        // modal position in the pick order
+      const agree = step[1] || 0;      // builds that put it exactly there
+      const cost = step[3] != null ? step[3] : [0,1,2,5][+tier];
       const row = el('div','ab-r');
       if (tier === '0') row.classList.add('unlock');
-      if (!count) row.classList.add('none');
+      if (!pos) row.classList.add('none');
       const p = el('span','p');
       p.textContent = tier === '0' ? '\u25c6' : cost;
       p.title = tier === '0' ? 'Unlock' : cost + ' ability point' + (cost > 1 ? 's' : '');
+      // The headline is WHERE in the sequence this step usually lands; the
+      // dim figure is how many builds agree on that position.
+      const n = el('span','n');
+      const ord = el('em');
+      ord.textContent = pos ? ordinal(pos) : '\u2014';
+      const b = el('b'); b.textContent = pos ? ' ' + agree + '/' + of : '';
+      n.append(ord, b);
       const bar = el('span','bar');
       const fill = el('i');
-      fill.style.width = of ? Math.round(100 * count / of) + '%' : '0';
+      fill.style.width = of ? Math.round(100 * agree / of) + '%' : '0';
       bar.appendChild(fill);
-      const n = el('span','n');
-      const b = el('b'); b.textContent = ' /' + of;
-      n.append(document.createTextNode(String(count)), b);
       row.append(p, bar, n);
+      row.title = pos
+        ? agree + ' of ' + of + ' builds took this as pick ' + pos
+        : 'not taken in the sampled builds';
       col.appendChild(row);
     }
     grid.appendChild(col);
@@ -639,9 +653,7 @@ function renderAbilities(hostSlug){
     const lab2 = el('div','section-label');
     // The label has to change with the source: one named player's choices and
     // the cohort's best sampled player are different claims.
-    lab2.textContent = blk.seq_from === 'cohort'
-      ? 'Strongest sampled build\u2019s order'
-      : 'Top player\u2019s order';
+    lab2.textContent = 'Top player\u2019s order';
     lab2.style.marginBottom = '6px';
     wrap.appendChild(lab2);
     const seq = el('div','seq');
