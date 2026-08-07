@@ -185,6 +185,18 @@ jobs:
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
         run: python3 probe_mmr_shape.py
 
+      # ZERO SQL. Dropping the general-board requirement changed the ceiling
+      # on 39 of 76 hero-regions. The new set is a superset so a ceiling can
+      # only move up — but net wins rewards VOLUME, so this checks whether the
+      # newcomers are top-of-board players the old rule was hiding, or grinders
+      # outside the region's top 1,000 with big game counts.
+      - name: Probe ceiling delta
+        if: always()
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+        run: python3 probe_ceiling_delta.py
+
       # Part A is free (leaderboard + hero-stats); part B costs ~2 SQL.
       # A measures what the candidate pool becomes if the general-board
       # requirement is dropped and identity is confirmed by "has ranked games
