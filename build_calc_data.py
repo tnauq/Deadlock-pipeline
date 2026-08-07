@@ -135,6 +135,16 @@ def load_assets(raw_dir, dump_raw):
 # ---------------------------------------------------------------------------
 
 _NUM = re.compile(r"-?\d+(?:\.\d+)?")
+# Ability descriptions embed whole inline <svg> icons — 931 KB of the bundle
+# was markup. Strip tags and collapse whitespace; the text is all we render.
+_TAG = re.compile(r"<[^>]*>", re.S)
+_WS = re.compile(r"\s+")
+
+
+def clean_text(v):
+    if not isinstance(v, str):
+        return ""
+    return _WS.sub(" ", _TAG.sub(" ", v)).strip()
 
 
 def slug(name):
@@ -285,6 +295,79 @@ def weapon_index(items):
             if it.get("type") == "weapon" and it.get("weapon_info")}
 
 
+def build_abilities(items, keep_classes):
+    """
+    Ability records for the calculator's ability panel.
+
+    Each carries `properties` in the same shape as a shop item — cooldown,
+    duration, radius, damage, each with a label and unit — plus three
+    `upgrades`, one per point tier (1/2/5), listing what that tier changes.
+
+    Spirit scaling IS derivable: `scale_function.stat_scale` is the
+    coefficient and `specific_stat_scale_type` the stat it reads. Siphon Life's
+    DPS carries 0.6 against ETechPower, matching the published figure, so
+
+        final = value + stat_scale * SpiritPower
+
+    Upgrades can raise the coefficient rather than the base: a property_upgrade
+    with `upgrade_type: EAddToScale` adds its bonus to stat_scale (Siphon Life
+    tier 3 takes 0.6 to 0.72). Those are kept separate from flat bonuses below
+    because applying one as the other is silently wrong.
+    """
+    # 389 ability records exist, but only the 152 in signature1-4 are ever
+    # shown — the rest are innates (mantle, jump, zipline) and other heroes'
+    # kits. Filtering cuts the bundle by roughly two thirds.
+    out = {}
+    for it in items:
+        if it.get("type") != "ability" or it.get("id") is None:
+            continue
+        if keep_classes and it.get("class_name") not in keep_classes:
+            continue
+        props = []
+        for key, p in (it.get("properties") or {}).items():
+            if not isinstance(p, dict):
+                continue
+            val = parse_value(p.get("value"))
+            if val is None or val == 0.0:
+                continue
+            sf = p.get("scale_function") or {}
+            props.append({
+                "key": key,
+                "label": p.get("label") or key,
+                "value": val,
+                "unit": parse_unit(p),
+                "scales": sf.get("specific_stat_scale_type") or "",
+                "scale": sf.get("stat_scale") or 0,
+            })
+        ups = []
+        for u in (it.get("upgrades") or []):
+            tier = []
+            for pu in (u.get("property_upgrades") or []):
+                if not pu.get("name"):
+                    continue
+                tier.append({
+                    "name": pu["name"],
+                    "bonus": parse_value(pu.get("bonus")),
+                    "raw": pu.get("bonus"),
+                    # EAddToScale raises the spirit coefficient; anything else
+                    # is a flat change to the property's own value
+                    "to_scale": pu.get("upgrade_type") == "EAddToScale",
+                    "scales": pu.get("scale_stat_filter") or "",
+                })
+            ups.append(tier)
+        out[int(it["id"])] = {
+            "name": it.get("name"),
+            "class_name": it.get("class_name"),
+            "desc": clean_text((it.get("description") or {}).get("desc")
+                               if isinstance(it.get("description"), dict)
+                               else it.get("description")),
+            "icon": icon_ref(it.get("image")),
+            "props": props,
+            "upgrades": ups,
+        }
+    return out
+
+
 def build_heroes(heroes, weapons):
     out = []
     for h in heroes:
@@ -386,10 +469,16 @@ def main():
     if not allow:
         print("[calc] WARNING: no wiki allowlist at %s" % WIKI_LIST, file=sys.stderr)
     items, stats = build_items(items_raw, allow)
+    sig_classes = {c for h in heroes_raw
+                   for c in [(h.get("items") or {}).get("signature%d" % k)
+                             for k in (1, 2, 3, 4)] if c}
+    ability_recs = build_abilities(items_raw, sig_classes)
     weapons = weapon_index(items_raw)
     heroes = build_heroes(heroes_raw, weapons)
 
     os.makedirs(a.out_dir, exist_ok=True)
+    atext = json.dumps(ability_recs, separators=(",", ":"))
+    open(os.path.join(a.out_dir, "abilities.json"), "w").write(atext)
     itext = json.dumps(items, separators=(",", ":"))
     htext = json.dumps(heroes, separators=(",", ":"))
     open(os.path.join(a.out_dir, "items.json"), "w").write(itext)
@@ -430,6 +519,9 @@ def main():
         "n_slot_or_cost_mismatch": stats["mismatch_slot_or_cost"],
         "n_self_penalties": sum(1 for i in items for p in i["props"] if p["penalty"]),
         "n_effect_only": sum(1 for i in items if not i["props"]),
+        "n_abilities": len(ability_recs),
+        "abilities_kb": round(len(atext.encode()) / 1024, 1),
+        "abilities_gz_kb": round(len(gzip.compress(atext.encode())) / 1024, 1),
         "dps_checked": dps_checked,
         "dps_failed": dps_failed,
     }
@@ -448,6 +540,9 @@ def main():
     print("[calc] exclusion overlaps: %s"
           % ", ".join("%s %d" % (k[9:], v) for k, v in sorted(stats.items())
                       if k.startswith("exclcombo_")), file=sys.stderr)
+    print("[calc] abilities %d (%.1f KB / %.1f KB gz)"
+          % (meta["n_abilities"], meta["abilities_kb"], meta["abilities_gz_kb"]),
+          file=sys.stderr)
     print("[calc] DPS oracle: %d weapons checked, %d mismatched"
           % (dps_checked, dps_failed), file=sys.stderr)
 
