@@ -96,6 +96,18 @@ jobs:
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
         run: python3 probe_leaderboard_ranked.py
 
+      # ZERO SQL. The processed board dropped account_id, badge_level,
+      # ranked_rank and ranked_subrank — identity resolution now rests entirely
+      # on possible_account_ids, which put the wrong player in 110 of 371 slots
+      # when used alone. /raw is unread; if it carries the real ids this fixes
+      # that outright.
+      - name: Probe raw leaderboard
+        if: always()
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+        run: python3 probe_leaderboard_raw.py
+
       # ONE /v1/sql call. Answers whether ability upgrade picks can be
       # displayed the way item frequency is: do ability ids repeat within a
       # build (one row per point), what upgrade_id holds, whether game_time_s
