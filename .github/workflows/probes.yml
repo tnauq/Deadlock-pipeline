@@ -163,6 +163,18 @@ jobs:
           python3 deadlock_pipeline.py
           python3 ceiling_rank.py
 
+      # ZERO SQL. /v1/players/mmr is dead (200 + empty list for every account,
+      # including one that cannot exist), but /v1/players/scoreboard returns
+      # real rows with rank, account_id, value and matches. Reads the spec for
+      # its sort_by enum and tests whether it can be filtered to ranked play
+      # and a region — if so it is the ceiling ordering, computed upstream.
+      - name: Probe scoreboard
+        if: always()
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+        run: python3 probe_scoreboard.py
+
       # ZERO SQL. /v1/players/mmr answers 200 with an EMPTY list for real
       # accounts. Separates "wrong parameter form" from "player_score is gone
       # the way of badge" — the two lead opposite ways for the ranked ceiling.
