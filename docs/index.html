@@ -178,6 +178,24 @@ h1{font-size:clamp(24px,7vw,38px);letter-spacing:.04em;margin-top:4px}
   .apts{padding:8px}
 }
 
+.apick{background:none;border:0;padding:0;cursor:pointer;font:inherit;
+  display:flex;flex-direction:column;align-items:center;gap:6px;width:100%;min-width:0}
+.apick .ic{transition:border-color .12s}
+.apick:hover .ic{border-color:var(--dim)}
+.apick[aria-pressed=true] .ic{border-color:var(--cat-s)}
+.apick[aria-pressed=true] .nm{color:var(--text)}
+.apick:focus-visible{outline:2px solid var(--text);outline-offset:3px;border-radius:10px}
+.abd{margin-top:10px;padding:9px 10px;border-radius:9px;background:var(--panel-2);
+  border:1px solid var(--frame)}
+.abd-desc{font-size:12px;color:var(--dim);line-height:1.5;margin-bottom:8px}
+.abd-rows{display:grid;gap:2px}
+.abd-r{display:flex;align-items:baseline;gap:8px;font-size:12.5px}
+.abd-r .n{font-family:var(--mono);font-variant-numeric:tabular-nums;font-weight:800;
+  color:var(--text);min-width:4.6em;text-align:right}
+.abd-r .k{color:var(--dim);flex:1;min-width:0}
+.abd-r.up .n{color:var(--cat-s)}
+.abd-r .sc{font-family:var(--mono);font-size:10.5px;color:var(--cat-s);flex:0 0 auto}
+
 /* ---------- build calculator ---------- */
 .calc{margin-top:26px}
 .calc-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:12px}
@@ -686,8 +704,10 @@ function calcLoad(){
   if (CALC.loading) return CALC.loading;
   const grab = f => fetch('calc/' + f + '?v=' + Date.now())
     .then(r => { if (!r.ok) throw new Error(f + ' ' + r.status); return r.json(); });
-  CALC.loading = Promise.all([grab('items.json'), grab('heroes.json'), grab('property_table.json')])
-    .then(([items, heroes, table]) => {
+  CALC.loading = Promise.all([grab('items.json'), grab('heroes.json'),
+                             grab('property_table.json'), grab('abilities.json')])
+    .then(([items, heroes, table, abilities]) => {
+      CALC.abil = abilities;
       CALC.items = items;
       CALC.byId = Object.fromEntries(items.map(i => [i.id, i]));
       CALC.heroes = Object.fromEntries(heroes.map(h => [h.slug, h]));
@@ -899,7 +919,9 @@ function abilBudget(){
   return {unlocks, points, usedU, usedP};
 }
 
-function drawAbilities(host){
+let abilOpen = null;      // ability id whose detail panel is showing
+
+function drawAbilities(host, out){
   const slots = abilSlots();
   if (!Object.keys(slots).length) return;
   const meta = DATA.ability_meta || {};
@@ -925,9 +947,15 @@ function drawAbilities(host){
     const m = meta[a.id] || {name: 'ability ' + a.id, icon: ['','']};
     const taken = (build.abil || {})[a.id] || 0;
     const col = el('div','apc');
-    col.appendChild(icon(m.icon, m.name));
-    const nm = el('div','nm'); nm.textContent = m.name; nm.title = m.name;
-    col.appendChild(nm);
+    const pick = el('button','apick');
+    pick.type = 'button';
+    pick.setAttribute('aria-pressed', String(abilOpen === a.id));
+    pick.title = 'Show what ' + m.name + ' does with this build';
+    pick.appendChild(icon(m.icon, m.name));
+    const nm = el('div','nm'); nm.textContent = m.name;
+    pick.appendChild(nm);
+    pick.onclick = () => { abilOpen = (abilOpen === a.id) ? null : a.id; drawCalc(host); };
+    col.appendChild(pick);
 
     const pips = el('div','pips');
     for (let step = 1; step <= 4; step++){
@@ -956,6 +984,11 @@ function drawAbilities(host){
     grid.appendChild(col);
   }
   box.appendChild(grid);
+
+  if (abilOpen != null){
+    const rec = (CALC.abil || {})[abilOpen];
+    if (rec) drawAbilityDetail(box, rec, (build.abil || {})[abilOpen] || 0, out);
+  }
   host.appendChild(box);
 }
 
@@ -978,6 +1011,86 @@ function loadAbilityOrder(){
     } else if (b.usedP + PIP_COST[step - 1] > b.points) continue;
     build.abil[aid] = step;
   }
+}
+
+
+/* ---------- ability detail ------------------------------------------------
+   final = (base + flat upgrades) + (stat_scale + scale upgrades) x SpiritPower
+
+   An upgrade tagged `to_scale` raises the COEFFICIENT, not the base — Siphon
+   Life's tier 3 takes 0.6 to 0.72, so at 150 spirit it is worth 18 flat plus
+   another 18 from scaling. 69 upgrades across the pool behave that way and
+   applying one as a flat bonus would be quietly wrong.
+
+   Item effects then apply to the properties they actually govern: cooldown,
+   duration and range/radius all have panel rows the calculator already
+   computes. Damage is left alone — weapon damage percentages do not touch
+   ability damage.
+   ------------------------------------------------------------------------ */
+
+const ABIL_ITEM_FX = {
+  // The Spirit panel shows cooldown NEGATED — a 20% reduction reads as -20%.
+  // So the multiplier is (1 + cd/100), not (1 - cd/100); the latter made
+  // Superior Cooldown raise Siphon Life's cooldown from 22s to 26.4s.
+  AbilityCooldown:      s => 1 + s.cd/100,
+  AbilityCooldownBetweenCharge: s => 1 + s.cd/100,
+  AbilityDuration:      s => 1 + s.dur/100,
+  AbilityCastRange:     s => 1 + s.rng/100,
+  Radius:               s => 1 + s.rng/100,
+  ImpactRadius:         s => 1 + s.rng/100,
+};
+
+function abilityValues(rec, steps, stats){
+  const flat = {}, scale = {};
+  for (let t = 0; t < Math.max(steps - 1, 0); t++)
+    for (const u of (rec.upgrades[t] || [])){
+      if (u.bonus == null) continue;
+      if (u.to_scale) scale[u.name] = (scale[u.name] || 0) + u.bonus;
+      else flat[u.name] = (flat[u.name] || 0) + u.bonus;
+    }
+  return rec.props.map(p => {
+    const base = p.value + (flat[p.key] || 0);
+    const coef = (p.scale || 0) + (scale[p.key] || 0);
+    let v = base + (coef && p.scales === 'ETechPower' ? coef * stats.spirit : 0);
+    const fx = ABIL_ITEM_FX[p.key];
+    if (fx) v *= fx(stats);
+    return {label: p.label, unit: p.unit, value: v, coef,
+            scaled: coef > 0 && p.scales === 'ETechPower',
+            changed: (flat[p.key] || 0) !== 0 || (scale[p.key] || 0) !== 0};
+  });
+}
+
+function drawAbilityDetail(host, rec, steps, out){
+  const g = k => (out.rows.S.find(r => r.label === k) || {}).v || 0;
+  const stats = {
+    spirit: g('Spirit Power'),
+    cd: g('Ability Cooldown'), dur: g('Ability Duration'), rng: g('Ability Range'),
+  };
+  const box = el('div','abd');
+  if (rec.desc){
+    const d = el('div','abd-desc'); d.textContent = rec.desc;
+    box.appendChild(d);
+  }
+  const list = el('div','abd-rows');
+  for (const v of abilityValues(rec, steps, stats)){
+    if (!v.value && !v.scaled) continue;
+    const row = el('div','abd-r');
+    if (v.changed) row.classList.add('up');
+    const n = el('span','n');
+    n.textContent = (Math.abs(v.value) >= 100 ? v.value.toFixed(0) : v.value.toFixed(1)) +
+                    (v.unit || '');
+    const k = el('span','k'); k.textContent = v.label;
+    row.append(n, k);
+    if (v.scaled){
+      const sc = el('span','sc');
+      sc.textContent = '\u2726' + v.coef.toFixed(2);
+      sc.title = v.coef.toFixed(2) + ' x Spirit Power (' + stats.spirit.toFixed(0) + ')';
+      row.appendChild(sc);
+    }
+    list.appendChild(row);
+  }
+  box.appendChild(list);
+  host.appendChild(box);
 }
 
 /* ---------- render ------------------------------------------------------- */
@@ -1087,7 +1200,7 @@ function drawCalc(wrap){
   bar.append(seed, clr, note);
   wrap.appendChild(bar);
 
-  drawAbilities(wrap);
+  drawAbilities(wrap, out);
 
   // effects — one box per equipped item that has a conditional property
   const condItems = equipped().filter(hasToggle);
