@@ -1,331 +1,211 @@
 #!/usr/bin/env python3
 """
-probe_mmr_pool.py — can a daily ranked ceiling be built, and can lobby-mates
-                    fix thin build pools?
+probe_mmr_shape.py — /v1/players/mmr answers 200 with an EMPTY list. Why?
 
-Two questions, one run.
+Established 2026-08-07: the endpoint is alive, `account_ids` is the correct
+parameter (omitting it gives 400 "missing field account_ids"), and
+/v1/players/mmr-history is now 404. But a request for 12 real ceiling-player
+accounts returned zero rows and no error.
 
-A. BATCH SIZE. /v1/players/mmr returns player_score, which is ranked-aware and
-   opponent-derived — a truer ceiling than win rate, which cannot see who you
-   beat. It is 5 req/min unkeyed (25 keyed) with a 50/min GLOBAL ceiling shared
-   with every other API user. Whether a daily rating pass is viable depends
-   entirely on how many ids fit in one call, which nobody here has measured.
+Two explanations need separating, because they lead opposite ways:
 
-B. LOBBY EXPANSION. Valve's boards gate eligibility, and thin boards (Grey
-   Talon 13 entries) cannot fill a 20-build sample. A ceiling player's ranked
-   lobby holds 11 other players matched against them, who are plausibly of
-   similar standing. If that holds, rosters are a source of extra candidates
-   that needs no leaderboard at all. If it does not, the idea dies here rather
-   than quietly widening the cohort.
+  1. The parameter FORM is wrong — comma-separated rather than repeated.
+     Fixable, and the ranked ceiling plan proceeds.
+  2. player_score has gone the way of badge — the endpoint still answers but
+     has nothing to say. Then the plan needs a different rating source, and
+     shrunk ranked win rate from hero-stats is the fallback.
 
-   This is a CLAIM TO TEST, not an assumption: the probe scores the lobby-mates
-   and reports how their ratings sit against the seed's, and how many clear the
-   top-N threshold.
+Tests, cheapest first:
+  T1  Comma-separated vs repeated parameters, same account.
+  T2  Accounts drawn from hero-stats rather than the leaderboard, i.e. ids
+      known to have ranked games, in case ceiling ids are resolution artefacts.
+  T3  A deliberately invalid id, to see what "no data" looks like versus
+      "unknown account" — if both return [], the endpoint cannot distinguish
+      them and an empty result proves nothing about the account.
+  T4  Every response header and body recorded verbatim, since the last run
+      could only say "0 rows".
 
-Cost: ~2 SQL calls (rosters) plus MMR calls, which are a separate bucket.
-Budget the SQL against the 20/hour cap before running alongside the pipeline.
+Cost: ZERO SQL. MMR is 5 req/min unkeyed with a 50/min GLOBAL ceiling shared
+across all API users, so this paces itself at 13s between calls.
 
-    python3 probe_mmr_pool.py
+    python3 probe_mmr_shape.py
 
-Writes probe_out/mmr_pool.json. Stdlib only.
+Writes probe_out/mmr_shape.json. Stdlib only.
 """
 
 import csv
 import json
 import os
-import statistics
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import Counter
 
 BASE = "https://api.deadlock-api.com"
 API_KEY = os.environ.get("DEADLOCK_API_KEY")
 OUT = "probe_out"
+PACE_S = int(os.environ.get("MMR_PACE_S") or 13)
 REGION = os.environ.get("PROBE_REGION") or "NAmerica"
-SEEDS = int(os.environ.get("PROBE_SEEDS") or 12)      # ceiling players to expand from
-LOOKBACK_DAYS = int(os.environ.get("PROBE_LOOKBACK_DAYS") or 7)
-BATCH_STEPS = [1, 10, 20, 50, 100, 200, 500]
 
 
-def get(path, params=None, pairs=None):
-    url = BASE + path
-    qs = []
-    if params:
-        qs.append(urllib.parse.urlencode(params))
-    if pairs:
-        qs.append("&".join("%s=%s" % (k, v) for k, v in pairs))
-    if qs:
-        url += "?" + "&".join(qs)
+def fetch_json(path, query=""):
+    """Plain full-body fetch, for when the DATA is wanted rather than a record
+    of the response."""
+    url = BASE + path + ("?" + query if query else "")
     req = urllib.request.Request(url, headers={"User-Agent": "deadlock-probe/1.0"})
     if API_KEY:
         req.add_header("X-API-Key", API_KEY)
-    with urllib.request.urlopen(req, timeout=120) as r:
-        return json.loads(r.read().decode("utf-8")), len(url)
-
-
-def try_get(path, params=None, pairs=None):
     try:
-        payload, n = get(path, params, pairs)
-        return payload, n, None
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "replace")[:160].replace("\n", " ")
-        return None, 0, "HTTP %d %s" % (e.code, body)
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return json.loads(r.read().decode("utf-8"))
     except Exception as e:
-        return None, 0, str(e)
+        print("  [fetch] %s -> %s" % (path, e), file=sys.stderr)
+        return None
+    finally:
+        time.sleep(PACE_S)
 
 
-def sql(q, label="", tries=4):
+def call(path, query):
+    """Returns a dict describing exactly what came back."""
+    url = BASE + path + ("?" + query if query else "")
+    req = urllib.request.Request(url, headers={"User-Agent": "deadlock-probe/1.0"})
+    if API_KEY:
+        req.add_header("X-API-Key", API_KEY)
+    rec = {"url": url[:200]}
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            body = r.read()
+            rec["status"] = r.status
+            rec["content_type"] = r.headers.get("Content-Type", "")
+            rec["bytes"] = len(body)
+            rec["body"] = body[:600].decode("utf-8", "replace")
+            try:
+                data = json.loads(body)
+                rec["json_type"] = type(data).__name__
+                rec["n"] = len(data) if isinstance(data, (list, dict)) else None
+                if isinstance(data, list) and data:
+                    rec["first"] = data[0]
+                elif isinstance(data, dict):
+                    rec["keys"] = sorted(data)[:20]
+            except Exception as e:
+                rec["json_error"] = str(e)
+    except urllib.error.HTTPError as e:
+        rec["status"] = e.code
+        rec["body"] = e.read()[:600].decode("utf-8", "replace")
+    except Exception as e:
+        rec["error"] = str(e)
+    time.sleep(PACE_S)
+    return rec
+
+
+def ceiling_ids(n=3):
     """
-    Retries a 429 honouring next_request_in. The pipeline step runs immediately
-    before this probe and leaves the 2/min IP bucket empty, so the first call
-    here reliably 429s — exponential backoff from 1s is far too short, the body
-    says exactly how long to wait.
+    Prefer output/ceiling.csv — those ids are dual-confirmed across the hero
+    and general boards. It only exists when the pipeline step has run, which
+    free_only skips, so fall back to the leaderboard endpoint directly. That
+    keeps this probe genuinely SQL-free and runnable in any hour.
     """
-    url = BASE + "/v1/sql?format=json&query=" + urllib.parse.quote(q)
-    print("  [sql] %s (%d char url)" % (label, len(url)), file=sys.stderr)
-    for attempt in range(tries):
-        try:
-            with urllib.request.urlopen(
-                    urllib.request.Request(url, headers={"User-Agent": "probe/1.0"}),
-                    timeout=180) as r:
-                rows = json.loads(r.read().decode("utf-8"))
-            break
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", "replace")
-            if e.code == 429 and attempt < tries - 1:
-                wait = 35
-                try:
-                    wait = int(json.loads(body)["error"]["quota"].get("period", 60))
-                    wait = int(json.loads(body)["error"].get("next_request_in", wait)) + 2
-                except Exception:
-                    pass
-                print("  [sql] 429, waiting %ds" % wait, file=sys.stderr)
-                time.sleep(wait)
-                continue
-            raise SystemExit("SQL failed (%s): %s" % (e.code, body[:400]))
-    else:
-        raise SystemExit("SQL still rate limited after %d tries" % tries)
-    if isinstance(rows, dict):
-        rows = rows.get("data", rows.get("rows", []))
-    print("  [sql] %d rows" % len(rows), file=sys.stderr)
-    return rows
-
-
-# The first attempt returned 200 with ZERO rows for a single id, which means
-# the parameter name or the response shape is wrong — not that the batch was
-# too large. Try the plausible spellings and report what each gives back
-# rather than parsing blind and calling it truncation.
-MMR_PATHS = [
-    ("/v1/players/mmr", "account_ids"),
-    ("/v1/players/mmr", "account_id"),
-    ("/v1/players/mmr-history", "account_ids"),
-]
-_mmr_shape = {"path": None, "param": None, "sample": None, "attempts": []}
-
-
-def _rows_from(payload):
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
-        for k in ("data", "players", "results", "mmr"):
-            if isinstance(payload.get(k), list):
-                return payload[k]
-        # a bare object keyed by account id is also plausible
-        if payload and all(str(k).isdigit() for k in payload):
-            return [{"account_id": k, **(v if isinstance(v, dict) else {"value": v})}
-                    for k, v in payload.items()]
-    return []
-
-
-def _score_of(r):
-    for k in ("player_score", "score", "rank", "mmr"):
-        if isinstance(r.get(k), (int, float)):
-            return r[k]
-    return None
-
-
-def discover_mmr_shape(one_id):
-    """Find the working path+param once, and keep a sample response."""
-    for path, param in MMR_PATHS:
-        payload, url_len, err = try_get(path, pairs=[(param, str(one_id))])
-        rows = _rows_from(payload)
-        # record the outcome IN THE REPORT, not just stderr — the first run of
-        # this probe failed on every path and the artifact could not say why
-        _mmr_shape["attempts"].append({
-            "path": path, "param": param, "rows": len(rows), "error": err,
-            "payload_head": json.dumps(payload)[:300] if payload is not None else None,
-        })
-        print("   probe %-26s %-12s -> %s rows %s"
-              % (path, param, len(rows), err or ""), file=sys.stderr)
-        if rows:
-            _mmr_shape.update({"path": path, "param": param, "sample": rows[0]})
-            return True
-        if payload is not None and not rows:
-            _mmr_shape["sample"] = payload if not isinstance(payload, list) else None
-        time.sleep(13)
-    return False
-
-
-def mmr_for(ids):
-    """One batched call. Returns {account_id: player_score}."""
-    if not _mmr_shape["path"]:
-        return {}, 0, "mmr shape unknown"
-    pairs = [(_mmr_shape["param"], str(i)) for i in ids]
-    payload, url_len, err = try_get(_mmr_shape["path"], pairs=pairs)
-    out = {}
-    for r in _rows_from(payload):
-        if isinstance(r, dict) and r.get("account_id") is not None:
-            out[int(r["account_id"])] = _score_of(r)
-    return out, url_len, err
-
-
-def seed_ids():
-    """Ceiling accounts from output/ceiling.csv, this region only."""
     path = os.path.join("output", "ceiling.csv")
-    if not os.path.exists(path):
+    out = []
+    if os.path.exists(path):
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            for r in csv.DictReader(f):
+                a = (r.get("account_id") or "").strip()
+                if a.isdigit():
+                    out.append(int(a))
+    if out:
+        return sorted(set(out))[:n]
+
+    print("  [ids] no ceiling.csv — taking top ids from the leaderboard",
+          file=sys.stderr)
+    # NOT via call(): it truncates the body to 600 chars for the report, and
+    # the general board is 566 KB — parsing the truncated string yielded
+    # nothing and the probe exited with "could not source any account ids".
+    rows = fetch_json("/v1/leaderboard/%s" % urllib.parse.quote(REGION)) or []
+    if isinstance(rows, dict):
+        rows = rows.get("entries") or rows.get("data") or []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        # possible_account_ids is best-match-first: 92% resolve from slot 0
+        for a in (r.get("possible_account_ids") or [])[:1]:
+            out.append(int(a))
+        if len(out) >= n:
+            break
+    return out[:n]
+
+
+def hero_stats_ids(seed_ids, n=3):
+    """Ids that hero-stats confirms have RANKED games — a stronger guarantee
+    than leaderboard membership, which is only a name resolution."""
+    if not seed_ids:
         return []
-    ids = []
-    with open(path, newline="", encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            if r.get("region") != REGION:
-                continue
-            a = (r.get("account_id") or "").strip()
-            if a.isdigit():
-                ids.append(int(a))
-    return sorted(set(ids))
-
-
-Q_ROSTER = """
-SELECT match_id, account_id, hero_id
-FROM match_player
-WHERE match_id IN (
-    SELECT match_id FROM match_player
-    WHERE account_id IN ({seeds})
-      AND match_mode = 'Ranked' AND game_mode = 'Normal'
-      AND start_time >= now() - INTERVAL {days} DAY
-)
-"""
+    q = "&".join("account_ids=%d" % i for i in seed_ids)
+    rec = call("/v1/players/hero-stats", q + "&match_mode=ranked")
+    # full body again — hero-stats returns one row per (account, hero) and
+    # easily exceeds the 600-char record kept for the report
+    rows = fetch_json("/v1/players/hero-stats", q + "&match_mode=ranked") or []
+    good = []
+    for r in rows if isinstance(rows, list) else []:
+        if isinstance(r, dict) and (r.get("matches") or r.get("matches_played")):
+            a = r.get("account_id")
+            if a is not None and int(a) not in good:
+                good.append(int(a))
+    return good[:n], rec
 
 
 def main():
     os.makedirs(OUT, exist_ok=True)
-    report = {"region": REGION}
+    report = {}
 
-    seeds = seed_ids()
+    seeds = ceiling_ids(3)
+    report["ceiling_ids"] = seeds
     if not seeds:
-        raise SystemExit("no ceiling.csv for %s — run the pipeline first" % REGION)
-    seeds = seeds[:SEEDS]
-    report["seeds"] = len(seeds)
-    print("[1/3] %d seed accounts" % len(seeds), file=sys.stderr)
+        raise SystemExit("could not source any account ids")
+    a = seeds[0]
 
-    # ---- A. how many ids fit in one /v1/players/mmr call? ---------------
-    print("[2/3] mmr batch size", file=sys.stderr)
-    if not discover_mmr_shape(seeds[0]):
-        print("   NO working mmr path/param found — recording the response and "
-              "skipping part A", file=sys.stderr)
-    report["mmr_shape"] = _mmr_shape
-    # pad the seed list by repeating it, so a large batch can be attempted
-    pool = (seeds * 200)[:max(BATCH_STEPS)]
-    batch = {}
-    best = 0
-    for n in (BATCH_STEPS if _mmr_shape["path"] else []):
-        ids = pool[:n]
-        got, url_len, err = mmr_for(ids)
-        distinct = len(set(ids))
-        batch[str(n)] = {"requested": n, "distinct_requested": distinct,
-                         "returned": len(got), "url_chars": url_len, "error": err}
-        print("   %4d ids -> %3d rows, url %d %s"
-              % (n, len(got), url_len, err or ""), file=sys.stderr)
-        if err:
-            break
-        if len(got) >= distinct:
-            best = n
-        else:
-            batch[str(n)]["truncated"] = True
-            break
-        time.sleep(13)          # 5 req/min unkeyed; stay well inside it
-    report["batch"] = batch
-    report["largest_clean_batch"] = best
+    print("[T1] parameter form", file=sys.stderr)
+    report["T1_repeated_one"] = call("/v1/players/mmr", "account_ids=%d" % a)
+    report["T1_repeated_many"] = call(
+        "/v1/players/mmr", "&".join("account_ids=%d" % i for i in seeds))
+    report["T1_comma"] = call(
+        "/v1/players/mmr", "account_ids=" + ",".join(str(i) for i in seeds))
 
-    # ---- B. are lobby-mates comparable to the seed? ---------------------
-    print("[3/3] lobby expansion", file=sys.stderr)
-    time.sleep(35)          # let the 2/min IP bucket refill after the pipeline
-    rows = sql(Q_ROSTER.format(seeds=",".join(str(s) for s in seeds),
-                               days=LOOKBACK_DAYS), "rosters")
-    mates = Counter()
-    per_match = {}
-    for r in rows:
-        aid, mid = int(r["account_id"]), int(r["match_id"])
-        per_match.setdefault(mid, set()).add(aid)
-        if aid not in seeds:
-            mates[aid] += 1
-    report["matches_seen"] = len(per_match)
-    report["distinct_lobby_mates"] = len(mates)
-    report["mates_seen_more_than_once"] = sum(1 for v in mates.values() if v > 1)
+    print("[T2] ids known to have ranked games", file=sys.stderr)
+    good, hs = report.get("_", None), None
+    good, hs = hero_stats_ids(seeds, 3)
+    report["T2_hero_stats_probe"] = {"ids_found": good,
+                                     "status": hs.get("status"),
+                                     "n": hs.get("n"),
+                                     "first": hs.get("first")}
+    if good:
+        report["T2_mmr_for_those"] = call(
+            "/v1/players/mmr", "&".join("account_ids=%d" % i for i in good))
 
-    # score the seeds and a sample of mates with the same endpoint
-    sample = [a for a, _ in mates.most_common(min(len(mates), max(best, 20) * 2))]
-    seed_scores, _, e1 = mmr_for(seeds)
-    time.sleep(13)
-    mate_scores = {}
-    step = max(best, 20)
-    for i in range(0, min(len(sample), step * 3), step):
-        got, _, err = mmr_for(sample[i:i + step])
-        mate_scores.update(got)
-        if err:
-            break
-        time.sleep(13)
+    print("[T3] control: an id that cannot exist", file=sys.stderr)
+    report["T3_bogus"] = call("/v1/players/mmr", "account_ids=1")
 
-    sv = [v for v in seed_scores.values() if isinstance(v, (int, float))]
-    mv = [v for v in mate_scores.values() if isinstance(v, (int, float))]
-    report["seed_scores"] = {"n": len(sv),
-                             "min": min(sv) if sv else None,
-                             "median": statistics.median(sv) if sv else None,
-                             "max": max(sv) if sv else None}
-    report["mate_scores"] = {"n": len(mv),
-                             "min": min(mv) if mv else None,
-                             "median": statistics.median(mv) if mv else None,
-                             "max": max(mv) if mv else None}
-    if sv and mv:
-        floor = min(sv)
-        report["mates_at_or_above_seed_floor"] = sum(1 for v in mv if v >= floor)
-        report["mates_within_2_of_seed_median"] = sum(
-            1 for v in mv if abs(v - statistics.median(sv)) <= 2.0)
-    report["mate_score_missing"] = len(sample) - len(mate_scores)
+    print("[T4] neighbouring endpoints", file=sys.stderr)
+    report["T4_mmr_history"] = call("/v1/players/%d/mmr-history" % a, "")
+    report["T4_scoreboard"] = call("/v1/players/scoreboard", "sort_by=winrate&limit=3")
 
-    json.dump(report, open(os.path.join(OUT, "mmr_pool.json"), "w"), indent=1)
+    json.dump(report, open(os.path.join(OUT, "mmr_shape.json"), "w"),
+              indent=1, default=str)
 
-    print("\n=== A  /v1/players/mmr batching ===")
-    print("  working shape: path=%s param=%s" % (_mmr_shape["path"], _mmr_shape["param"]))
-    print("  sample row: %s" % json.dumps(_mmr_shape["sample"])[:300])
-    for k, v in batch.items():
-        print("  %4s ids -> %3d rows  url %5d  %s%s"
-              % (k, v["returned"], v["url_chars"],
-                 "TRUNCATED " if v.get("truncated") else "", v["error"] or ""))
-    print("  largest clean batch: %d" % best)
-    if best:
-        calls = -(-3197 // best)
-        print("  -> 3,197 board ids would take %d calls, ~%.0f min at 5/min unkeyed"
-              % (calls, calls / 5.0))
-
-    print("\n=== B  lobby expansion ===")
-    print("  %d seeds -> %d matches -> %d distinct lobby-mates (%d seen more than once)"
-          % (len(seeds), report["matches_seen"], report["distinct_lobby_mates"],
-             report["mates_seen_more_than_once"]))
-    print("  seed player_score : %s" % report["seed_scores"])
-    print("  mate player_score : %s" % report["mate_scores"])
-    if sv and mv:
-        print("  mates at or above the LOWEST seed score: %d of %d"
-              % (report["mates_at_or_above_seed_floor"], len(mv)))
-        print("  mates within 2.0 of the seed median:     %d of %d"
-              % (report["mates_within_2_of_seed_median"], len(mv)))
-    print("  mates with no score returned: %d" % report["mate_score_missing"])
-    print("\n  -> tight clustering supports using lobby-mates as extra candidates;")
-    print("     a wide spread means the lobby is NOT a comparable population.")
-    print("\nwrote %s/mmr_pool.json" % OUT)
+    print("\n=== results ===")
+    for k, v in report.items():
+        if not isinstance(v, dict) or "status" not in v:
+            continue
+        print("  %-22s status %-4s %-9s n=%-5s %s"
+              % (k, v.get("status"), v.get("json_type") or "",
+                 v.get("n"), (v.get("body") or "")[:70].replace("\n", " ")))
+    print("\n  ceiling ids probed: %s" % seeds)
+    print("  ids hero-stats confirms have ranked games: %s"
+          % report["T2_hero_stats_probe"]["ids_found"])
+    print("\n  If T3 (a bogus id) also returns an empty list, an empty result")
+    print("  says nothing about the account and player_score is simply absent.")
+    print("\nwrote %s/mmr_shape.json" % OUT)
 
 
 if __name__ == "__main__":
