@@ -623,17 +623,23 @@ function imbueDefault(itemId){
   return rec && rec.top ? rec.top : null;
 }
 
+// Must run BEFORE the slot tiles are drawn: the tile shows an amber "!" for an
+// unassigned imbue item, and assigning defaults inside drawImbue() left every
+// tile flagged even though a target had just been chosen.
+function applyImbueDefaults(){
+  build.imbue = build.imbue || {};
+  for (const it of equipped()){
+    if (!it.imbue || build.imbue[it.id] !== undefined) continue;
+    const d = imbueDefault(it.id);
+    if (d) build.imbue[it.id] = d;
+  }
+}
+
 function drawImbue(host){
   const items = equipped().filter(i => i.imbue);
   if (!items.length) return;
   const slots = abilSlots();
   const meta = DATA.ability_meta || {};
-  build.imbue = build.imbue || {};
-  for (const it of items)
-    if (build.imbue[it.id] === undefined){
-      const d = imbueDefault(it.id);
-      if (d) build.imbue[it.id] = d;
-    }
   const box = el('div','fx');
   const h4 = el('h4'); h4.textContent = 'Imbue';
   box.appendChild(h4);
@@ -984,17 +990,23 @@ function imbueDefault(itemId){
   return rec && rec.top ? rec.top : null;
 }
 
+// Must run BEFORE the slot tiles are drawn: the tile shows an amber "!" for an
+// unassigned imbue item, and assigning defaults inside drawImbue() left every
+// tile flagged even though a target had just been chosen.
+function applyImbueDefaults(){
+  build.imbue = build.imbue || {};
+  for (const it of equipped()){
+    if (!it.imbue || build.imbue[it.id] !== undefined) continue;
+    const d = imbueDefault(it.id);
+    if (d) build.imbue[it.id] = d;
+  }
+}
+
 function drawImbue(host){
   const items = equipped().filter(i => i.imbue);
   if (!items.length) return;
   const slots = abilSlots();
   const meta = DATA.ability_meta || {};
-  build.imbue = build.imbue || {};
-  for (const it of items)
-    if (build.imbue[it.id] === undefined){
-      const d = imbueDefault(it.id);
-      if (d) build.imbue[it.id] = d;
-    }
   const box = el('div','fx');
   const h4 = el('h4'); h4.textContent = 'Imbue';
   box.appendChild(h4);
@@ -1308,6 +1320,7 @@ function mountCalc(parent, slug){
 }
 
 function drawCalc(wrap){
+  applyImbueDefaults();
   const out = resolve();
   wrap.replaceChildren();
 
