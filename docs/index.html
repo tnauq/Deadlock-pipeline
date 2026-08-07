@@ -141,38 +141,14 @@ h1{font-size:clamp(24px,7vw,38px);letter-spacing:.04em;margin-top:4px}
 .more:hover{color:var(--text);border-color:var(--dim)}
 .empty{color:var(--dim);font-size:12px;padding:6px 2px}
 
-/* ---------- ability points ---------- */
-.abil{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
-.ab{min-width:0;border:1px solid var(--frame);border-radius:10px;
-  background:var(--panel);overflow:hidden}
-.ab-h{display:flex;flex-direction:column;align-items:center;gap:5px;padding:8px 4px 6px}
-.ab-h .ic{width:44px;height:44px;border-radius:9px;border:1px solid var(--frame)}
-.ab-h .nm{font-size:10.5px;line-height:1.2;color:var(--dim);text-align:center;
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
-.ab-r{display:flex;align-items:center;gap:6px;padding:5px 8px;
-  border-top:1px solid var(--frame);font-size:11.5px}
-.ab-r .p{flex:0 0 auto;min-width:15px;height:15px;display:grid;place-items:center;
-  border-radius:4px;background:var(--panel-2);color:var(--dim);
-  font:800 9.5px/1 var(--mono)}
-.ab-r.unlock .p{background:var(--frame);color:var(--text)}
-.ab-r .bar{flex:1;height:4px;border-radius:2px;background:var(--panel-2);overflow:hidden}
-.ab-r .bar i{display:block;height:100%;background:var(--a);opacity:.55}
-.ab-r .n{flex:0 0 auto;font-family:var(--mono);font-variant-numeric:tabular-nums;
-  font-weight:800;color:var(--text);font-size:11.5px}
-.ab-r .n em{font-style:normal;color:var(--text)}
-.ab-r .n b{color:var(--dim);font-weight:600;font-size:10.5px}
-.ab-r.none .n{color:var(--dim)}
-.seq{display:flex;flex-wrap:wrap;gap:4px;margin-top:10px}
-.seq .s{display:flex;align-items:center;gap:4px;padding:3px 7px 3px 4px;border-radius:99px;
-  background:var(--panel);border:1px solid var(--frame);font-size:11px;color:var(--dim)}
-.seq .s .ic{width:18px;height:18px;border-radius:5px}
-.seq .s em{font-style:normal;font-family:var(--mono);font-weight:800;color:var(--text)}
-@media (max-width:520px){
-  .ab-h .ic{width:36px;height:36px}
-  .ab-h .nm{font-size:9.5px}
-  .ab-r{padding:4px 5px;gap:4px}
-  .ab-r .bar{display:none}
-}
+/* ---------- ability order ---------- */
+.seq{display:flex;flex-wrap:wrap;gap:5px;margin-top:12px}
+.seq .s{display:flex;align-items:center;gap:5px;padding:3px 8px 3px 5px;
+  border-radius:99px;background:var(--panel);border:1px solid var(--frame)}
+.seq .s .ic{width:22px;height:22px;border-radius:6px;flex:0 0 auto}
+.seq .s em{font-style:normal;font-family:var(--mono);font-size:10px;
+  font-weight:800;color:var(--dim);min-width:1.1em;text-align:right}
+.seq .s .c{font-family:var(--mono);font-size:11px;font-weight:800;color:var(--text)}
 
 /* ---------- build calculator ---------- */
 .calc{margin-top:26px}
@@ -588,86 +564,71 @@ if (window.__DATA__) {
    number for that reason.
    ------------------------------------------------------------------------ */
 
-function ordinal(n){
-  const s = ['th','st','nd','rd'], v = n % 100;
-  return n + (s[(v - 20) % 10] || s[v] || s[0]);
-}
+/* ---------- ability order ------------------------------------------------
+   One sequence at a time behind a 1/2 toggle, matching the region switch:
+     1  the ceiling player's build
+     2  the most representative cohort build
+
+   The 4x4 modal-position grid this replaced was unreadable — "15th, 3/20" put
+   a confident ordinal on three agreeing builds, and four columns of that asked
+   the reader to reconstruct an order that was never actually shown. A single
+   real sequence says the same thing directly.
+   ------------------------------------------------------------------------ */
+
+let abilOrder = 0;                       // which of the two is showing
 
 function renderAbilities(hostSlug){
   const blk = (R().abilities || {})[hostSlug];
-  if (!blk || !blk.slots || !Object.keys(blk.slots).length) return null;
+  const orders = blk && blk.orders;
+  if (!orders || !orders.length) return null;
   const meta = DATA.ability_meta || {};
-  const of = blk.of_builds || 0;
+  const which = Math.min(abilOrder, orders.length - 1);
+  const seq = orders[which];
 
   const wrap = el('div');
+  const head = el('div','calc-head');
   const lab = el('div','section-label');
-  lab.textContent = 'Ability points · of ' + of + ' builds';
-  wrap.appendChild(lab);
+  lab.style.margin = '0';
+  lab.textContent = which === 0 && blk.seq_from === 'ceiling'
+    ? 'Ability order \u00b7 top player'
+    : 'Ability order \u00b7 most common build';
+  head.appendChild(lab);
 
-  const grid = el('div','abil');
-  for (const slot of ['1','2','3','4']){
-    const a = blk.slots[slot];
-    if (!a) continue;
-    const m = meta[a.id] || {name: 'ability ' + a.id, icon: ['','']};
-    const col = el('div','ab');
-    const head = el('div','ab-h');
-    head.appendChild(icon(m.icon, m.name));
-    const nm = el('div','nm'); nm.textContent = m.name; nm.title = m.name;
-    head.appendChild(nm);
-    col.appendChild(head);
-
-    for (const tier of ['0','1','2','3']){
-      const step = a.steps[tier] || [];
-      const pos = step[0] || 0;        // modal position in the pick order
-      const agree = step[1] || 0;      // builds that put it exactly there
-      const cost = step[3] != null ? step[3] : [0,1,2,5][+tier];
-      const row = el('div','ab-r');
-      if (tier === '0') row.classList.add('unlock');
-      if (!pos) row.classList.add('none');
-      const p = el('span','p');
-      p.textContent = tier === '0' ? '\u25c6' : cost;
-      p.title = tier === '0' ? 'Unlock' : cost + ' ability point' + (cost > 1 ? 's' : '');
-      // The headline is WHERE in the sequence this step usually lands; the
-      // dim figure is how many builds agree on that position.
-      const n = el('span','n');
-      const ord = el('em');
-      ord.textContent = pos ? ordinal(pos) : '\u2014';
-      const b = el('b'); b.textContent = pos ? ' ' + agree + '/' + of : '';
-      n.append(ord, b);
-      const bar = el('span','bar');
-      const fill = el('i');
-      fill.style.width = of ? Math.round(100 * agree / of) + '%' : '0';
-      bar.appendChild(fill);
-      row.append(p, bar, n);
-      row.title = pos
-        ? agree + ' of ' + of + ' builds took this as pick ' + pos
-        : 'not taken in the sampled builds';
-      col.appendChild(row);
-    }
-    grid.appendChild(col);
-  }
-  wrap.appendChild(grid);
-
-  // the ceiling player's own order, if it was sampled
-  if (blk.ceiling && blk.ceiling.length){
-    const lab2 = el('div','section-label');
-    // The label has to change with the source: one named player's choices and
-    // the cohort's best sampled player are different claims.
-    lab2.textContent = 'Top player\u2019s order';
-    lab2.style.marginBottom = '6px';
-    wrap.appendChild(lab2);
-    const seq = el('div','seq');
-    blk.ceiling.forEach(([aid, tier], k) => {
-      const m = meta[aid] || {name: 'ability ' + aid, icon: ['','']};
-      const chip = el('span','s');
-      chip.title = m.name + (tier ? '  upgrade ' + tier : '  unlock');
-      const num = el('em'); num.textContent = k + 1;
-      chip.append(num, icon(m.icon, m.name),
-                  document.createTextNode(tier ? '+' + [0,1,2,5][tier] : '\u25c6'));
-      seq.appendChild(chip);
+  if (orders.length > 1){
+    const grp = el('div','regions');
+    grp.style.margin = '0';
+    grp.setAttribute('role','group');
+    grp.setAttribute('aria-label','Which build');
+    orders.forEach((_, k) => {
+      const b = el('button');
+      b.type = 'button';
+      b.textContent = k + 1;
+      b.style.minWidth = '38px';
+      b.title = k === 0
+        ? (blk.seq_from === 'ceiling' ? 'The top player\u2019s build'
+                                      : 'The most common build')
+        : 'The next most common build';
+      b.setAttribute('aria-pressed', String(k === which));
+      b.onclick = () => { abilOrder = k; renderDetail(); };
+      grp.appendChild(b);
     });
-    wrap.appendChild(seq);
+    head.appendChild(grp);
   }
+  wrap.appendChild(head);
+
+  const strip = el('div','seq');
+  seq.forEach(([aid, tier], k) => {
+    const m = meta[aid] || {name: 'ability ' + aid, icon: ['','']};
+    const chip = el('span','s');
+    chip.title = m.name + (tier ? '  \u00b7  ' + [0,1,2,5][tier] + ' point upgrade'
+                                : '  \u00b7  unlock');
+    const num = el('em'); num.textContent = k + 1;
+    const cost = el('span','c');
+    cost.textContent = tier ? [0,1,2,5][tier] : '\u25c6';
+    chip.append(num, icon(m.icon, m.name), cost);
+    strip.appendChild(chip);
+  });
+  wrap.appendChild(strip);
   return wrap;
 }
 
