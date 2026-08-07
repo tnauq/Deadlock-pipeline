@@ -179,26 +179,50 @@ def main():
     # hero board and the general board. Join it to the sampled builds to
     # publish that one player's sequence. The ACCOUNT ID IS NOT PUBLISHED, only
     # the ordered picks, consistent with withholding ladder position and name.
-    by_acct = {(r["region"], slug(r["hero"]), (r.get("account_id") or "").strip()): r
-               for r in order_rows}
-    ceiling_seq = {}
-    for r in ceil_rows:
-        acct = (r.get("account_id") or "").strip()
-        if not acct:
-            continue
-        row = by_acct.get((r["region"], slug(r["hero"]), acct))
-        if not row or not row.get("sequence"):
-            continue
+    def parse_seq(row):
         seq = []
-        for tok in row["sequence"].split():
+        for tok in (row.get("sequence") or "").split():
             a, _, t = tok.partition(":")
             if t.isdigit():
                 seq.append([a, int(t)])
+        return seq
+
+    by_acct = {(r["region"], slug(r["hero"]), (r.get("account_id") or "").strip()): r
+               for r in order_rows}
+    ceiling_seq, seq_source = {}, {}
+    for r in ceil_rows:
+        key = (r["region"], slug(r["hero"]))
+        acct = (r.get("account_id") or "").strip()
+        row = by_acct.get((r["region"], slug(r["hero"]), acct)) if acct else None
+        seq = parse_seq(row) if row else []
         if seq:
-            ceiling_seq[(r["region"], slug(r["hero"]))] = seq
+            ceiling_seq[key] = seq
+            seq_source[key] = "ceiling"
+            continue
+        # FALLBACK. The ceiling player tops the general board, but the sampled
+        # pool is chosen by shrunk ranked win rate on the hero and capped at
+        # PER_REGION, so their own match is only among the 20 about half the
+        # time. When it is not, show the strongest player in the cohort that
+        # WAS sampled — same volume-aware rating the pool was selected on.
+        best = None
+        for o in order_rows:
+            if o["region"] != r["region"] or slug(o["hero"]) != slug(r["hero"]):
+                continue
+            try:
+                rating = float(o.get("ranked_rating") or 0)
+            except ValueError:
+                rating = 0.0
+            if best is None or rating > best[0]:
+                best = (rating, o)
+        if best and parse_seq(best[1]):
+            ceiling_seq[key] = parse_seq(best[1])
+            seq_source[key] = "cohort"
     if abil_rows:
-        print("  [abilities] %d rows, %d ceiling sequences matched of %d ceiling rows"
-              % (len(abil_rows), len(ceiling_seq), len(ceil_rows)), file=sys.stderr)
+        n_ceil = sum(1 for v in seq_source.values() if v == "ceiling")
+        print("  [abilities] %d rows, %d sequences of %d hero-regions "
+              "(%d ceiling player, %d cohort fallback)"
+              % (len(abil_rows), len(ceiling_seq), len(ceil_rows),
+                 n_ceil, len(ceiling_seq) - n_ceil), file=sys.stderr)
 
     # ---- per-region builds ------------------------------------------------
     builds = {rg: defaultdict(lambda: {s: [] for s in SNAPSHOTS}) for rg in REGIONS}
@@ -253,7 +277,8 @@ def main():
             "order": order,
             "builds": {k: v for k, v in builds[rg].items()},
             "abilities": {k: {"slots": v["slots"], "of_builds": v["of_builds"],
-                              "ceiling": ceiling_seq.get((rg, k), [])}
+                              "ceiling": ceiling_seq.get((rg, k), []),
+                              "seq_from": seq_source.get((rg, k), "")}
                           for k, v in abilities[rg].items()},
         }
         print("  [%s] %d heroes, tiers %s" % (rg, len(order), dict(zip(TIER_NAMES, sizes))),
