@@ -121,7 +121,7 @@ TARGET_BUILDS = PER_REGION * len(REGIONS)
 # --------------------------------------------------------------------------
 
 
-def _get(url, tries=3):
+def _get(url, tries=_env("HTTP_TRIES", 4)):
     req = urllib.request.Request(url, headers={"User-Agent": "deadlock-pipeline/5.0"})
     if API_KEY:
         req.add_header("X-API-Key", API_KEY)
@@ -144,6 +144,19 @@ def _get(url, tries=3):
                     except Exception:
                         wait = 60
                     print("  [http] 429, waiting %ds" % wait, file=sys.stderr)
+                time.sleep(wait)
+                continue
+            raise
+        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
+            # A dropped connection never reaches an HTTP status, so the block
+            # above never saw it and one reset killed a whole run — a 2026-08-07
+            # run died on hero 52 of 38 with "[Errno 104] Connection reset by
+            # peer" during the TLS handshake, 24 ladders in. Transient network
+            # faults get the same treatment as a 503.
+            if attempt < tries - 1:
+                wait = 2 ** attempt + 1
+                print("  [http] %s — retrying in %ds (%d/%d)"
+                      % (e, wait, attempt + 1, tries - 1), file=sys.stderr)
                 time.sleep(wait)
                 continue
             raise
