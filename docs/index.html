@@ -817,7 +817,17 @@ function contributes(p){
 }
 
 function isConditional(p){
-  return !!(p.unresolved || p.cond || p.section === 'active');
+  if (p.unresolved || p.cond || p.section === 'active') return true;
+  // A `passive` property flagged IntrinsicallyProvidedInAbility is part of the
+  // item's proc, not a standing bonus. Spiritual Overflow's +30% fire rate
+  // reads that way: no cond string, unresolved false, so it was counted
+  // ALWAYS and its toggle appeared to do nothing. Only 5 properties across 3
+  // items match (Spiritual Overflow, Spellslinger, Enchanter's Emblem).
+  //
+  // `innate` + the same flag stays unconditional — those 16 are genuine
+  // always-on bonuses like Fleetfoot's bullet resist.
+  return p.section === 'passive' &&
+         (p.flags || []).some(f => String(f) === 'IntrinsicallyProvidedInAbility');
 }
 
 // An item earns a checkbox only if ticking it would actually move a number.
