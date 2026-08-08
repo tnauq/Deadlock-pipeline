@@ -78,9 +78,10 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 BASE = "https://api.deadlock-api.com"
 API_KEY = os.environ.get("DEADLOCK_API_KEY")
@@ -94,6 +95,31 @@ MAX_URL = int(os.environ.get("MAX_URL") or 9000)
 # two can be compared when the ladder switches to percentile ranking and net
 # wins expires. k=25 matches the pipeline's pool selection.
 SHRINK_K = int(os.environ.get("SHRINK_K") or 25)
+
+# ---- orbit fallback -------------------------------------------------------
+# Board-sourced candidates run thin on unpopular heroes — 11 of 76 hero-regions
+# had under five before the general-board rule was relaxed. Orbit 1 is everyone
+# who shared a ranked match with a ceiling player, taken straight from
+# match_player, so identity is exact: no possible_account_ids, no name matching.
+#
+# Measured 2026-08-08 (NAmerica, 3-day window, 12 seeds):
+#     orbit 0    12 accounts   median winrate 0.568   p90 0.634
+#     orbit 1   949            median 0.530           p90 0.629
+#     orbit 2  6,879           median 0.504           p90 0.607
+# Orbit 2 sits at the population mean, so ONE HOP is the useful radius; two is
+# dilution. Orbit 1's p90 matches the seeds' — its top is as strong as they
+# are, which is what a ceiling (a maximum) actually needs.
+#
+# Proximity is measured as DISTINCT SEEDS shared with, not raw shared matches:
+# a duo partner queuing with one seed all evening racks up matches without
+# being of comparable standing, whereas meeting several different ceiling
+# players is hard to do by accident.
+ORBIT_FALLBACK = os.environ.get("ORBIT_FALLBACK", "1") == "1"
+ORBIT_MIN_CANDIDATES = int(os.environ.get("ORBIT_MIN_CANDIDATES") or 8)
+ORBIT_SEEDS = int(os.environ.get("ORBIT_SEEDS") or 12)
+ORBIT_DAYS = int(os.environ.get("ORBIT_DAYS") or 3)
+ORBIT_MIN_SEEDS_MET = int(os.environ.get("ORBIT_MIN_SEEDS_MET") or 1)
+ORBIT_MIN_GAMES = int(os.environ.get("ORBIT_MIN_GAMES") or 10)
 
 # How many board entries to keep for the archive (player bar-chart-race data).
 # Costs no extra API calls — the full board is already fetched.
@@ -261,6 +287,81 @@ def fetch_ranked_records(account_ids):
     return out
 
 
+Q_ORBIT = """
+SELECT match_id, account_id
+FROM match_player
+WHERE match_id IN (
+    SELECT match_id FROM match_player
+    WHERE account_id IN ({ids})
+      AND match_mode = '{mode}' AND game_mode = 'Normal'
+      AND start_time >= now() - INTERVAL {days} DAY
+)
+"""
+
+
+def sql(query, label=""):
+    """One /v1/sql call. The quota is 2 per 60s on a SLIDING window and a 429
+    still consumes a slot, so a refusal is waited out in full rather than
+    retried immediately."""
+    url = BASE + "/v1/sql?format=json&query=" + urllib.parse.quote(query)
+    if len(url) > MAX_URL:
+        raise RuntimeError("orbit query %d chars, over %d" % (len(url), MAX_URL))
+    print("  [sql] %s (%d char url)" % (label, len(url)), file=sys.stderr)
+    for attempt in range(3):
+        try:
+            rows = get(url)
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 2:
+                print("  [sql] 429, waiting 65s", file=sys.stderr)
+                time.sleep(65)
+                continue
+            raise
+    else:
+        raise RuntimeError("rate limited")
+    if isinstance(rows, dict):
+        rows = rows.get("data", rows.get("rows", []))
+    return rows
+
+
+def fetch_orbit1(seed_ids):
+    """
+    account_id -> {"seeds_met": n, "shared": n} for everyone who shared a
+    ranked match with a seed. ONE SQL call for a dozen seeds.
+    """
+    seeds = sorted(set(int(a) for a in seed_ids if a))[:ORBIT_SEEDS]
+    if not seeds:
+        return {}
+    try:
+        rows = sql(Q_ORBIT.format(ids=",".join(str(a) for a in seeds),
+                                  mode=MATCH_MODE, days=ORBIT_DAYS),
+                   "orbit1 from %d seeds" % len(seeds))
+    except Exception as e:
+        print("  [orbit] failed (%s) — continuing without the fallback" % e,
+              file=sys.stderr)
+        return {}
+    by_match = defaultdict(set)
+    for r in rows:
+        by_match[int(r["match_id"])].add(int(r["account_id"]))
+    seedset = set(seeds)
+    out = defaultdict(lambda: {"seeds_met": set(), "shared": 0})
+    for _mid, accts in by_match.items():
+        met = accts & seedset
+        if not met:
+            continue
+        for a in accts - seedset:
+            out[a]["seeds_met"] |= met
+            out[a]["shared"] += 1
+    final = {a: {"seeds_met": len(v["seeds_met"]), "shared": v["shared"]}
+             for a, v in out.items()}
+    if final:
+        breadth = Counter(v["seeds_met"] for v in final.values())
+        print("  [orbit] %d matches, %d players; seeds met: %s"
+              % (len(by_match), len(final), dict(sorted(breadth.items()))),
+              file=sys.stderr)
+    return final
+
+
 def ceiling_value(rec):
     """
     THE ORDERING. Net wins over ranked play: wins minus losses.
@@ -326,8 +427,32 @@ def main():
               % (rg, sum(1 for k, v in confirmed.items()
                          if k[0] == rg and v[0]), n_missing), file=sys.stderr)
 
-    print("[3/3] ranked records for the confirmed players", file=sys.stderr)
+    print("[3/4] orbit fallback for thin hero-regions", file=sys.stderr)
+    # Only hero-regions that are actually short get expanded; everywhere else
+    # the boards already supply enough candidates and the orbit would only add
+    # weaker players for the maximum to ignore.
+    orbit = {}
+    if ORBIT_FALLBACK:
+        for rg in REGIONS:
+            thin = [hid for (r, hid), (cands, _n) in confirmed.items()
+                    if r == rg and len(cands) < ORBIT_MIN_CANDIDATES]
+            if not thin:
+                print("  [orbit] %-9s no thin hero-regions" % rg, file=sys.stderr)
+                continue
+            # seed from the strongest board positions in this region — the
+            # accounts most likely to actually be near the ceiling
+            seeds = sorted({c["account_id"]: c["pos"]
+                            for (r, _h), (cands, _n) in confirmed.items()
+                            if r == rg for c in cands}.items(),
+                           key=lambda kv: kv[1])
+            orbit[rg] = fetch_orbit1([a for a, _p in seeds])
+            print("  [orbit] %-9s %d thin heroes, %d orbit-1 players"
+                  % (rg, len(thin), len(orbit[rg])), file=sys.stderr)
+
+    print("[4/4] ranked records for the confirmed players", file=sys.stderr)
     every_id = {c["account_id"] for (cands, _n) in confirmed.values() for c in cands}
+    for members in orbit.values():
+        every_id |= set(members)
     records = fetch_ranked_records(every_id)
 
     per_region = defaultdict(list)
@@ -335,8 +460,29 @@ def main():
         if not cands:
             continue
         hero = hero_ids[hid]
+        pool = list(cands)
+        from_orbit = 0
+        if len(cands) < ORBIT_MIN_CANDIDATES and orbit.get(rg):
+            have = {c["account_id"] for c in cands}
+            for aid, prox in orbit[rg].items():
+                if aid in have:
+                    continue
+                if prox["seeds_met"] < ORBIT_MIN_SEEDS_MET:
+                    continue
+                rec = records.get(aid)
+                # must actually PLAY the hero, and enough to mean something —
+                # reaching 7,000 players is no use if none of them play Vyper
+                if not rec or rec["games"] < ORBIT_MIN_GAMES:
+                    continue
+                pool.append({"name": "", "account_id": aid,
+                             # no board position: they were not on it
+                             "pos": 10 ** 9, "hero_pos": 10 ** 9,
+                             "badge": None, "top_heroes": [],
+                             "seeds_met": prox["seeds_met"],
+                             "shared": prox["shared"]})
+                from_orbit += 1
         scored = []
-        for c in cands:
+        for c in pool:
             rec = records.get(c["account_id"])
             if not rec or not rec["games"]:
                 continue
@@ -353,7 +499,7 @@ def main():
             "hero": hero,
             "hero_id": hid,
             "region": rg,
-            "ceiling_player": c["name"],
+            "ceiling_player": c["name"] or ("orbit:%d" % c["account_id"]),
             "account_id": c["account_id"],
             # THE ORDERING
             "net_wins": net,
@@ -361,15 +507,20 @@ def main():
             "ranked_wins": rec["wins"],
             "shrunk_winrate": round(shrunk(rec), 4),
             # reference only — what the ceiling used to be ordered by
-            "global_pos": c["pos"],
+            # An orbit player was never on a board, so a position would be a
+            # lie. The 1e9 sentinel exists only to sort them last on ties.
+            "global_pos": "" if c["pos"] >= 10 ** 9 else c["pos"],
             "region_depth": depth[rg],
-            "pct": round(100.0 * c["pos"] / max(depth[rg], 1), 3),
+            "pct": "" if c["pos"] >= 10 ** 9 else round(100.0 * c["pos"] / max(depth[rg], 1), 3),
             "badge_level": c["badge"],
-            "hero_ladder_pos": c["hero_pos"],
-            "match": "confirmed",
+            "hero_ladder_pos": "" if c["hero_pos"] >= 10 ** 9 else c["hero_pos"],
+            "match": "orbit" if c.get("seeds_met") else "confirmed",
             "valve_top_hero": "YES" if hid in (c["top_heroes"] or []) else "",
             "located_on_general": len(cands),
             "scored_candidates": len(scored),
+            "from_orbit": from_orbit,
+            "ceiling_from_orbit": "YES" if c.get("seeds_met") else "",
+            "orbit_seeds_met": c.get("seeds_met", ""),
             "board_size": board_size,
             "winrate_rank": t.get("rank", ""),
             "elite_winrate": t.get("elite_winrate", ""),
@@ -387,8 +538,11 @@ def main():
                 return float(d["elite_winrate"])
             except (TypeError, ValueError):
                 return -1.0
+        def _pos(d):
+            v = d.get("global_pos")
+            return v if isinstance(v, int) else 10 ** 9
         rows = sorted(per_region.get(rg, []),
-                      key=lambda d: (-d["net_wins"], d["global_pos"], -_wr(d)))
+                      key=lambda d: (-d["net_wins"], _pos(d), -_wr(d)))
         for i, d in enumerate(rows, 1):
             d["ceiling_rank"] = i
         out.extend(rows)
@@ -404,7 +558,8 @@ def main():
             "account_id", "net_wins", "ranked_games", "ranked_wins",
             "shrunk_winrate", "global_pos", "region_depth", "pct", "badge_level",
             "hero_ladder_pos", "match", "valve_top_hero", "located_on_general",
-            "scored_candidates", "board_size", "winrate_rank", "elite_winrate"]
+            "scored_candidates", "from_orbit", "ceiling_from_orbit",
+            "orbit_seeds_met", "board_size", "winrate_rank", "elite_winrate"]
     path = os.path.join(OUT_DIR, "ceiling.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
@@ -425,7 +580,7 @@ def main():
             print("  %-4d %-12s %-16s %6d %7d %8.3f %s" %
                   (d["ceiling_rank"], d["hero"][:12], (d["ceiling_player"] or "?")[:16],
                    d["net_wins"], d["ranked_games"], d["shrunk_winrate"],
-                   d["global_pos"]), file=sys.stderr)
+                   d["global_pos"] or "orbit"), file=sys.stderr)
 
     dup = defaultdict(list)
     for d in out:
