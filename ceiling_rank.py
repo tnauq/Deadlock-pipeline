@@ -120,6 +120,10 @@ ORBIT_SEEDS = int(os.environ.get("ORBIT_SEEDS") or 12)
 ORBIT_DAYS = int(os.environ.get("ORBIT_DAYS") or 3)
 ORBIT_MIN_SEEDS_MET = int(os.environ.get("ORBIT_MIN_SEEDS_MET") or 1)
 ORBIT_MIN_GAMES = int(os.environ.get("ORBIT_MIN_GAMES") or 10)
+# Games ON THE HERO. Board candidates prove hero play by being on the hero's
+# board; an orbit candidate proves nothing, so this is the only thing stopping
+# someone who has never played Vyper from becoming Vyper's ceiling.
+ORBIT_MIN_HERO_GAMES = int(os.environ.get("ORBIT_MIN_HERO_GAMES") or 5)
 
 # How many board entries to keep for the archive (player bar-chart-race data).
 # Costs no extra API calls — the full board is already fetched.
@@ -244,8 +248,11 @@ def fetch_ranked_records(account_ids):
     """
     ids = sorted(set(int(a) for a in account_ids if a))
     if not ids:
-        return {}
+        return {}, {}
     out = defaultdict(lambda: {"games": 0, "wins": 0})
+    # per (account, hero) as well: an orbit candidate has no board membership
+    # to prove they play the hero, so the hero-level record is the only check
+    per_hero = {}
     base = "%s/v1/players/hero-stats?match_mode=%s" % (BASE, urllib.parse.quote(MATCH_MODE))
     # ~22.7 encoded chars per id (SCHEMA.md quirk 4); size the chunk against the
     # REAL url length, prefix included, rather than the query string alone
@@ -281,10 +288,13 @@ def fetch_ranked_records(account_ids):
             rec = out[int(a)]
             rec["games"] += int(g)
             rec["wins"] += int(w)
+            h = r.get("hero_id")
+            if h is not None:
+                per_hero[(int(a), int(h))] = {"games": int(g), "wins": int(w)}
         time.sleep(0.05)
-    print("  [hs] %d accounts over %d calls (no SQL used)" % (len(out), calls),
-          file=sys.stderr)
-    return out
+    print("  [hs] %d accounts, %d (account,hero) rows over %d calls (no SQL used)"
+          % (len(out), len(per_hero), calls), file=sys.stderr)
+    return out, per_hero
 
 
 Q_ORBIT = """
@@ -384,7 +394,7 @@ def shrunk(rec, k=None):
 def main():
     tier = {r["hero"]: r for r in csv.DictReader(open(os.path.join(OUT_DIR, "tierlist.csv")))}
 
-    print("[1/3] leaderboards", file=sys.stderr)
+    print("[1/4] leaderboards", file=sys.stderr)
     boards = {}
     for region in REGIONS:
         boards[region] = fetch_board(region)
@@ -410,7 +420,7 @@ def main():
     if not hero_ids:
         raise SystemExit("no hero ids in tierlist.csv")
 
-    print("[2/3] cross-referencing hero boards against the general board",
+    print("[2/4] cross-referencing hero boards against the general board",
           file=sys.stderr)
     confirmed = {}            # (region, hero_id) -> [candidate, ...]
     for rg in REGIONS:
@@ -453,7 +463,7 @@ def main():
     every_id = {c["account_id"] for (cands, _n) in confirmed.values() for c in cands}
     for members in orbit.values():
         every_id |= set(members)
-    records = fetch_ranked_records(every_id)
+    records, hero_records = fetch_ranked_records(every_id)
 
     per_region = defaultdict(list)
     for (rg, hid), (cands, board_size) in confirmed.items():
@@ -470,16 +480,21 @@ def main():
                 if prox["seeds_met"] < ORBIT_MIN_SEEDS_MET:
                     continue
                 rec = records.get(aid)
-                # must actually PLAY the hero, and enough to mean something —
-                # reaching 7,000 players is no use if none of them play Vyper
                 if not rec or rec["games"] < ORBIT_MIN_GAMES:
+                    continue
+                # and they must actually PLAY THIS HERO — reaching 949 players
+                # is no use if none of them play Vyper, and an account-level
+                # game count says nothing about that
+                hrec = hero_records.get((aid, hid))
+                if not hrec or hrec["games"] < ORBIT_MIN_HERO_GAMES:
                     continue
                 pool.append({"name": "", "account_id": aid,
                              # no board position: they were not on it
                              "pos": 10 ** 9, "hero_pos": 10 ** 9,
                              "badge": None, "top_heroes": [],
                              "seeds_met": prox["seeds_met"],
-                             "shared": prox["shared"]})
+                             "shared": prox["shared"],
+                             "hero_games": hrec["games"]})
                 from_orbit += 1
         scored = []
         for c in pool:
@@ -521,6 +536,7 @@ def main():
             "from_orbit": from_orbit,
             "ceiling_from_orbit": "YES" if c.get("seeds_met") else "",
             "orbit_seeds_met": c.get("seeds_met", ""),
+            "orbit_hero_games": c.get("hero_games", ""),
             "board_size": board_size,
             "winrate_rank": t.get("rank", ""),
             "elite_winrate": t.get("elite_winrate", ""),
@@ -559,7 +575,8 @@ def main():
             "shrunk_winrate", "global_pos", "region_depth", "pct", "badge_level",
             "hero_ladder_pos", "match", "valve_top_hero", "located_on_general",
             "scored_candidates", "from_orbit", "ceiling_from_orbit",
-            "orbit_seeds_met", "board_size", "winrate_rank", "elite_winrate"]
+            "orbit_seeds_met", "orbit_hero_games", "board_size", "winrate_rank",
+            "elite_winrate"]
     path = os.path.join(OUT_DIR, "ceiling.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
