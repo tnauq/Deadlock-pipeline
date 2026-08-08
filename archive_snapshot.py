@@ -212,9 +212,20 @@ def build_snapshot(region, ceil_rows, item_rows, tier_rows):
             "name": r["hero"],
             # the hero's best player's position on the region's cross-hero
             # board, from the hero-board/general-board cross-reference
+            # `rank` is the hero's ceiling position within the region. Since
+            # 2026-08-07 that is ordered by the ceiling player's ranked NET
+            # WINS, not by their board position.
             "rank": int(r["ceiling_rank"]),
-            "pos": int(r["global_pos"]),
+            # `pos` is that player's cross-hero board position, kept for
+            # reference. BLANK when the ceiling came from the orbit fallback —
+            # that player was never on a board, so a position would be a
+            # fabrication. int("") raised here the first time the orbit
+            # supplied a ceiling (6 of 76 on 2026-08-08).
+            "pos": int(r["global_pos"]) if (r.get("global_pos") or "").strip() else None,
             "depth": int(r["region_depth"]),
+            # "confirmed" (on both boards) or "orbit" (co-play fallback)
+            "source": r.get("match") or "confirmed",
+            "net_wins": int(r["net_wins"]) if (r.get("net_wins") or "").lstrip("-").isdigit() else None,
             # carried for reference; the site ranks by ceiling, not win rate
             "winrate": float(t["elite_winrate"]) if t.get("elite_winrate") else None,
             "players": int(t["players"]) if t.get("players") else None,
@@ -267,7 +278,12 @@ def update_index(date, region, snap):
         "file": "%s-%s.json" % (date, region),
         # just enough to plot movement without opening the day file
         "ranks": {s: h["rank"] for s, h in snap["heroes"].items()},
-        "pos": {s: h["pos"] for s, h in snap["heroes"].items()},
+        # orbit ceilings have no board position; omitted rather than written
+        # as null so a chart does not draw a line through zero
+        "pos": {s: h["pos"] for s, h in snap["heroes"].items()
+                if h["pos"] is not None},
+        "net": {s: h["net_wins"] for s, h in snap["heroes"].items()
+                if h["net_wins"] is not None},
     }
     days = [d for d in index.get("days", [])
             if not (d.get("date") == date and d.get("region") == region)]
@@ -320,9 +336,10 @@ def main():
         wrote += 1
         p = snap.get("players")
         conf = sum(1 for e in p["entries"] if e["confirmed"]) if p else 0
-        print("  -> %s (%.0f KB, %d heroes, %d board players / %d id-confirmed) "
-              "| index now %d entries"
-              % (path, os.path.getsize(path) / 1024, len(snap["heroes"]),
+        n_orbit = sum(1 for h in snap["heroes"].values() if h.get("source") == "orbit")
+        print("  -> %s (%.0f KB, %d heroes [%d from orbit], %d board players / "
+              "%d id-confirmed) | index now %d entries"
+              % (path, os.path.getsize(path) / 1024, len(snap["heroes"]), n_orbit,
                  len(p["entries"]) if p else 0, conf, n_days), file=sys.stderr)
 
         # raw CSVs, outside docs/ so they don't count against the Pages limit
@@ -336,9 +353,6 @@ def main():
                 with open(os.path.join(OUT, name), "rb") as src, \
                         gzip.open(dest, "wb", compresslevel=9) as dst:
                     shutil.copyfileobj(src, dst)
-
-    if not wrote:
-        print("  [archive] nothing new written", file=sys.stderr)
 
 
 if __name__ == "__main__":
