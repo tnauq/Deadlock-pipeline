@@ -113,6 +113,38 @@ MAX_URL = _env("MAX_URL", 9000)   # ~9KB is documented as working (SCHEMA.md qui
 SQL_PAUSE_S = _env("SQL_PAUSE_S", 40)
 # On a 429 the only reliable recovery is to let the whole window drain.
 SQL_429_WAIT_S = _env("SQL_429_WAIT_S", 65)
+
+# ---- orbit fill -----------------------------------------------------------
+# Only 49 of 76 hero-regions reach a full 20 builds from the leaderboards; the
+# rest run out of qualifying board members. Orbit 1 — everyone who shared a
+# ranked match with a top board player — supplies the shortfall. Account ids
+# come straight from match_player, so identity is exact rather than resolved
+# from a display name.
+#
+# Measured 2026-08-08 (NAmerica, 3-day window, 12 seeds): orbit 1 is 949
+# players with median win rate 0.530 and p90 0.629, against the seeds' 0.568
+# and 0.634. Orbit 2 sits at the population mean (0.504) and is NOT used.
+# In a 400-account sample, hero coverage was ample even for unpopular heroes:
+# Lady Geist 82, Mirage 98, Grey Talon 41, Vyper 23.
+#
+# Cost: one SQL call per region, and only when that region has a short
+# hero-region. Orbit players are appended AFTER board members, so a full pool
+# never changes.
+ORBIT_FILL = _env("ORBIT_FILL", 1)
+ORBIT_SEEDS = _env("ORBIT_SEEDS", 12)
+ORBIT_DAYS = _env("ORBIT_DAYS", 3)
+ORBIT_MIN_HERO_GAMES = _env("ORBIT_MIN_HERO_GAMES", 5)
+ORBIT_MIN_SEEDS_MET = _env("ORBIT_MIN_SEEDS_MET", 1)
+# What orders orbit candidates for a build slot.
+#   "breadth"  distinct seeds met first, hero win rate as the tiebreak
+#   "winrate"  the reverse
+# Breadth measures STANDING — meeting several different top players in a
+# 3-day window is hard to do by accident — while hero win rate measures being
+# good AT THE HERO, which is not the same thing. Breadth is only a 1-3 valued
+# signal though, so if almost everyone sits at 1 the two orderings differ only
+# for the few who met 2+. The `[orbit] seeds met:` line prints the
+# distribution; if it is overwhelmingly {1: ...} this choice barely matters.
+ORBIT_SORT = os.environ.get("ORBIT_SORT", "breadth")
 # Unkeyed /v1/sql allows 2 req/min AND 20 req/hr (SCHEMA.md quirk #5). The
 # hourly cap is the binding one for chunked queries — it is what killed the
 # 2026-07-31 runs at chunk 21 both times. An X-API-Key raises this.
@@ -467,6 +499,67 @@ def shrunk(wins, games, k=None):
     return (wins + k * 0.5) / (games + k) if (games + k) else 0.5
 
 
+Q_ORBIT = """
+SELECT match_id, account_id
+FROM match_player
+WHERE match_id IN (
+    SELECT match_id FROM match_player
+    WHERE account_id IN ({ids})
+      AND match_mode = '{mode}' AND game_mode = 'Normal'
+      AND start_time >= now() - INTERVAL {days} DAY
+)
+"""
+
+
+def fetch_orbit1(seed_ids):
+    """
+    account_id -> {"seeds_met": n, "shared": n} for everyone who shared a
+    ranked match with a seed. ONE SQL call.
+
+    Proximity is DISTINCT SEEDS met, not raw shared matches: a duo partner
+    queuing with one seed all evening racks up matches without being of
+    comparable standing, whereas meeting several different top players is hard
+    to do by accident.
+    """
+    seeds = sorted(set(int(a) for a in seed_ids if a))[:ORBIT_SEEDS]
+    if not seeds:
+        return {}
+    q = Q_ORBIT.format(ids=",".join(str(a) for a in seeds),
+                       mode=MATCH_MODE, days=ORBIT_DAYS)
+    if len(sql_url(q)) > MAX_URL:
+        seeds = seeds[:max(4, len(seeds) // 2)]
+        q = Q_ORBIT.format(ids=",".join(str(a) for a in seeds),
+                           mode=MATCH_MODE, days=ORBIT_DAYS)
+    try:
+        rows = sql(q, "orbit1 from %d seeds" % len(seeds))
+    except SystemExit:
+        raise
+    except Exception as e:
+        print("  [orbit] failed (%s) — continuing without the fill" % e,
+              file=sys.stderr)
+        return {}
+    by_match = defaultdict(set)
+    for r in rows:
+        by_match[int(r["match_id"])].add(int(r["account_id"]))
+    seedset = set(seeds)
+    acc = defaultdict(lambda: {"seeds_met": set(), "shared": 0})
+    for accts in by_match.values():
+        met = accts & seedset
+        if not met:
+            continue
+        for a in accts - seedset:
+            acc[a]["seeds_met"] |= met
+            acc[a]["shared"] += 1
+    out = {a: {"seeds_met": len(v["seeds_met"]), "shared": v["shared"]}
+           for a, v in acc.items()}
+    if out:
+        breadth = Counter(v["seeds_met"] for v in out.values())
+        print("  [orbit] %d matches, %d players; seeds met: %s"
+              % (len(by_match), len(out), dict(sorted(breadth.items()))),
+              file=sys.stderr)
+    return out
+
+
 def fetch_hero_stats(account_ids):
     """Per (account, hero) ranked stats for every candidate. No SQL."""
     ids = sorted(account_ids)
@@ -728,6 +821,66 @@ def main():
                                     offhero_games=og, offhero_wins=ow,
                                     ambiguous=r["ambiguous"]))
             taken += 1
+
+    # ---- orbit fill -------------------------------------------------------
+    # Top up any hero-region short of PER_REGION with orbit-1 players who
+    # actually play that hero. Board members are never displaced: the orbit
+    # only ever appends to a pool that came up short.
+    orbit_added = 0
+    if ORBIT_FILL:
+        short = defaultdict(list)
+        for hid, lst in chosen.items():
+            for rg in REGIONS:
+                have = [c for c in lst if c["region"] == rg]
+                if len(have) < PER_REGION:
+                    short[rg].append((hid, PER_REGION - len(have)))
+        for rg, gaps in sorted(short.items()):
+            seeds = [c["account_id"] for lst in chosen.values() for c in lst
+                     if c["region"] == rg]
+            seeds = sorted(set(seeds))[:ORBIT_SEEDS]
+            members = fetch_orbit1(seeds)
+            if not members:
+                continue
+            # hero-stats for the orbit members, so their hero record and most
+            # recent match on the hero are known. Free, batched.
+            known = {a for (a, _h) in stats}
+            extra = fetch_hero_stats(set(members) - known)
+            print("  [orbit] %-9s %d short hero-regions, %d orbit players, "
+                  "%d (account,hero) rows" % (rg, len(gaps), len(members), len(extra)),
+                  file=sys.stderr)
+            for hid, need in gaps:
+                taken = {c["account_id"] for c in chosen[hid]}
+                cands = []
+                for aid, prox in members.items():
+                    if aid in taken or prox["seeds_met"] < ORBIT_MIN_SEEDS_MET:
+                        continue
+                    s_ = extra.get((aid, hid)) or stats.get((aid, hid))
+                    if not s_ or s_["last_match_id"] is None:
+                        continue
+                    if s_["hero_games"] < ORBIT_MIN_HERO_GAMES:
+                        continue
+                    cands.append((shrunk(s_["hero_wins"], s_["hero_games"]),
+                                  prox["seeds_met"], aid, s_))
+                if ORBIT_SORT == "winrate":
+                    cands.sort(key=lambda t: (-t[0], -t[1]))
+                else:
+                    cands.sort(key=lambda t: (-t[1], -t[0]))
+                for rating, met, aid, s_ in cands[:need]:
+                    chosen[hid].append({
+                        "hero_id": hid, "region": rg, "ladder_pos": None,
+                        "account_name": "", "badge_level": None,
+                        "account_id": aid, "mmr": None,
+                        "ranked_rating": round(rating, 4),
+                        "last_match_id": int(s_["last_match_id"]),
+                        "last_played": s_["last_played"],
+                        "hero_games": s_["hero_games"], "hero_wins": s_["hero_wins"],
+                        "offhero_games": 0, "offhero_wins": 0,
+                        "ambiguous": False, "source": "orbit",
+                        "orbit_seeds_met": met,
+                    })
+                    orbit_added += 1
+        print("  [orbit] added %d builds across all short hero-regions"
+              % orbit_added, file=sys.stderr)
 
     wanted = [(c["last_match_id"], c["account_id"])
               for lst in chosen.values() for c in lst]
@@ -1021,7 +1174,10 @@ def main():
           ["hero_id", "hero", "region", "ladder_pos", "account_id", "account_name",
            "ranked_rating", "hero_games", "hero_wins",
            "offhero_games", "offhero_wins",
-           "last_match_id", "last_played", "ambiguous"])
+           "last_match_id", "last_played", "ambiguous",
+           # blank for board-sourced rows; "orbit" plus the breadth of contact
+           # for anyone the orbit fill supplied
+           "source", "orbit_seeds_met"])
     write("item_frequency.csv", freq,
           ["hero_id", "hero", "region", "snapshot", "item_id", "item", "category", "tier",
            "count", "of_builds", "icon_url"])
