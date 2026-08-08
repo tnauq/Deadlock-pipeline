@@ -1246,6 +1246,42 @@ function imbuedStats(abilityId, hasCharges){
   return add;
 }
 
+// Which stat a scale coefficient reads. A BLANK specific_stat_scale_type is
+// the default, and the default is spirit — 105 properties are blank against
+// 104 explicitly ETechPower. Treating blank as "no scaling" left Venator's
+// Snap Trap frozen at its base 80 however much spirit was bought.
+//
+// Weapon-scaled abilities read the weapon-damage PERCENTAGE AS A RAW NUMBER:
+// 40% contributes 40, not 0.4. Venator's Gutshot is 60 + 0.7 x 40 = 88 at
+// +40% weapon damage. Treating it as a fraction made the whole term vanish.
+//
+// ELevelUpBoons follows the same raw-number convention, counting boons — one
+// per level, so 31 at level 32. Venator's Ira Domini bonus damage is
+// 115 + 3.0 x 31 = 208 there.
+//
+// The remaining sources (melee, cooldown, duration — 7 properties) are still
+// NOT computed. They show their base value and name what they grow on, which
+// is better than a confident wrong number.
+const SCALE_SOURCE = {
+  '':                          s => s.spirit,
+  'ETechPower':                s => s.spirit,
+  'EBaseWeaponDamageIncrease': s => s.wdmg,
+  'EWeaponPower':              s => s.wdmg,
+  'EWeaponDamageScale':        s => s.wdmg,
+  'ELevelUpBoons':             s => s.boons,
+};
+const SCALE_SRC_LABEL = {
+  'EBaseWeaponDamageIncrease': 'Weapon Damage %',
+  'EWeaponPower':              'Weapon Damage %',
+  'EWeaponDamageScale':        'Weapon Damage %',
+  'ELevelUpBoons':             'boons',
+};
+const SCALE_LABEL = {
+  'ELightMeleeDamage': 'light melee',
+  'ETechCooldown':     'cooldown',
+  'ETechDuration':     'duration',
+};
+
 function abilityValues(rec, steps, stats, hasCharges){
   const flat = {}, scale = {};
   for (let t = 0; t < Math.max(steps - 1, 0); t++)
@@ -1257,13 +1293,18 @@ function abilityValues(rec, steps, stats, hasCharges){
   return rec.props.map(p => {
     const base = p.value + (flat[p.key] || 0);
     const coef = (p.scale || 0) + (scale[p.key] || 0);
-    let v = base + (coef && p.scales === 'ETechPower' ? coef * stats.spirit : 0);
+    const src = SCALE_SOURCE[p.scales];
+    const from = coef && src ? src(stats) : 0;
+    let v = base + coef * from;
     // charge cooldown is meaningless without charges
     if (p.key === 'AbilityCooldownBetweenCharge' && !hasCharges) return null;
     const fx = ABIL_ITEM_FX[p.key];
     if (fx) v *= fx(stats);
     return {label: p.label, unit: p.unit, value: v, coef,
-            scaled: coef > 0 && p.scales === 'ETechPower',
+            scaled: coef > 0 && !!src,
+            // scales, but on something the calculator will not guess at
+            unmodelled: coef > 0 && !src && !!SCALE_LABEL[p.scales],
+            source: p.scales || 'ETechPower',
             changed: (flat[p.key] || 0) !== 0 || (scale[p.key] || 0) !== 0};
   }).filter(Boolean);
 }
@@ -1272,8 +1313,14 @@ function drawAbilityDetail(host, rec, steps, out, id){
   const g = k => (out.rows.S.find(r => r.label === k) || {}).v || 0;
   const hasCharges = rec.props.some(p => /Charges/.test(p.key) && p.value > 0);
   const im = imbuedStats(id, hasCharges);
+  const gg = k => (out.rows.G.find(r => r.label === k) || {}).v || 0;
   const stats = {
     spirit: g('Spirit Power') + im.spirit,
+    // boons accrue one per level; weapon damage and melee come off the
+    // weapon panel the calculator has already computed
+    boons: Math.max(0, build.level - 1),
+    wdmg: gg('Weapon Damage'),
+    melee: gg('Light Melee'),
     cd: g('Ability Cooldown') + im.cd,
     dur: g('Ability Duration') + im.dur,
     rng: g('Ability Range') + im.rng,
@@ -1296,8 +1343,19 @@ function drawAbilityDetail(host, rec, steps, out, id){
     row.append(n, k);
     if (v.scaled){
       const sc = el('span','sc');
+      const lab = SCALE_SRC_LABEL[v.source] || 'Spirit Power';
+      const amt = SCALE_SOURCE[v.source] ? SCALE_SOURCE[v.source](stats) : stats.spirit;
       sc.textContent = '\u2726' + v.coef.toFixed(2);
-      sc.title = v.coef.toFixed(2) + ' x Spirit Power (' + stats.spirit.toFixed(0) + ')';
+      sc.title = v.coef.toFixed(2) + ' x ' + lab + ' (' + amt.toFixed(0) + ')';
+      row.appendChild(sc);
+    } else if (v.unmodelled){
+      // base value shown, with what it grows on named. Better an admitted gap
+      // than a confident wrong number.
+      const sc = el('span','sc');
+      sc.style.opacity = '0.65';
+      sc.textContent = '+' + SCALE_LABEL[v.source];
+      sc.title = 'Scales with ' + SCALE_LABEL[v.source] + ' (x' +
+                 v.coef.toFixed(2) + '), not modelled — base value shown';
       row.appendChild(sc);
     }
     list.appendChild(row);
