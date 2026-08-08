@@ -185,6 +185,23 @@ jobs:
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
         run: python3 probe_mmr_shape.py
 
+      # 1 SQL call for orbit 1, ~2 more for orbit 2 (705 ids per call). If
+      # orbit 1 comes back much wider than the 1,373 already measured, orbit 2
+      # gets expensive fast — 5,000 seeds would be 8 calls against a 20/HOUR
+      # cap. Set ORBITS=1 to stop at one hop.
+      #
+      # Measures SIZE before quality: if orbit 2 reaches most of ranked NA it
+      # is not a cohort and cannot fix thinness, whatever its win rates look
+      # like.
+      - name: Probe orbits
+        if: ${{ always() && !inputs.free_only }}
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+          PROBE_LOOKBACK_DAYS: ${{ inputs.lookback_days }}
+          ORBITS: "2"
+        run: python3 probe_orbits.py
+
       # ZERO SQL. Dropping the general-board requirement changed the ceiling
       # on 39 of 76 hero-regions. The new set is a superset so a ceiling can
       # only move up — but net wins rewards VOLUME, so this checks whether the
