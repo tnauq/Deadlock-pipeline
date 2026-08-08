@@ -273,8 +273,9 @@
  },
  "MODIFIER_VALUE_ITEM_COOLDOWN_REDUCTION_PERCENTAGE": {
   "panel": "S",
-  "row": "ability_cooldown",
-  "kind": "add_pct"
+  "row": "item_cooldown",
+  "kind": "add_pct",
+  "note": "Reduces ITEM (active) cooldowns, NOT ability cooldowns \u2014 a separate stat that was mapped onto ability_cooldown. Transcendent Cooldown grants 25% of each, so it read as 50% and cut Viscous's Splatter from 9s to 6s. Every item carrying one carries the other."
  },
  "MODIFIER_VALUE_COOLDOWN_BETWEEN_CHARGE_REDUCTION_PERCENTAGE": {
   "panel": "S",
