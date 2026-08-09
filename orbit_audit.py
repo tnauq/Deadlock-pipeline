@@ -15,8 +15,21 @@ leaves this script: it emits per-hero-region aggregates only.
 
     python3 orbit_audit.py
 
-Reads  ./output/candidates.csv, ./output/item_frequency.csv
+Reads  ./output/candidates.csv, ./output/source_items.csv
 Writes ./output/orbit_audit.csv, and prints a summary
+
+A RAW JACCARD IS NOT INTERPRETABLE on its own. It falls when either group is
+small, because fewer items clear the "held by 2 or more builds" threshold — so
+a 5-vs-15 split scores low whether or not the groups differ. Two controls fix
+that:
+
+  * a BOARD-vs-BOARD baseline, splitting the board builds in half and
+    comparing those. That is the noise floor: whatever two halves of the SAME
+    population score is what "no difference" looks like at that sample size.
+  * size matching, subsampling the larger group down to the smaller one.
+
+If orbit-vs-board lands at the baseline, the two sources are indistinguishable
+and a rising orbit share is harmless.
 
 Per hero-region it reports:
     orbit_builds / board_builds     the split
@@ -34,8 +47,12 @@ Cost: ZERO API calls. Pure local aggregation.
 
 import csv
 import os
+import random
 import sys
 from collections import defaultdict
+
+random.seed(20260809)          # a stable baseline between runs
+TRIALS = int(os.environ.get("ORBIT_AUDIT_TRIALS") or 40)
 
 OUT = "output"
 
@@ -76,11 +93,44 @@ def main():
     # cannot answer this because it pools both sources together.
     src = read("source_items.csv", required=False)
     have_builds = bool(src)
-    by_src = defaultdict(set)
+    # item -> how many builds of that source held it, so a threshold can be
+    # applied at whatever sample size the comparison is run at
+    counts = defaultdict(dict)
     for r in src:
-        # a single build holding an item says little; two or more is a choice
-        if int(r["count"]) >= 2:
-            by_src[(r["region"], r["hero"], r["source"])].add(r["item_id"])
+        counts[(r["region"], r["hero"], r["source"])][r["item_id"]] = int(r["count"])
+
+    def jac(a, b):
+        u = len(a | b)
+        return len(a & b) / u if u else None
+
+    def at_least(d, k):
+        return {i for i, c in d.items() if c >= k}
+
+    def baseline(hero_key, n_small, n_large):
+        """
+        Board-vs-board at the same sizes. source_items.csv is aggregated, so
+        the two halves cannot be drawn from real builds — instead each item is
+        kept with probability proportional to how often it appeared, which
+        reproduces the thresholding effect that drives the jaccard down.
+        """
+        d = counts.get(hero_key + ("board",), {})
+        tot = sum(1 for _ in d) and max(
+            (c for c in d.values()), default=0)
+        if not d or not tot:
+            return None
+        out = []
+        for _ in range(TRIALS):
+            ha, hb = {}, {}
+            for i, c in d.items():
+                # split c holdings between two halves binomially
+                a = sum(1 for _ in range(c) if random.random() < 0.5)
+                ha[i], hb[i] = a, c - a
+            sa = at_least(ha, 2)
+            sb = at_least(hb, 2)
+            v = jac(sa, sb)
+            if v is not None:
+                out.append(v)
+        return sum(out) / len(out) if out else None
 
     rows = []
     for (rg, hero), g in sorted(groups.items()):
@@ -92,19 +142,27 @@ def main():
             "mean_seeds_met": round(sum(seeds_met[(rg, hero)]) /
                                     len(seeds_met[(rg, hero)]), 2)
                               if seeds_met[(rg, hero)] else "",
-            "jaccard": "", "orbit_only": "", "board_only": "",
+            "jaccard": "", "baseline": "", "vs_baseline": "",
+            "orbit_only": "", "board_only": "",
         }
         if have_builds and n_o and n_b:
-            oi = by_src.get((rg, hero, "orbit"), set())
-            bi = by_src.get((rg, hero, "board"), set())
-            inter, union = len(oi & bi), len(oi | bi)
-            rec["jaccard"] = round(inter / union, 3) if union else ""
+            oi = at_least(counts.get((rg, hero, "orbit"), {}), 2)
+            bi = at_least(counts.get((rg, hero, "board"), {}), 2)
+            v = jac(oi, bi)
+            rec["jaccard"] = round(v, 3) if v is not None else ""
             rec["orbit_only"] = len(oi - bi)
             rec["board_only"] = len(bi - oi)
+            base = baseline((rg, hero), min(n_o, n_b), max(n_o, n_b))
+            rec["baseline"] = round(base, 3) if base is not None else ""
+            if base and v is not None:
+                # above 1.0 means the two sources agree MORE than two halves
+                # of the board pool agree with each other
+                rec["vs_baseline"] = round(v / base, 2)
         rows.append(rec)
 
     cols = ["region", "hero", "board_builds", "orbit_builds", "orbit_share",
-            "mean_seeds_met", "jaccard", "orbit_only", "board_only"]
+            "mean_seeds_met", "jaccard", "baseline", "vs_baseline",
+            "orbit_only", "board_only"]
     path = os.path.join(OUT, "orbit_audit.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
@@ -127,10 +185,22 @@ def main():
                   % (r["region"], r["hero"], r["board_builds"], r["orbit_builds"],
                      r["orbit_share"], r["mean_seeds_met"]), file=sys.stderr)
     js = [r["jaccard"] for r in rows if isinstance(r["jaccard"], float)]
+    bs = [r["baseline"] for r in rows if isinstance(r.get("baseline"), float)]
+    vb = [r["vs_baseline"] for r in rows if isinstance(r.get("vs_baseline"), float)]
     if js:
         js.sort()
-        print("  [orbit] item-set jaccard, orbit vs board: min %.2f  median %.2f  "
-              "max %.2f" % (js[0], js[len(js) // 2], js[-1]), file=sys.stderr)
+        print("  [orbit] jaccard orbit vs board : min %.2f  median %.2f  max %.2f"
+              % (js[0], js[len(js) // 2], js[-1]), file=sys.stderr)
+    if bs:
+        bs.sort()
+        print("  [orbit] jaccard board vs board : min %.2f  median %.2f  max %.2f"
+              "   <- the noise floor" % (bs[0], bs[len(bs) // 2], bs[-1]),
+              file=sys.stderr)
+    if vb:
+        vb.sort()
+        print("  [orbit] ratio to baseline      : median %.2f  (1.00 means the "
+              "two sources are indistinguishable)" % vb[len(vb) // 2],
+              file=sys.stderr)
     else:
         print("  [orbit] no per-build item file, so item overlap was not "
               "computed — only the build split is reported", file=sys.stderr)
