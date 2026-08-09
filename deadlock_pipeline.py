@@ -944,12 +944,25 @@ def main():
     builds_rg = defaultdict(int)
     holds = defaultdict(lambda: defaultdict(int))
     souls = defaultdict(lambda: defaultdict(int))
+    # Postgame holdings split by where the build CAME from, so the orbit fill
+    # can be audited without anything account-level leaving the runner.
+    # candidates.csv carries account ids and is never uploaded or committed;
+    # this is the aggregate that answers "do orbit builds differ?" on its own.
+    src_of = {(c["last_match_id"], c["account_id"]): c.get("source") or "board"
+              for lst in chosen.values() for c in lst}
+    src_holds = defaultdict(lambda: defaultdict(int))
+    src_builds = defaultdict(int)
 
     for (hid, _m, _a), purchases in per_build.items():
         rg = build_region.get((_m, _a), "")
+        src = src_of.get((_m, _a), "board")
         builds[hid] += 1
         builds_rg[(hid, rg)] += 1
+        src_builds[(hid, rg, src)] += 1
         for snap, held in snapshot_holdings(purchases, component_of).items():
+            if snap == "postgame":
+                for iid in held:
+                    src_holds[(hid, rg, src)][iid] += 1
             for iid in held:
                 holds[(hid, rg, snap)][iid] += 1
                 meta = items.get(iid)
@@ -1192,6 +1205,20 @@ def main():
             "count": c, "of_holders": imbue_item[(hid, rg, iid)],
         })
     imbue_rows.sort(key=lambda d: (d["hero"], d["region"], d["item"], -d["count"]))
+    src_rows = []
+    for (hid, rg, src), counter in sorted(src_holds.items()):
+        for iid, c in sorted(counter.items(), key=lambda kv: -kv[1]):
+            src_rows.append({
+                "hero_id": hid, "hero": heroes.get(hid, ""), "region": rg,
+                "source": src, "item_id": iid,
+                "item": items.get(iid, {}).get("name", ""),
+                "category": (items.get(iid, {}).get("cat") or "?"),
+                "count": c, "of_builds": src_builds[(hid, rg, src)],
+            })
+    write("source_items.csv", src_rows,
+          ["hero_id", "hero", "region", "source", "item_id", "item",
+           "category", "count", "of_builds"])
+
     write("imbue_frequency.csv", imbue_rows,
           ["hero_id", "hero", "region", "item_id", "item", "ability_id", "ability",
            "slot", "count", "of_holders"])
