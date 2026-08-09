@@ -1,299 +1,209 @@
 #!/usr/bin/env python3
 """
-probe_orbits.py — co-play graph expansion from the ceiling players.
+orbit_audit.py — do orbit-sourced builds actually look different?
 
-Idea: treat the ranked population as a graph. Orbit 0 is the ceiling players.
-Orbit 1 is everyone who shared a ranked match with them. Orbit 2 is everyone
-who shared a match with orbit 1. Candidates sourced this way carry a real
-`account_id` straight from match_player — no name resolution, no
-possible_account_ids, so none of the 110-of-371 identity problem.
+The pipeline tops up short hero-regions with ORBIT players: accounts that
+shared a ranked match with a top board player. On 2026-08-09 that was 211 of
+1,520 builds, 13.9%, up from 165 the run before. Those players are near the
+ceiling rather than demonstrably on the ladder, so the question is whether
+their builds differ from the board-sourced ones — if they do not, the share
+does not matter.
 
-WHAT THIS IS ACTUALLY TESTING. Orbit 1 was already measured at 1,373 distinct
-players from 12 seeds over 3 days. Expanding from 1,373 could plausibly reach
-most of ranked NA, and if orbit 2 is the whole population then it is not a
-cohort and cannot fix thinness in any meaningful way — it would just be
-"everyone", which the pipeline could get more cheaply.
+This reads output/candidates.csv, which carries Steam account ids and display
+names and is deliberately never committed or uploaded. NOTHING account-level
+leaves this script: it emits per-hero-region aggregates only.
 
-So the questions are size first, quality second:
+    python3 orbit_audit.py
 
-  Q1  How many distinct accounts are in each orbit, and what is the growth
-      factor? Orbit 2 approaching the ranked population means the radius is
-      already too wide at 2.
-  Q2  Does standing DECAY with orbit distance? Win rate and games are pulled
-      for a sample of each orbit. If orbit 2 looks like orbit 1, distance
-      carries no information. If it degrades sharply, orbit 1 is the useful
-      radius and orbit 2 is dilution.
-  Q3  Coverage of the thin hero-regions: how many orbit members have ranked
-      games on the heroes that currently have too few candidates? That is the
-      only reason to want this, so it is measured directly.
+Reads  ./output/candidates.csv, ./output/source_items.csv
+Writes ./output/orbit_audit.csv, and prints a summary
 
-Win rate is used rather than net wins deliberately. Net wins conflates skill
-with volume, and ranked placement SEEDS from prior standing — a player with 30
-games was placed at a rank, not climbing to one — so a low game count says
-nothing about how good they are.
+A RAW JACCARD IS NOT INTERPRETABLE on its own. It falls when either group is
+small, because fewer items clear the "held by 2 or more builds" threshold — so
+a 5-vs-15 split scores low whether or not the groups differ. Two controls fix
+that:
 
-Cost: 1 SQL call for orbit 1, plus ~2-4 chunked calls for orbit 2 depending on
-how wide orbit 1 turns out to be. Budget against the 20/HOUR cap: this is a
-daily-cadence tool, not a 4-hourly one. Set ORBITS=1 to stop after orbit 1.
+  * a BOARD-vs-BOARD baseline, splitting the board builds in half and
+    comparing those. That is the noise floor: whatever two halves of the SAME
+    population score is what "no difference" looks like at that sample size.
+  * size matching, subsampling the larger group down to the smaller one.
 
-    python3 probe_orbits.py
+If orbit-vs-board lands at the baseline, the two sources are indistinguishable
+and a rising orbit share is harmless.
 
-Writes probe_out/orbits.json. Stdlib only.
+Per hero-region it reports:
+    orbit_builds / board_builds     the split
+    jaccard                         overlap of the two groups' postgame item
+                                    sets — 1.00 means identical choices
+    orbit_only / board_only         items unique to each group
+    mean_seeds_met                  proximity of the orbit players used
+
+A jaccard near 1 says the orbit players build the same things and the fill is
+harmless. A low one, especially with a large orbit share, says the fill is
+changing what the site reports.
+
+Cost: ZERO API calls. Pure local aggregation.
 """
 
 import csv
-import json
 import os
-import statistics
+import random
 import sys
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from collections import defaultdict
 
-BASE = "https://api.deadlock-api.com"
-API_KEY = os.environ.get("DEADLOCK_API_KEY")
-OUT = "probe_out"
-REGION = os.environ.get("PROBE_REGION") or "NAmerica"
-SEEDS = int(os.environ.get("ORBIT_SEEDS") or 12)
-ORBITS = int(os.environ.get("ORBITS") or 2)
-LOOKBACK_DAYS = int(os.environ.get("PROBE_LOOKBACK_DAYS") or 3)
-MATCH_MODE = os.environ.get("MATCH_MODE") or "Ranked"
-MAX_URL = int(os.environ.get("MAX_URL") or 9000)
-# Sampled per orbit for the quality read — hero-stats is free but the response
-# grows with one row per (account, hero).
-QUALITY_SAMPLE = int(os.environ.get("ORBIT_SAMPLE") or 400)
-SQL_PAUSE_S = int(os.environ.get("SQL_PAUSE_S") or 40)
+random.seed(20260809)          # a stable baseline between runs
+TRIALS = int(os.environ.get("ORBIT_AUDIT_TRIALS") or 40)
 
-_sql_calls = [0]
+OUT = "output"
 
 
-def get(url, timeout=300):
-    req = urllib.request.Request(url, headers={"User-Agent": "deadlock-orbits/1.0"})
-    if API_KEY:
-        req.add_header("X-API-Key", API_KEY)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
-
-
-def sql(q, label="", tries=4):
-    """
-    The quota is 2 requests per 60s and the window SLIDES; a 429 response still
-    consumes a slot, so retrying inside the window makes things worse. Space
-    calls past half the window and drain it fully on a 429.
-    """
-    url = BASE + "/v1/sql?format=json&query=" + urllib.parse.quote(q)
-    if len(url) > MAX_URL:
-        raise SystemExit("query URL %d chars, over %d — chunk further"
-                         % (len(url), MAX_URL))
-    if _sql_calls[0]:
-        print("  [sql] pausing %ds" % SQL_PAUSE_S, file=sys.stderr)
-        time.sleep(SQL_PAUSE_S)
-    _sql_calls[0] += 1
-    print("  [sql] #%d %s (%d char url)" % (_sql_calls[0], label, len(url)),
-          file=sys.stderr)
-    for attempt in range(tries):
-        try:
-            rows = get(url)
-            break
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", "replace")
-            if e.code == 429 and attempt < tries - 1:
-                print("  [sql] 429, waiting 65s for the window to drain",
-                      file=sys.stderr)
-                time.sleep(65)
-                continue
-            raise SystemExit("SQL failed (%s): %s" % (e.code, body[:300]))
-    else:
-        raise SystemExit("SQL still rate limited")
-    if isinstance(rows, dict):
-        rows = rows.get("data", rows.get("rows", []))
-    print("  [sql] %d rows" % len(rows), file=sys.stderr)
-    return rows
-
-
-Q_ORBIT = """
-SELECT DISTINCT account_id
-FROM match_player
-WHERE match_id IN (
-    SELECT match_id FROM match_player
-    WHERE account_id IN ({ids})
-      AND match_mode = '{mode}' AND game_mode = 'Normal'
-      AND start_time >= now() - INTERVAL {days} DAY
-)
-"""
-
-
-def expand(ids, label):
-    """
-    One orbit outward. DISTINCT account_id keeps the response small — the
-    intermediate row count would otherwise be matches x 12.
-    """
-    ids = sorted(set(ids))
-    out = set()
-    # size the chunk against the real URL, not the id list alone
-    fixed = len(BASE + "/v1/sql?format=json&query=" +
-                urllib.parse.quote(Q_ORBIT.format(ids="", mode=MATCH_MODE,
-                                                  days=LOOKBACK_DAYS)))
-    per = 12          # ~11 chars per id once encoded, plus the comma
-    chunk = max(50, (MAX_URL - fixed - 100) // per)
-    for i in range(0, len(ids), chunk):
-        part = ids[i:i + chunk]
-        rows = sql(Q_ORBIT.format(ids=",".join(str(a) for a in part),
-                                  mode=MATCH_MODE, days=LOOKBACK_DAYS),
-                   "%s %d-%d of %d" % (label, i + 1, i + len(part), len(ids)))
-        for r in rows:
-            out.add(int(r["account_id"]))
-    return out
-
-
-def hero_stats(ids):
-    """(account, hero) -> {games, wins} over ranked play. Free, batched."""
-    ids = sorted(set(int(a) for a in ids if a))
-    out = {}
-    if not ids:
-        return out
-    base = "%s/v1/players/hero-stats?match_mode=%s" % (BASE, urllib.parse.quote(MATCH_MODE))
-    chunk = max(20, (MAX_URL - len(base) - 40) // 24)
-    for i in range(0, len(ids), chunk):
-        part = ids[i:i + chunk]
-        try:
-            rows = get(base + "".join("&account_ids=%d" % a for a in part), timeout=180)
-        except Exception as e:
-            print("  [hs] chunk failed: %s" % e, file=sys.stderr)
-            continue
-        for r in rows or []:
-            a, h = r.get("account_id"), r.get("hero_id")
-            if a is None or h is None:
-                continue
-            g = r.get("matches_played")
-            if g is None:
-                m = r.get("matches")
-                g = len(m) if isinstance(m, list) else (m or 0)
-            w = r.get("wins") or 0
-            if isinstance(w, list):
-                w = len(w)
-            out[(int(a), int(h))] = {"games": int(g), "wins": int(w)}
-        time.sleep(0.05)
-    return out
-
-
-def quality(ids, stats):
-    """Account-level ranked record for a set of ids."""
-    per = defaultdict(lambda: {"games": 0, "wins": 0})
-    for (a, _h), rec in stats.items():
-        if a in ids:
-            per[a]["games"] += rec["games"]
-            per[a]["wins"] += rec["wins"]
-    wr = [v["wins"] / v["games"] for v in per.values() if v["games"] >= 10]
-    gm = [v["games"] for v in per.values() if v["games"]]
-    return {
-        "with_ranked_games": len(gm),
-        "with_10plus": len(wr),
-        "median_games": statistics.median(gm) if gm else None,
-        "median_winrate": round(statistics.median(wr), 3) if wr else None,
-        "p90_winrate": round(sorted(wr)[int(0.9 * len(wr))], 3) if wr else None,
-        "over_55pct": sum(1 for x in wr if x > 0.55),
-        "over_60pct": sum(1 for x in wr if x > 0.60),
-    }
+def read(name, required=True):
+    path = os.path.join(OUT, name)
+    if not os.path.exists(path):
+        if required:
+            raise SystemExit("missing %s — run the pipeline first" % path)
+        return []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        return list(csv.DictReader(f))
 
 
 def main():
-    os.makedirs(OUT, exist_ok=True)
-    cpath = os.path.join("output", "ceiling.csv")
-    if not os.path.exists(cpath):
-        raise SystemExit("no output/ceiling.csv — run the pipeline first")
-    seeds = []
-    for r in csv.DictReader(open(cpath, newline="", encoding="utf-8-sig")):
-        if r.get("region") != REGION:
+    cands = read("candidates.csv")
+    if "source" not in cands[0]:
+        raise SystemExit("candidates.csv has no `source` column — pipeline is "
+                         "older than the orbit fill")
+
+    # (region, hero) -> {"orbit": {match_ids}, "board": {match_ids}}
+    groups = defaultdict(lambda: {"orbit": set(), "board": set()})
+    seeds_met = defaultdict(list)
+    for r in cands:
+        key = (r["region"], r["hero"])
+        mid = (r.get("last_match_id") or "").strip()
+        if not mid:
             continue
-        a = (r.get("account_id") or "").strip()
-        if a.isdigit():
-            seeds.append(int(a))
-    seeds = sorted(set(seeds))[:SEEDS]
-    if not seeds:
-        raise SystemExit("no ceiling accounts for %s" % REGION)
+        which = "orbit" if (r.get("source") or "") == "orbit" else "board"
+        groups[key][which].add(mid)
+        if which == "orbit":
+            v = (r.get("orbit_seeds_met") or "").strip()
+            if v.isdigit():
+                seeds_met[key].append(int(v))
 
-    report = {"region": REGION, "lookback_days": LOOKBACK_DAYS,
-              "orbit0": len(seeds)}
-    print("[orbit 0] %d ceiling accounts" % len(seeds), file=sys.stderr)
+    # source_items.csv is the pipeline's own postgame holdings split by where
+    # the build came from — aggregate, no account ids. item_frequency.csv
+    # cannot answer this because it pools both sources together.
+    src = read("source_items.csv", required=False)
+    have_builds = bool(src)
+    # item -> how many builds of that source held it, so a threshold can be
+    # applied at whatever sample size the comparison is run at
+    counts = defaultdict(dict)
+    for r in src:
+        counts[(r["region"], r["hero"], r["source"])][r["item_id"]] = int(r["count"])
 
-    orbits = [set(seeds)]
-    seen = set(seeds)
-    for k in range(1, ORBITS + 1):
-        print("[orbit %d] expanding from %d accounts" % (k, len(orbits[-1])),
+    def jac(a, b):
+        u = len(a | b)
+        return len(a & b) / u if u else None
+
+    def at_least(d, k):
+        return {i for i, c in d.items() if c >= k}
+
+    def baseline(hero_key, n_small, n_large):
+        """
+        Board-vs-board at the same sizes. source_items.csv is aggregated, so
+        the two halves cannot be drawn from real builds — instead each item is
+        kept with probability proportional to how often it appeared, which
+        reproduces the thresholding effect that drives the jaccard down.
+        """
+        d = counts.get(hero_key + ("board",), {})
+        tot = sum(1 for _ in d) and max(
+            (c for c in d.values()), default=0)
+        if not d or not tot:
+            return None
+        out = []
+        for _ in range(TRIALS):
+            ha, hb = {}, {}
+            for i, c in d.items():
+                # split c holdings between two halves binomially
+                a = sum(1 for _ in range(c) if random.random() < 0.5)
+                ha[i], hb[i] = a, c - a
+            sa = at_least(ha, 2)
+            sb = at_least(hb, 2)
+            v = jac(sa, sb)
+            if v is not None:
+                out.append(v)
+        return sum(out) / len(out) if out else None
+
+    rows = []
+    for (rg, hero), g in sorted(groups.items()):
+        n_o, n_b = len(g["orbit"]), len(g["board"])
+        rec = {
+            "region": rg, "hero": hero,
+            "orbit_builds": n_o, "board_builds": n_b,
+            "orbit_share": round(100.0 * n_o / max(n_o + n_b, 1), 1),
+            "mean_seeds_met": round(sum(seeds_met[(rg, hero)]) /
+                                    len(seeds_met[(rg, hero)]), 2)
+                              if seeds_met[(rg, hero)] else "",
+            "jaccard": "", "baseline": "", "vs_baseline": "",
+            "orbit_only": "", "board_only": "",
+        }
+        if have_builds and n_o and n_b:
+            oi = at_least(counts.get((rg, hero, "orbit"), {}), 2)
+            bi = at_least(counts.get((rg, hero, "board"), {}), 2)
+            v = jac(oi, bi)
+            rec["jaccard"] = round(v, 3) if v is not None else ""
+            rec["orbit_only"] = len(oi - bi)
+            rec["board_only"] = len(bi - oi)
+            base = baseline((rg, hero), min(n_o, n_b), max(n_o, n_b))
+            rec["baseline"] = round(base, 3) if base is not None else ""
+            if base and v is not None:
+                # above 1.0 means the two sources agree MORE than two halves
+                # of the board pool agree with each other
+                rec["vs_baseline"] = round(v / base, 2)
+        rows.append(rec)
+
+    cols = ["region", "hero", "board_builds", "orbit_builds", "orbit_share",
+            "mean_seeds_met", "jaccard", "baseline", "vs_baseline",
+            "orbit_only", "board_only"]
+    path = os.path.join(OUT, "orbit_audit.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+
+    tot_o = sum(r["orbit_builds"] for r in rows)
+    tot_b = sum(r["board_builds"] for r in rows)
+    touched = [r for r in rows if r["orbit_builds"]]
+    print("  -> %s (%d hero-regions)" % (path, len(rows)), file=sys.stderr)
+    print("  [orbit] %d of %d builds are orbit-sourced (%.1f%%), across %d "
+          "hero-regions" % (tot_o, tot_o + tot_b,
+                            100.0 * tot_o / max(tot_o + tot_b, 1), len(touched)),
+          file=sys.stderr)
+    if touched:
+        worst = sorted(touched, key=lambda r: -r["orbit_share"])[:8]
+        print("  [orbit] most orbit-dependent:", file=sys.stderr)
+        for r in worst:
+            print("     %-9s %-14s %2d board / %2d orbit  (%.0f%%)  seeds met %s"
+                  % (r["region"], r["hero"], r["board_builds"], r["orbit_builds"],
+                     r["orbit_share"], r["mean_seeds_met"]), file=sys.stderr)
+    js = [r["jaccard"] for r in rows if isinstance(r["jaccard"], float)]
+    bs = [r["baseline"] for r in rows if isinstance(r.get("baseline"), float)]
+    vb = [r["vs_baseline"] for r in rows if isinstance(r.get("vs_baseline"), float)]
+    if js:
+        js.sort()
+        print("  [orbit] jaccard orbit vs board : min %.2f  median %.2f  max %.2f"
+              % (js[0], js[len(js) // 2], js[-1]), file=sys.stderr)
+    if bs:
+        bs.sort()
+        print("  [orbit] jaccard board vs board : min %.2f  median %.2f  max %.2f"
+              "   <- the noise floor" % (bs[0], bs[len(bs) // 2], bs[-1]),
               file=sys.stderr)
-        got = expand(orbits[-1], "orbit%d" % k)
-        fresh = got - seen
-        seen |= got
-        orbits.append(fresh)
-        report["orbit%d" % k] = {"reached": len(got), "new": len(fresh),
-                                 "cumulative": len(seen)}
-        print("  [orbit %d] %d reached, %d new, %d cumulative"
-              % (k, len(got), len(fresh), len(seen)), file=sys.stderr)
-        if not fresh:
-            break
-
-    report["sql_calls"] = _sql_calls[0]
-    report["growth"] = [len(o) for o in orbits]
-
-    # ---- quality by orbit ------------------------------------------------
-    print("[quality] hero-stats per orbit", file=sys.stderr)
-    q = {}
-    sampled = set()
-    for k, o in enumerate(orbits):
-        s = sorted(o)[:QUALITY_SAMPLE]
-        sampled |= set(s)
-    stats = hero_stats(sampled)
-    for k, o in enumerate(orbits):
-        s = set(sorted(o)[:QUALITY_SAMPLE])
-        q["orbit%d" % k] = quality(s, stats)
-    report["quality"] = q
-
-    # ---- coverage of thin hero-regions ----------------------------------
-    thin = []
-    for r in csv.DictReader(open(cpath, newline="", encoding="utf-8-sig")):
-        if r.get("region") != REGION:
-            continue
-        try:
-            if int(r.get("scored_candidates") or 0) < 8:
-                thin.append((int(r["hero_id"]), r["hero"],
-                             int(r.get("scored_candidates") or 0)))
-        except ValueError:
-            continue
-    cov = []
-    for hid, hero, cur in thin:
-        n = sum(1 for (a, h), rec in stats.items()
-                if h == hid and rec["games"] >= 5 and a in sampled)
-        cov.append({"hero": hero, "current": cur, "in_orbit_sample": n})
-    report["thin_coverage"] = cov
-
-    json.dump(report, open(os.path.join(OUT, "orbits.json"), "w"), indent=2)
-
-    print("\n=== Q1  orbit sizes (%s, %d-day window) ===" % (REGION, LOOKBACK_DAYS))
-    print("  orbit 0 (seeds)   %6d" % len(orbits[0]))
-    for k in range(1, len(orbits)):
-        b = report["orbit%d" % k]
-        print("  orbit %d           %6d new   (%d reached, %d cumulative)"
-              % (k, b["new"], b["reached"], b["cumulative"]))
-    print("  SQL calls used: %d" % _sql_calls[0])
-
-    print("\n=== Q2  does standing decay with distance? ===")
-    print("  %-9s %-8s %-9s %-9s %-9s %s"
-          % ("orbit", "sampled", "med games", "med wr", "p90 wr", ">60%"))
-    for k in range(len(orbits)):
-        b = q["orbit%d" % k]
-        print("  %-9d %-8s %-9s %-9s %-9s %s"
-              % (k, b["with_ranked_games"], b["median_games"], b["median_winrate"],
-                 b["p90_winrate"], b["over_60pct"]))
-    print("  -> orbit 2 looking like orbit 1 means distance carries no signal")
-
-    print("\n=== Q3  thin hero-regions, candidates in the orbit sample ===")
-    for c in sorted(cov, key=lambda c: c["current"])[:12]:
-        print("  %-14s current %-3d  in sample %d" % (c["hero"], c["current"],
-                                                      c["in_orbit_sample"]))
-    print("\nwrote %s/orbits.json" % OUT)
+    if vb:
+        vb.sort()
+        print("  [orbit] ratio to baseline      : median %.2f  (1.00 means the "
+              "two sources are indistinguishable)" % vb[len(vb) // 2],
+              file=sys.stderr)
+    else:
+        print("  [orbit] no per-build item file, so item overlap was not "
+              "computed — only the build split is reported", file=sys.stderr)
 
 
 if __name__ == "__main__":
