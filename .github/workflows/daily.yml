@@ -105,6 +105,16 @@ jobs:
         continue-on-error: true
         run: python3 build_calc_data.py
 
+      # Reads candidates.csv (account ids, never committed or uploaded) and
+      # source_items.csv, and emits output/orbit_audit.csv — per hero-region
+      # aggregates only. Answers whether orbit-sourced builds actually differ
+      # from board-sourced ones, which is what decides whether a rising orbit
+      # share matters. Zero API calls.
+      - name: Audit the orbit fill
+        if: always()
+        continue-on-error: true
+        run: python3 orbit_audit.py
+
       # docs/ plus archive/ are committed. output/ still stays off the repo:
       # candidates.csv and excluded.csv carry Steam account IDs and display
       # names. Nothing in the archive contains account-level data.
@@ -155,3 +165,5 @@ jobs:
             output/ceiling.csv
             output/ability_frequency.csv
             output/imbue_frequency.csv
+            output/source_items.csv
+            output/orbit_audit.csv
