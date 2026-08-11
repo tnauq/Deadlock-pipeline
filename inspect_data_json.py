@@ -47,10 +47,24 @@ def get(path):
         return json.loads(r.read().decode("utf-8"))
 
 
-def dead_ids_from_assets():
+def stem(class_name):
+    """`upgrade_ammo_scavenger` -> `ammo_scavenger`, so a renamed item's new
+    record can be matched to the old one by what it is rather than its id."""
+    c = (class_name or "").lower()
+    for p in ("upgrade_", "item_"):
+        if c.startswith(p):
+            c = c[len(p):]
+    return c
+
+
+def all_assets():
+    return get("/v1/assets/items")
+
+
+def dead_ids_from_assets(items=None):
     """Every asset id that is disabled or unshopable, by the pipeline's own
     id resolution so the keys line up with what data.json stores."""
-    items = get("/v1/assets/items")
+    items = items if items is not None else all_assets()
     dead = {}
     for it in items:
         v = it.get("id", it.get("item_id"))
@@ -70,6 +84,9 @@ def dead_ids_from_assets():
     print("[assets] %d records, %d disabled/unshopable" % (len(items), len(dead)),
           file=sys.stderr)
     return dead
+
+
+ASSETS = []
 
 
 def main():
@@ -109,7 +126,8 @@ def main():
         print("\n=== 2. DEAD ITEMS (offline: the two known names) ===")
     else:
         try:
-            dead = dead_ids_from_assets()
+            ASSETS[:] = all_assets()
+            dead = dead_ids_from_assets(ASSETS)
         except Exception as e:
             print("\n[warn] assets fetch failed (%s) — falling back to offline mode" % e,
                   file=sys.stderr)
@@ -148,6 +166,51 @@ def main():
         for hslug, snap, name, count in rows:
             hname = (heroes.get(hslug) or {}).get("name", hslug)
             print("    %-14s %-9s %-22s count %s" % (hname, snap, name, count))
+
+    # ---- rename or removal? ----------------------------------------------
+    # A disabled record whose class_name stem also appears on a LIVE record is
+    # a RENAME: Valve forked a new id and left the old one disabled. Then the
+    # held id is genuinely current and only the NAME lookup is wrong — the fix
+    # is to remap, not to drop the rows.
+    #
+    # A stem with no live twin is a real REMOVAL, and counts against it are
+    # either stale or an allowlist leak. Those two want opposite fixes, which
+    # is why this runs before anything is filtered out.
+    print("\n=== 3b. RENAMED, OR ACTUALLY REMOVED? ===")
+    if not ASSETS:
+        print("  (offline — needs the assets fetch, skipped)")
+    else:
+        live = {}
+        for it in ASSETS:
+            v = it.get("id", it.get("item_id"))
+            if v is None:
+                continue
+            if it.get("disabled") or it.get("shopable") is False:
+                continue
+            live.setdefault(stem(it.get("class_name")), []).append(it)
+
+        held = {str(p[1]) for b in regions.values()
+                for cols in (b.get("builds") or {}).values()
+                for lst in (cols or {}).values() for p in lst}
+        for iid in [i for i in present if i in held]:
+            info = present[iid]
+            cls = info.get("class_name")
+            st = stem(cls)
+            twins = [t for t in live.get(st, [])]
+            print("\n  %-12s %s" % (iid, info["name"]))
+            print("    class_name  %s   (stem %r)" % (cls, st))
+            if twins:
+                for t in twins:
+                    tid = t.get("id", t.get("item_id"))
+                    print("    LIVE TWIN   %-12s %-24s cost=%s tier=%s"
+                          % (tid, t.get("name"), t.get("cost"), t.get("item_tier")))
+                print("    -> RENAME. Remap %s -> %s in the item lookup." % (iid, tid))
+            else:
+                near = sorted(k for k in live if st and (st in k or k in st))
+                print("    no live record shares that stem")
+                if near:
+                    print("    nearest stems: %s" % ", ".join(near[:6]))
+                print("    -> REMOVAL. Rows are stale or leaked; dropping them is safe.")
 
     # ---- read ------------------------------------------------------------
     print("\n=== 4. READ ===")
