@@ -59,19 +59,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      # TEMPORARY. probe_item_ids.py was reported present at repo root but the
-      # runner could not open it. Names the ref and sha actually checked out and
-      # lists what is there, which separates "wrong branch" from "filename got
-      # mangled on upload" — mobile file cards have substituted spaces for dots
-      # before. Delete once the probe runs.
-      - name: List repo root
-        if: always()
-        run: |
-          echo "ref: ${GITHUB_REF_NAME}  sha: ${GITHUB_SHA}"
-          ls -la
-          echo "--- anything probe-ish, any depth ---"
-          find . -path ./.git -prune -o -iname '*probe*' -print
-
       # ZERO SQL, no key. /v1/assets/items only. A Haze tile renders as an item
       # removed from the game well outside the 90-day lookback, so the count is
       # real and the LABEL is wrong. Hypothesis: an id collision under the
@@ -91,6 +78,22 @@ jobs:
           PROBE_ITEM: ${{ inputs.probe_item }}
           PROBE_HERO: ${{ inputs.probe_hero }}
         run: python3 probe_item_ids.py
+
+      # ZERO SQL, no key. Reads the COMMITTED docs/data.json — the file the
+      # site actually serves — and cross-references every build against the
+      # disabled/unshopable set from /v1/assets/items. Two dead items appeared
+      # on the site (Ammo Scavenger on Haze, Enduring Spirit on Lady Geist)
+      # with counts that cannot be genuine: both were removed well outside the
+      # 90-day lookback. Two mechanisms produce that and they have opposite
+      # fixes — a carried-forward stale region block, or a shop-id allowlist
+      # laxer than the 156-item catalogue. Region stamps discriminate.
+      # Needs no pipeline run and no output/ directory.
+      - name: Inspect data.json for dead items
+        if: always()
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+        run: python3 inspect_data_json.py
 
       # ZERO SQL, no key. /v1/assets/heroes and /v1/assets/items only, so this
       # is safe in any hour and runs first — nothing downstream depends on it
