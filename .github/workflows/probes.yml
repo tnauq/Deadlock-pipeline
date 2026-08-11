@@ -34,6 +34,16 @@ on:
         required: false
         default: "156"
         type: string
+      probe_item:
+        description: "Item name suspected of being mislabeled (id-collision probe)"
+        required: false
+        default: "ammo scavenger"
+        type: string
+      probe_hero:
+        description: "Hero whose tiles show the suspect item"
+        required: false
+        default: "Haze"
+        type: string
 
 jobs:
   probe:
@@ -48,6 +58,26 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      # ZERO SQL, no key. /v1/assets/items only. A Haze tile renders as an item
+      # removed from the game well outside the 90-day lookback, so the count is
+      # real and the LABEL is wrong. Hypothesis: an id collision under the
+      # pipeline's own `it.get("id", it.get("item_id"))` resolution, where a
+      # dead legacy record overwrites a live name last-write-wins. The dump is
+      # already known to carry 56 unnamed legacy records, 23 cost-9999
+      # alternative-mode items and two items both named "Silencer".
+      #
+      # No collision plus a live record under that name means the item was
+      # RENAMED rather than removed, and the fix is to key on class_name.
+      # Runs first: costs nothing and cannot spoil the budget below.
+      - name: Probe item id collisions
+        if: always()
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+          PROBE_ITEM: ${{ inputs.probe_item }}
+          PROBE_HERO: ${{ inputs.probe_hero }}
+        run: python3 probe_item_ids.py
 
       # ZERO SQL, no key. /v1/assets/heroes and /v1/assets/items only, so this
       # is safe in any hour and runs first — nothing downstream depends on it
