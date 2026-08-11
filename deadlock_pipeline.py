@@ -280,8 +280,25 @@ def load_assets():
                                        for k in (1, 2, 3, 4)]
 
     _assets = _get(BASE + "/v1/assets/items")
+    # DISABLED RECORDS ARE EXCLUDED. Without this the dump's 78
+    # disabled/unshopable upgrades entered `items`, so the `iid not in items`
+    # guard in the aggregation loop never rejected them and four items removed
+    # in May 2025 rendered on the site with counts of 2-4. `by_class` is built
+    # from this same list, so a live item's component_items could also resolve
+    # onto a dead id and put it into the component graph.
+    #
+    # `shopable` is absent on some records; only an explicit False disqualifies.
+    # Anything filtered here now falls to the skipped_abilities branch below,
+    # which prints a count — so the run states plainly whether these ids appear
+    # in match_player at all.
     raw = [it for it in _assets
-           if it.get("type") == "upgrade" and it.get("id") is not None]
+           if it.get("type") == "upgrade" and it.get("id") is not None
+           and not it.get("disabled") and it.get("shopable") is not False]
+    _dead_ids = {int(it["id"]) for it in _assets
+                 if it.get("type") == "upgrade" and it.get("id") is not None
+                 and (it.get("disabled") or it.get("shopable") is False)}
+    print("  [assets] excluded %d disabled/unshopable upgrade records"
+          % len(_dead_ids), file=sys.stderr)
 
     # Hero abilities share the items.item_id space in match_player (PROBES.md
     # finding 6). They used to be discarded as noise; they are the ability
@@ -351,7 +368,7 @@ def load_assets():
     print("  [assets] icons: %d/%d heroes, %d/%d items"
           % (sum(1 for v in hero_icon.values() if v), len(heroes), have_icons, len(items)),
           file=sys.stderr)
-    return heroes, hero_icon, items, component_of, abilities, hero_sigs
+    return heroes, hero_icon, items, component_of, abilities, hero_sigs, _dead_ids
 
 
 # --------------------------------------------------------------------------
@@ -693,7 +710,7 @@ def main():
     excluded = []
 
     print("[1/5] assets", file=sys.stderr)
-    heroes, hero_icon, items, component_of, abilities, hero_sigs = load_assets()
+    heroes, hero_icon, items, component_of, abilities, hero_sigs, dead_ids = load_assets()
 
     print("[2/5] ladders (%s), depth %d, target %d per region, exclusivity %s"
           % (", ".join(REGIONS), LEADERBOARD_DEPTH, PER_REGION,
@@ -1191,6 +1208,17 @@ def main():
            # blank for board-sourced rows; "orbit" plus the breadth of contact
            # for anyone the orbit fill supplied
            "source", "orbit_seeds_met"])
+    # A disabled id reaching this point means the filter in load_assets() has
+    # been bypassed or the asset dump changed shape. Fail loudly: shipping a
+    # dead item quietly is exactly what happened before, and it survived
+    # several runs because nothing ever objected.
+    _leaked = sorted({r["item_id"] for r in freq if r["item_id"] in dead_ids})
+    if _leaked:
+        raise SystemExit(
+            "%d disabled item id(s) reached item_frequency.csv: %s\n"
+            "load_assets() should have excluded these. Not writing CSVs."
+            % (len(_leaked), ", ".join(str(i) for i in _leaked[:12])))
+
     write("item_frequency.csv", freq,
           ["hero_id", "hero", "region", "snapshot", "item_id", "item", "category", "tier",
            "count", "of_builds", "icon_url"])
