@@ -59,6 +59,19 @@ jobs:
         with:
           python-version: "3.12"
 
+      # TEMPORARY. probe_item_ids.py was reported present at repo root but the
+      # runner could not open it. Names the ref and sha actually checked out and
+      # lists what is there, which separates "wrong branch" from "filename got
+      # mangled on upload" — mobile file cards have substituted spaces for dots
+      # before. Delete once the probe runs.
+      - name: List repo root
+        if: always()
+        run: |
+          echo "ref: ${GITHUB_REF_NAME}  sha: ${GITHUB_SHA}"
+          ls -la
+          echo "--- anything probe-ish, any depth ---"
+          find . -path ./.git -prune -o -iname '*probe*' -print
+
       # ZERO SQL, no key. /v1/assets/items only. A Haze tile renders as an item
       # removed from the game well outside the 90-day lookback, so the count is
       # real and the LABEL is wrong. Hypothesis: an id collision under the
