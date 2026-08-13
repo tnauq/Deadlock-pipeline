@@ -7,7 +7,9 @@ Candidates are the top qualifying players from each region's hero ladder
 data come from SQL.
 
 Outputs (./output/):
-    tierlist.csv         heroes ranked by their pool's pooled win rate ON THE HERO
+    tierlist.csv         heroes ranked by decay-weighted pool net wins, with
+                         pooled win rate ON THE HERO as the tiebreak
+    pool_audit.csv       sampled players at or below POOL_LOW_NET_WINS net wins
     candidates.csv       the sampled players, per hero per region
     item_frequency.csv   hold rates per hero per net-worth snapshot
     hero_splits.csv      V/G/S soul share and split classification, per snapshot
@@ -148,6 +150,34 @@ ORBIT_SORT = os.environ.get("ORBIT_SORT", "breadth")
 # Unkeyed /v1/sql allows 2 req/min AND 20 req/hr (SCHEMA.md quirk #5). The
 # hourly cap is the binding one for chunked queries — it is what killed the
 # 2026-07-31 runs at chunk 21 both times. An X-API-Key raises this.
+# ---- recency decay + pool net wins ---------------------------------------
+# net wins = wins - losses = games x (2p - 1). It is CUMULATIVE, so a nerfed
+# hero keeps every win already banked and only stops adding to the pile; it
+# cannot fall. A heavily nerfed hero therefore holds its rank until a rival
+# accumulates an equal total from scratch, which at ~300 games per
+# hero-region takes most of a lookback window.
+#
+# Fix: weight each ranked game by 0.5 ** (age_days / DECAY_HALFLIFE_DAYS), so
+# a game today counts 1.0 and one a half-life ago counts 0.5. Decayed net
+# wins can FALL, because post-patch losses arrive at full weight while the
+# pre-patch stock is already discounted. Set DECAY_HALFLIFE_DAYS=0 to
+# disable and fall back to the flat count.
+#
+# Half-life choice: 14 days puts a 90-day-old game at 1.2% of a fresh one and
+# reaches 90% of its response to a patch in ~46 days. Shorter reacts faster
+# and is noisier.
+DECAY_HALFLIFE_DAYS = float(os.environ.get("DECAY_HALFLIFE_DAYS") or 14)
+# Ranked only, regardless of what MATCH_MODE is set to for the item queries.
+# Net wins is a ladder-success statistic and unranked games do not belong in
+# it. Empty string would mean "no filter", which is NOT what is wanted here.
+DECAY_MATCH_MODE = os.environ.get("DECAY_MATCH_MODE") or "Ranked"
+# Costs 1-3 SQL calls against the 20/hr cap. Set 0 to skip; tierlist then
+# keeps elite_winrate as the primary sort.
+POOL_NET_WINS = _env("POOL_NET_WINS", 1)
+# Pool players at or below this net-wins figure are listed in pool_audit.csv.
+# 0 means "has lost at least as often as won on the hero", which is the case
+# worth eyeballing: an elite pool should not contain break-even players.
+POOL_LOW_NET_WINS = _env("POOL_LOW_NET_WINS", 0)
 HOURLY_SQL_BUDGET = _env("HOURLY_SQL_BUDGET", 20)
 OUT_DIR = "output"
 
@@ -577,6 +607,58 @@ def fetch_orbit1(seed_ids):
     return out
 
 
+Q_POOL_WINS = """
+SELECT account_id,
+       hero_id,
+       count()    AS g,
+       sum(won)   AS w,
+       sum(pow(0.5, dateDiff('day', start_time, now()) / {hl}))       AS wg,
+       sum(won * pow(0.5, dateDiff('day', start_time, now()) / {hl})) AS ww
+FROM match_player
+WHERE match_mode = '{mode}'
+  AND start_time >= now() - INTERVAL {days} DAY
+  AND (account_id, hero_id) IN ({pairs})
+GROUP BY account_id, hero_id
+"""
+
+
+def fetch_pool_wins(pairs):
+    """Ranked games/wins per sampled (account, hero), raw and decay-weighted.
+
+    Chunked under MAX_URL exactly like query_items. Returns
+    (account_id, hero_id) -> {"g","w","wg","ww"}. hero_stats already gives a
+    raw record, but it is unweighted and its match_mode handling is the API's
+    rather than ours, so the ranked-only guarantee is asserted here in SQL.
+    """
+    hl = DECAY_HALFLIFE_DAYS if DECAY_HALFLIFE_DAYS > 0 else 1e9
+    out, chunk, i = {}, max(20, MAX_URL // 22), 0
+    pairs = sorted(set(pairs))
+    while i < len(pairs):
+        part = pairs[i:i + chunk]
+        body = ",".join("(%d,%d)" % (a, h) for a, h in part)
+        q = Q_POOL_WINS.format(hl=hl, mode=DECAY_MATCH_MODE,
+                               days=LOOKBACK_DAYS, pairs=body)
+        n = len(sql_url(q))
+        if n > MAX_URL:
+            if chunk <= 20:
+                raise SystemExit(
+                    "pool-wins chunk of %d pairs is %d chars, over the %d limit."
+                    % (len(part), n, MAX_URL))
+            fixed = len(sql_url(Q_POOL_WINS.format(hl=hl, mode=DECAY_MATCH_MODE,
+                                                   days=LOOKBACK_DAYS, pairs="")))
+            per = max((n - fixed) / len(part), 1.0)
+            chunk = max(20, min(chunk - 1, int((MAX_URL - fixed) / per * 0.97)))
+            continue
+        rows = sql(q, "pool wins %d-%d of %d" % (i + 1, i + len(part), len(pairs)))
+        for r in rows:
+            out[(int(r["account_id"]), int(r["hero_id"]))] = {
+                "g": int(float(r["g"])), "w": int(float(r["w"])),
+                "wg": float(r["wg"]), "ww": float(r["ww"]),
+            }
+        i += len(part)
+    return out
+
+
 def fetch_hero_stats(account_ids):
     """Per (account, hero) ranked stats for every candidate. No SQL."""
     ids = sorted(account_ids)
@@ -899,6 +981,65 @@ def main():
         print("  [orbit] added %d builds across all short hero-regions"
               % orbit_added, file=sys.stderr)
 
+    # ---- pool net wins, ranked only, with recency decay -------------------
+    # Attaches to every sampled player BEFORE the tier rollup, so the tier
+    # statistic and the per-player audit come from the same numbers.
+    pool_low = []
+    if POOL_NET_WINS:
+        pw_pairs = [(c["account_id"], hid)
+                    for hid, lst in chosen.items() for c in lst]
+        print("[3b/5] pool net wins (%d players, %s only, half-life %s d)"
+              % (len(pw_pairs), DECAY_MATCH_MODE,
+                 DECAY_HALFLIFE_DAYS or "off"), file=sys.stderr)
+        try:
+            pw = fetch_pool_wins(pw_pairs)
+        except SystemExit:
+            raise
+        except Exception as e:
+            print("  [pool] failed (%s) - continuing without decay" % e,
+                  file=sys.stderr)
+            pw = {}
+        missing = 0
+        for hid, lst in chosen.items():
+            for c in lst:
+                v = pw.get((c["account_id"], hid))
+                if not v:
+                    missing += 1
+                    # No ranked rows in the window. Recorded as blank, NOT as
+                    # zero: zero would read as "played and broke even" and
+                    # would drag the hero's total down as if it were a real
+                    # break-even record.
+                    c["ranked_games"] = c["ranked_wins"] = ""
+                    c["net_wins"] = c["net_wins_decayed"] = ""
+                    continue
+                g, w = v["g"], v["w"]
+                c["ranked_games"], c["ranked_wins"] = g, w
+                c["net_wins"] = w - (g - w)
+                c["net_wins_decayed"] = round(2 * v["ww"] - v["wg"], 2)
+                c["_wg"], c["_ww"] = v["wg"], v["ww"]
+                if c["net_wins"] <= POOL_LOW_NET_WINS:
+                    pool_low.append(dict(
+                        hero=heroes.get(hid, ""), hero_id=hid,
+                        region=c["region"], account_id=c["account_id"],
+                        account_name=c.get("account_name", ""),
+                        source=c.get("source", "board"),
+                        orbit_seeds_met=c.get("orbit_seeds_met", ""),
+                        ranked_games=g, ranked_wins=w,
+                        net_wins=c["net_wins"],
+                        net_wins_decayed=c["net_wins_decayed"],
+                        ranked_rating=c["ranked_rating"]))
+        if missing:
+            print("  [pool] %d of %d sampled players had no ranked rows in the "
+                  "%d-day window" % (missing, len(pw_pairs), LOOKBACK_DAYS),
+                  file=sys.stderr)
+        if pool_low:
+            byhero = Counter(r["hero"] for r in pool_low)
+            bysrc = Counter(r["source"] for r in pool_low)
+            print("  [pool] %d players at or below %d net wins (%s); worst "
+                  "heroes: %s" % (len(pool_low), POOL_LOW_NET_WINS,
+                                  dict(bysrc), dict(byhero.most_common(5))),
+                  file=sys.stderr)
+
     wanted = [(c["last_match_id"], c["account_id"])
               for lst in chosen.values() for c in lst]
     # which region each sampled build came from, so item frequencies can be
@@ -1137,6 +1278,17 @@ def main():
         og = sum(c["offhero_games"] for c in thick)
         ow = sum(c["offhero_wins"] for c in thick)
         hero_wr, off_wr = _wr(w, g), _wr(ow, og)
+        # Pooled ranked record. Blank entries (no ranked rows in the window)
+        # are skipped rather than counted as 0-0.
+        rk = [c for c in lst if c.get("ranked_games") not in (None, "")]
+        rg_ = sum(c["ranked_games"] for c in rk)
+        rw_ = sum(c["ranked_wins"] for c in rk)
+        net = rw_ - (rg_ - rw_)
+        wg_ = sum(c.get("_wg", 0.0) for c in rk)
+        ww_ = sum(c.get("_ww", 0.0) for c in rk)
+        net_dec = 2 * ww_ - wg_
+        # Effective sample size after weighting, for the decayed win rate's SE.
+        dec_wr = _wr(ww_, wg_) if wg_ else None
         top5 = [c["ranked_rating"] for c in by_rating[:5]]
         per_reg = {rg: sum(1 for c in lst if c["region"] == rg) for rg in REGIONS}
         tier.append({"hero_id": hid, "hero": heroes.get(hid, ""),
@@ -1144,6 +1296,15 @@ def main():
                      "top5_rating": round(sum(top5) / len(top5), 4),
                      "median_rating": round(
                          sorted(c["ranked_rating"] for c in lst)[len(lst) // 2], 4),
+                     "net_wins_decayed": round(net_dec, 1) if rk else "",
+                     "net_wins": net if rk else "",
+                     "ranked_games": rg_, "ranked_wins": rw_,
+                     "decayed_winrate": round(dec_wr, 2) if dec_wr is not None else "",
+                     "decayed_games": round(wg_, 1),
+                     "decayed_se": round(_se(wg_), 2) if wg_ else "",
+                     "pool_players_rated": len(rk),
+                     "pool_low_net_wins": sum(
+                         1 for c in rk if c["net_wins"] <= POOL_LOW_NET_WINS),
                      "elite_winrate": round(hero_wr, 2) if hero_wr is not None else "",
                      "elite_games": g,
                      "elite_se": round(_se(g), 2) if g else "",
@@ -1164,8 +1325,19 @@ def main():
                      "lane_role": {"GS": "damage"}.get(
                          early.get(hid, {}).get("split", ""), "frontline/support"),
                      "icon_url": hero_icon.get(hid, "")})
-    # ranked by pooled elite win rate: badge saturates at the top, win rate does not
-    tier.sort(key=lambda d: -(d["elite_winrate"] or 0))
+    # PRIMARY: decay-weighted net wins. Win rate is the TIEBREAK, not the
+    # ranking statistic — a flat net-wins total cannot fall after a nerf, so
+    # the decayed figure is what is sorted on. If the decay/pool query was
+    # skipped or failed there is nothing to sort on, so fall back to win rate.
+    def _sortkey(d):
+        primary = d.get("net_wins_decayed")
+        primary = primary if primary not in (None, "") else -1e9
+        return (-primary, -(d["elite_winrate"] or 0))
+
+    if POOL_NET_WINS and any(t.get("net_wins_decayed") not in (None, "") for t in tier):
+        tier.sort(key=_sortkey)
+    else:
+        tier.sort(key=lambda d: -(d["elite_winrate"] or 0))
     for i, t in enumerate(tier, 1):
         t["rank"] = i
     # a second ordering, by how much the pool outperforms its own off-hero baseline
@@ -1190,7 +1362,11 @@ def main():
         print("  [warn] could not write items_manifest.json (%s)" % e, file=sys.stderr)
 
     write("tierlist.csv", tier,
-          ["rank", "hero_id", "hero", "elite_winrate", "elite_games", "elite_se",
+          ["rank", "hero_id", "hero",
+           "net_wins_decayed", "net_wins", "decayed_winrate", "decayed_games",
+           "decayed_se", "ranked_games", "ranked_wins",
+           "pool_players_rated", "pool_low_net_wins",
+           "elite_winrate", "elite_games", "elite_se",
            "offhero_winrate", "offhero_games", "offhero_players",
            "winrate_delta", "delta_se", "delta_rank",
            "lane_split", "lane_weak", "lane_role", "median_rating", "top5_rating",
@@ -1203,11 +1379,19 @@ def main():
            for c in sorted(lst, key=lambda x: -x["ranked_rating"])],
           ["hero_id", "hero", "region", "ladder_pos", "account_id", "account_name",
            "ranked_rating", "hero_games", "hero_wins",
+           "ranked_games", "ranked_wins", "net_wins", "net_wins_decayed",
            "offhero_games", "offhero_wins",
            "last_match_id", "last_played", "ambiguous",
            # blank for board-sourced rows; "orbit" plus the breadth of contact
            # for anyone the orbit fill supplied
            "source", "orbit_seeds_met"])
+    if POOL_NET_WINS:
+        write("pool_audit.csv",
+              sorted(pool_low, key=lambda r: (r["net_wins"], r["hero"])),
+              ["hero", "hero_id", "region", "account_id", "account_name",
+               "source", "orbit_seeds_met", "ranked_games", "ranked_wins",
+               "net_wins", "net_wins_decayed", "ranked_rating"])
+
     # A disabled id reaching this point means the filter in load_assets() has
     # been bypassed or the asset dump changed shape. Fail loudly: shipping a
     # dead item quietly is exactly what happened before, and it survived
