@@ -44,12 +44,37 @@ rather than a ranking one. Under progression, accumulated net wins IS rank, so
 the two coincide. The shrunk-win-rate figures converge on net wins from below
 as k rises, which is why bigger k scored better; they were approximating it.
 
+WHY NET WINS IS NOT A PROXY
+---------------------------
+A ranked win is about +250 Rank Points and a loss about -250; 1000 RP buys a
+Subrank, 2000 for the last one before a new Rank. Accumulated RP is therefore
+roughly 250 x net wins, so net wins is a RESCALED COPY OF THE CURRENCY, not a
+correlate of it. That is the real reason the concordance table above came out
+the way it did, and it is why DECAY MUST NOT BE APPLIED HERE: a decayed
+net-wins figure corresponds to no rank any player holds.
+
+Two known biases, both directional and neither correctable from the data:
+
+    loss protection   5 games at a full-Rank boundary, 2 at a Subrank
+                      boundary. Those losses subtract from net wins but cost
+                      no real rank, so net wins UNDERSTATES the badge of
+                      players who park at boundaries rather than climb.
+    streak bonuses    wins on a streak award more than 250, so net wins
+                      UNDERSTATES fast climbers.
+
+Both push the same way, and together they are what makes the system
+INFLATIONARY: even a 50:50 player climbs eventually. Inflation is harmless for
+an ORDERING as long as everyone inflates on the same schedule — which is
+exactly what stops being true at Eternus, where thresholds move relatively so
+the inflation cancels out instead of carrying everyone upward.
+
 *** THIS METRIC HAS AN EXPIRY. *** At Eternus the system reverts to percentile
 ranking, where inflation stops moving anyone and net wins decouples from rank.
 One player is at Eternus as of 2026-08-07. When enough arrive that the top is
 percentile-ranked, `ceiling_value()` below is the single function to replace.
 Badge is not expected to return: it reads 0 across every ranked row, and being
 a team average it would be non-zero if any Eternus player were in the lobby.
+The Eternus watch below is what tells you when that day has come.
 
 WHAT THE BOARD IS STILL FOR
 ---------------------------
@@ -129,6 +154,42 @@ ORBIT_MIN_HERO_GAMES = int(os.environ.get("ORBIT_MIN_HERO_GAMES") or 5)
 # Costs no extra API calls — the full board is already fetched.
 BOARD_ARCHIVE_TOP = int(os.environ.get("BOARD_ARCHIVE_TOP") or 100)
 
+# ---- Eternus watch --------------------------------------------------------
+# ceiling_value() is valid only while the ladder is a progression system. At
+# Eternus I the Subrank thresholds stop being fixed and are recomputed daily on
+# a PERCENTILE basis, at which point inflation stops carrying anyone upward and
+# net wins decouples from rank.
+#
+# badge_level cannot detect this: it reads blank on every row. The board's own
+# `ranked_rank` field is already fetched and thrown away, and it is the
+# surviving signal, so it is counted here instead.
+#
+# Rank names in board order; Eternus is last. The field may come back as a
+# rank index, a name, or a badge-style int (rank*10 + subrank) — _rank_name()
+# normalises all three.
+RANK_NAMES = ["Obscurus", "Initiate", "Seeker", "Alchemist", "Arcanist",
+              "Ritualist", "Emissary", "Archon", "Oracle", "Phantom",
+              "Ascendant", "Eternus"]
+# Share of ranked board entries at Eternus that trips the warning.
+ETERNUS_WARN_SHARE = float(os.environ.get("ETERNUS_WARN_SHARE") or 0.02)
+
+
+def _rank_name(v):
+    """Board rank value -> rank name, or '' if it cannot be read."""
+    if v is None or v == "":
+        return ""
+    if isinstance(v, str) and not v.strip().lstrip("-").isdigit():
+        return v.strip().split()[0]
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return ""
+    if n <= 0:
+        return ""
+    # a badge-style value carries the subrank in the ones digit
+    idx = n // 10 if n >= 10 else n
+    return RANK_NAMES[idx] if 0 <= idx < len(RANK_NAMES) else ""
+
 
 def get(url):
     req = urllib.request.Request(url, headers={"User-Agent": "deadlock-ceiling/1.0"})
@@ -169,6 +230,7 @@ def fetch_board(region):
         ordered.append({
             "pos": i + 1,
             "name": name,
+            "ranked_rank": e.get("ranked_rank"),
             "top_heroes": e.get("top_hero_ids") or [],
             # CANDIDATE list, not an identity — one name can carry 30+ ids.
             # Only trustworthy once cross-checked against a resolved pool
@@ -179,6 +241,36 @@ def fetch_board(region):
     print("  [board] %-9s %d entries, %d named, depth %d"
           % (region, len(entries), sum(len(v) for v in by_name.values()), len(entries)),
           file=sys.stderr)
+
+    # ---- Eternus watch, from ranked_rank -----------------------------------
+    ranks = Counter(_rank_name(e.get("ranked_rank")) for e in entries)
+    ranks.pop("", None)
+    n_rank = sum(ranks.values())
+    if n_rank:
+        top = ", ".join(
+            "%s=%d" % (k, v) for k, v in
+            sorted(ranks.items(),
+                   key=lambda kv: -(RANK_NAMES.index(kv[0])
+                                    if kv[0] in RANK_NAMES else -1))[:4])
+        print("  [rank]  %-9s %d of %d entries carry a rank; top: %s"
+              % (region, n_rank, len(entries), top), file=sys.stderr)
+        n_et = ranks.get("Eternus", 0)
+        if n_et:
+            share = n_et / n_rank
+            print("  [eternus] %-9s %d entries at Eternus (%.2f%% of ranked entries)"
+                  % (region, n_et, 100 * share), file=sys.stderr)
+            if share >= ETERNUS_WARN_SHARE:
+                print("  [eternus] *** %s is at %.1f%%, over the %.1f%% threshold. "
+                      "Eternus is percentile-ranked, so net wins is decoupling "
+                      "from rank — ceiling_value() needs replacing. See the "
+                      "module docstring. ***"
+                      % (region, 100 * share, 100 * ETERNUS_WARN_SHARE),
+                      file=sys.stderr)
+    else:
+        print("  [rank]  %-9s no readable ranked_rank on any entry — Eternus "
+              "cannot be detected from the board this run" % region,
+              file=sys.stderr)
+
     return by_name, len(entries), ordered
 
 
@@ -225,6 +317,7 @@ def all_on_board(hero_entries, by_name):
                     "pos": cand["pos"],
                     "hero_pos": he["hero_pos"],
                     "badge": cand["badge"],
+                    "ranked_rank": cand.get("ranked_rank"),
                     "top_heroes": cand["top_heroes"],
                 })
                 break
@@ -376,8 +469,14 @@ def ceiling_value(rec):
     """
     THE ORDERING. Net wins over ranked play: wins minus losses.
 
+    This is not a proxy for rank, it is the currency rescaled: a win is about
+    +250 Rank Points, a loss about -250, and 1000 RP buys a Subrank, so
+    accumulated RP is roughly 250 x this number. DO NOT decay it — a decayed
+    figure corresponds to no rank any player holds.
+
     Replace this one function when the ladder stops being progression-based —
-    see the module docstring. Everything else keys off whatever it returns.
+    see the module docstring, and watch the [eternus] lines in the log.
+    Everything else keys off whatever it returns.
     """
     return 2 * rec["wins"] - rec["games"]
 
@@ -491,7 +590,8 @@ def main():
                 pool.append({"name": "", "account_id": aid,
                              # no board position: they were not on it
                              "pos": 10 ** 9, "hero_pos": 10 ** 9,
-                             "badge": None, "top_heroes": [],
+                             "badge": None, "ranked_rank": None,
+                             "top_heroes": [],
                              "seeds_met": prox["seeds_met"],
                              "shared": prox["shared"],
                              "hero_games": hrec["games"]})
@@ -528,6 +628,10 @@ def main():
             "region_depth": depth[rg],
             "pct": "" if c["pos"] >= 10 ** 9 else round(100.0 * c["pos"] / max(depth[rg], 1), 3),
             "badge_level": c["badge"],
+            # badge_level reads blank on every ranked row; ranked_rank is the
+            # surviving rank signal and is what the Eternus watch keys off.
+            "ranked_rank": c.get("ranked_rank") if c.get("ranked_rank") is not None else "",
+            "rank_name": _rank_name(c.get("ranked_rank")),
             "hero_ladder_pos": "" if c["hero_pos"] >= 10 ** 9 else c["hero_pos"],
             "match": "orbit" if c.get("seeds_met") else "confirmed",
             "valve_top_hero": "YES" if hid in (c["top_heroes"] or []) else "",
@@ -573,6 +677,7 @@ def main():
     cols = ["region", "ceiling_rank", "hero", "hero_id", "ceiling_player",
             "account_id", "net_wins", "ranked_games", "ranked_wins",
             "shrunk_winrate", "global_pos", "region_depth", "pct", "badge_level",
+            "ranked_rank", "rank_name",
             "hero_ladder_pos", "match", "valve_top_hero", "located_on_general",
             "scored_candidates", "from_orbit", "ceiling_from_orbit",
             "orbit_seeds_met", "orbit_hero_games", "board_size", "winrate_rank",
@@ -598,6 +703,30 @@ def main():
                   (d["ceiling_rank"], d["hero"][:12], (d["ceiling_player"] or "?")[:16],
                    d["net_wins"], d["ranked_games"], d["shrunk_winrate"],
                    d["global_pos"] or "orbit"), file=sys.stderr)
+
+    # ---- Eternus watch, at the level that actually matters -----------------
+    # The board-wide share is the early signal; THIS is the one that expires
+    # the metric, because the ordering only breaks once the CEILING PLAYERS
+    # themselves are percentile-ranked.
+    named = [d for d in out if d.get("rank_name")]
+    et = [d for d in named if d["rank_name"] == "Eternus"]
+    if named:
+        print("\n  [eternus] %d of %d ceiling players carry a readable rank; "
+              "%d at Eternus" % (len(named), len(out), len(et)), file=sys.stderr)
+        for d in et:
+            print("    %-9s %-12s %-16s net %d"
+                  % (d["region"], d["hero"], d["ceiling_player"], d["net_wins"]),
+                  file=sys.stderr)
+        if et:
+            print("  [eternus] net wins tracks rank only while the ladder is "
+                  "progression-based. Once a meaningful share of CEILING "
+                  "players sit at Eternus, the top of the ordering is "
+                  "measuring the wrong thing — replace ceiling_value().",
+                  file=sys.stderr)
+    else:
+        print("\n  [eternus] no ceiling player carries a readable rank — watch "
+              "disabled this run (badge_level is blank, and ranked_rank was "
+              "empty or unrecognised)", file=sys.stderr)
 
     dup = defaultdict(list)
     for d in out:
