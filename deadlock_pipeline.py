@@ -166,7 +166,14 @@ ORBIT_SORT = os.environ.get("ORBIT_SORT", "breadth")
 # Half-life choice: 14 days puts a 90-day-old game at 1.2% of a fresh one and
 # reaches 90% of its response to a patch in ~46 days. Shorter reacts faster
 # and is noisier.
-DECAY_HALFLIFE_DAYS = float(os.environ.get("DECAY_HALFLIFE_DAYS") or 14)
+# DEFAULT 0 = OFF. Below Eternus the ladder is a PROGRESSION system: a ranked
+# win is about +250 Rank Points and a loss about -250, with 1000 RP per
+# Subrank, so accumulated RP is roughly 250 x net wins. Net wins is therefore
+# not a proxy for rank — it is a rescaled copy of the currency itself. A
+# decayed net-wins figure corresponds to no rank any player holds, so decay is
+# WRONG for anything meant to track standing. It is left available for
+# exploring hero form, where "recent games only" is the actual question.
+DECAY_HALFLIFE_DAYS = float(os.environ.get("DECAY_HALFLIFE_DAYS") or 0)
 # Ranked only, regardless of what MATCH_MODE is set to for the item queries.
 # Net wins is a ladder-success statistic and unranked games do not belong in
 # it. Empty string would mean "no filter", which is NOT what is wanted here.
@@ -1296,12 +1303,12 @@ def main():
                      "top5_rating": round(sum(top5) / len(top5), 4),
                      "median_rating": round(
                          sorted(c["ranked_rating"] for c in lst)[len(lst) // 2], 4),
-                     "net_wins_decayed": round(net_dec, 1) if rk else "",
-                     "net_wins": net if rk else "",
-                     "ranked_games": rg_, "ranked_wins": rw_,
-                     "decayed_winrate": round(dec_wr, 2) if dec_wr is not None else "",
-                     "decayed_games": round(wg_, 1),
-                     "decayed_se": round(_se(wg_), 2) if wg_ else "",
+                     "pool_net_wins_decayed": round(net_dec, 1) if rk else "",
+                     "pool_net_wins": net if rk else "",
+                     "pool_ranked_games": rg_, "pool_ranked_wins": rw_,
+                     "pool_decayed_winrate": round(dec_wr, 2) if dec_wr is not None else "",
+                     "pool_decayed_games": round(wg_, 1),
+                     "pool_decayed_se": round(_se(wg_), 2) if wg_ else "",
                      "pool_players_rated": len(rk),
                      "pool_low_net_wins": sum(
                          1 for c in rk if c["net_wins"] <= POOL_LOW_NET_WINS),
@@ -1325,19 +1332,17 @@ def main():
                      "lane_role": {"GS": "damage"}.get(
                          early.get(hid, {}).get("split", ""), "frontline/support"),
                      "icon_url": hero_icon.get(hid, "")})
-    # PRIMARY: decay-weighted net wins. Win rate is the TIEBREAK, not the
-    # ranking statistic — a flat net-wins total cannot fall after a nerf, so
-    # the decayed figure is what is sorted on. If the decay/pool query was
-    # skipped or failed there is nothing to sort on, so fall back to win rate.
-    def _sortkey(d):
-        primary = d.get("net_wins_decayed")
-        primary = primary if primary not in (None, "") else -1e9
-        return (-primary, -(d["elite_winrate"] or 0))
-
-    if POOL_NET_WINS and any(t.get("net_wins_decayed") not in (None, "") for t in tier):
-        tier.sort(key=_sortkey)
-    else:
-        tier.sort(key=lambda d: -(d["elite_winrate"] or 0))
+    # NOT the tier ordering. The tier list is ONE player per hero, ranked by
+    # that player's overall account standing, and it is built by
+    # ceiling_rank.py / consumed by build_site_data.py, which orders on
+    # ceiling_rank and ignores this file's ordering entirely.
+    #
+    # A pooled statistic here answers a different question — how the hero's
+    # WHOLE elite cohort does — and briefly sorted this file, which put Vyper
+    # 2nd on the strength of 40 players while its ceiling player sat last at
+    # 8 net wins. The pool columns are RETAINED as a sample-quality
+    # diagnostic (see pool_low_net_wins) and are deliberately not the key.
+    tier.sort(key=lambda d: -(d["elite_winrate"] or 0))
     for i, t in enumerate(tier, 1):
         t["rank"] = i
     # a second ordering, by how much the pool outperforms its own off-hero baseline
@@ -1363,10 +1368,13 @@ def main():
 
     write("tierlist.csv", tier,
           ["rank", "hero_id", "hero",
-           "net_wins_decayed", "net_wins", "decayed_winrate", "decayed_games",
-           "decayed_se", "ranked_games", "ranked_wins",
-           "pool_players_rated", "pool_low_net_wins",
            "elite_winrate", "elite_games", "elite_se",
+           # pool-quality diagnostics, NOT a ranking. Prefixed so nothing
+           # downstream mistakes them for the ceiling player's figures.
+           "pool_net_wins", "pool_net_wins_decayed", "pool_decayed_winrate",
+           "pool_decayed_games", "pool_decayed_se",
+           "pool_ranked_games", "pool_ranked_wins",
+           "pool_players_rated", "pool_low_net_wins",
            "offhero_winrate", "offhero_games", "offhero_players",
            "winrate_delta", "delta_se", "delta_rank",
            "lane_split", "lane_weak", "lane_role", "median_rating", "top5_rating",
