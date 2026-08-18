@@ -76,6 +76,35 @@ Badge is not expected to return: it reads 0 across every ranked row, and being
 a team average it would be non-zero if any Eternus player were in the lobby.
 The Eternus watch below is what tells you when that day has come.
 
+THE RANK FLOOR — added 2026-08-18
+---------------------------------
+Net wins alone is an ACCUMULATION, and accumulation is reachable by volume at
+any rank: a 51% player with 900 ranked games outscores a 60% player with 300.
+Under a progression ladder those two really do hold different badges, so the
+floor exists to keep grinders out of a statistic that is supposed to describe
+the top of a hero's playerbase. A candidate must sit at or above
+CEILING_MIN_RANK (default Phantom) to be eligible to BE a ceiling.
+
+The floor gates ELIGIBILITY only. It does not touch `ceiling_value()`, and the
+ordering among the survivors is unchanged — see the docstring section above for
+why net wins must not be reweighted or decayed.
+
+    *** READ THIS BEFORE TRUSTING THE FLOOR ***
+The only rank signal that reaches this script is the board's `ranked_rank`
+field, and on the 2026-08-18 aggregate run it was EMPTY on all 74 rows —
+`rank_name` was blank for every ceiling player and the Eternus watch reported
+no readable rank at all. `badge_level` is blank too. Applied strictly to that
+data the floor drops every candidate and writes an empty ceiling.csv.
+
+So CEILING_RANK_UNKNOWN decides what an unreadable rank means, and it defaults
+to "keep" — floor the players it can read, pass the ones it cannot, and count
+both in the log and in the CSV. This is deliberately the weak setting: it
+degrades to current behaviour when the field is empty instead of silently
+emptying the output. Set it to "drop" once `ranked_rank` is actually populated,
+and check the [floor] log line to find out whether it is. Orbit candidates were
+never on a board and so ALWAYS have an unknown rank; under "drop" they can
+never be a ceiling, which defeats the fallback below.
+
 WHAT THE BOARD IS STILL FOR
 ---------------------------
 Eligibility and identity, both of which it does fine even unfiltered. Valve's
@@ -173,6 +202,18 @@ RANK_NAMES = ["Obscurus", "Initiate", "Seeker", "Alchemist", "Arcanist",
 # Share of ranked board entries at Eternus that trips the warning.
 ETERNUS_WARN_SHARE = float(os.environ.get("ETERNUS_WARN_SHARE") or 0.02)
 
+# ---- rank floor -----------------------------------------------------------
+# Minimum rank to be eligible as a ceiling. See the docstring section above.
+# Set to "" to disable the floor entirely.
+# `or "Phantom"` would swallow an explicit empty value, so the default is
+# applied only when the variable is genuinely unset — CEILING_MIN_RANK= means
+# OFF, not Phantom.
+_MIN_RANK_ENV = os.environ.get("CEILING_MIN_RANK")
+CEILING_MIN_RANK = ("Phantom" if _MIN_RANK_ENV is None else _MIN_RANK_ENV).strip()
+# What an unreadable rank means: "keep" (default, degrades to no floor when the
+# field is empty) or "drop" (strict — only use once ranked_rank is populated).
+CEILING_RANK_UNKNOWN = (os.environ.get("CEILING_RANK_UNKNOWN") or "keep").strip().lower()
+
 
 def _rank_name(v):
     """Board rank value -> rank name, or '' if it cannot be read."""
@@ -189,6 +230,40 @@ def _rank_name(v):
     # a badge-style value carries the subrank in the ones digit
     idx = n // 10 if n >= 10 else n
     return RANK_NAMES[idx] if 0 <= idx < len(RANK_NAMES) else ""
+
+
+def _rank_index(v):
+    """Board rank value -> index into RANK_NAMES, or None if unreadable."""
+    nm = _rank_name(v)
+    return RANK_NAMES.index(nm) if nm in RANK_NAMES else None
+
+
+def _min_rank_index():
+    """Configured floor as an index, or None when the floor is off/unknown."""
+    if not CEILING_MIN_RANK:
+        return None
+    if CEILING_MIN_RANK in RANK_NAMES:
+        return RANK_NAMES.index(CEILING_MIN_RANK)
+    print("  [floor] CEILING_MIN_RANK=%r is not a rank name; floor DISABLED. "
+          "Valid: %s" % (CEILING_MIN_RANK, ", ".join(RANK_NAMES)), file=sys.stderr)
+    return None
+
+
+def passes_floor(cand, floor_idx):
+    """
+    (eligible, verdict) for one candidate against the rank floor.
+
+    verdict is "pass" / "below" / "unknown" so the caller can count how much of
+    the floor is actually biting versus how much is unreadable — the difference
+    between a working floor and a floor that is doing nothing at all.
+    """
+    if floor_idx is None:
+        return True, "pass"
+    idx = _rank_index(cand.get("ranked_rank"))
+    if idx is None:
+        # orbit candidates were never on a board and always land here
+        return (CEILING_RANK_UNKNOWN != "drop"), "unknown"
+    return (idx >= floor_idx), ("pass" if idx >= floor_idx else "below")
 
 
 def get(url):
@@ -270,6 +345,11 @@ def fetch_board(region):
         print("  [rank]  %-9s no readable ranked_rank on any entry — Eternus "
               "cannot be detected from the board this run" % region,
               file=sys.stderr)
+        if _min_rank_index() is not None:
+            print("  [floor] %-9s and the %s floor has nothing to read here: "
+                  "every board candidate will be 'unknown' (policy=%s)"
+                  % (region, CEILING_MIN_RANK, CEILING_RANK_UNKNOWN),
+                  file=sys.stderr)
 
     return by_name, len(entries), ordered
 
@@ -474,6 +554,9 @@ def ceiling_value(rec):
     accumulated RP is roughly 250 x this number. DO NOT decay it — a decayed
     figure corresponds to no rank any player holds.
 
+    Eligibility to be scored at all is gated separately by passes_floor();
+    this function ranks whoever clears that gate.
+
     Replace this one function when the ladder stops being progression-based —
     see the module docstring, and watch the [eternus] lines in the log.
     Everything else keys off whatever it returns.
@@ -492,6 +575,14 @@ def shrunk(rec, k=None):
 
 def main():
     tier = {r["hero"]: r for r in csv.DictReader(open(os.path.join(OUT_DIR, "tierlist.csv")))}
+
+    floor_idx = _min_rank_index()
+    if floor_idx is None:
+        print("[floor] no rank floor in effect", file=sys.stderr)
+    else:
+        print("[floor] minimum rank %s (index %d); unreadable rank -> %s"
+              % (RANK_NAMES[floor_idx], floor_idx, CEILING_RANK_UNKNOWN.upper()),
+              file=sys.stderr)
 
     print("[1/4] leaderboards", file=sys.stderr)
     boards = {}
@@ -521,10 +612,11 @@ def main():
 
     print("[2/4] cross-referencing hero boards against the general board",
           file=sys.stderr)
-    confirmed = {}            # (region, hero_id) -> [candidate, ...]
+    confirmed = {}            # (region, hero_id) -> ([candidate, ...], board_size)
     for rg in REGIONS:
         by_name = boards[rg][0]
         n_missing = 0
+        missing_heroes = []
         for hid, hero in sorted(hero_ids.items(), key=lambda kv: kv[1]):
             hb = fetch_hero_board(rg, hid)
             time.sleep(0.15)          # 100 req/s allowed; stay well clear
@@ -532,14 +624,23 @@ def main():
             confirmed[(rg, hid)] = (cands, len(hb))
             if not cands:
                 n_missing += 1
+                missing_heroes.append(hero)
         print("  [xref] %-9s %d heroes with a confirmed player, %d without"
               % (rg, sum(1 for k, v in confirmed.items()
                          if k[0] == rg and v[0]), n_missing), file=sys.stderr)
+        if missing_heroes:
+            # These are exactly the hero-regions the orbit fallback exists for.
+            # Before 2026-08-18 they were skipped BEFORE the fallback ran and
+            # silently vanished from ceiling.csv — that is how NAmerica/Mina
+            # and Europe/Warden went missing from run 42.
+            print("  [xref] %-9s zero board candidates: %s"
+                  % (rg, ", ".join(missing_heroes)), file=sys.stderr)
 
     print("[3/4] orbit fallback for thin hero-regions", file=sys.stderr)
     # Only hero-regions that are actually short get expanded; everywhere else
     # the boards already supply enough candidates and the orbit would only add
-    # weaker players for the maximum to ignore.
+    # weaker players for the maximum to ignore. ZERO counts as short — see the
+    # [xref] note above.
     orbit = {}
     if ORBIT_FALLBACK:
         for rg in REGIONS:
@@ -548,15 +649,22 @@ def main():
             if not thin:
                 print("  [orbit] %-9s no thin hero-regions" % rg, file=sys.stderr)
                 continue
+            empty = [hid for (r, hid), (cands, _n) in confirmed.items()
+                     if r == rg and not cands]
             # seed from the strongest board positions in this region — the
             # accounts most likely to actually be near the ceiling
             seeds = sorted({c["account_id"]: c["pos"]
                             for (r, _h), (cands, _n) in confirmed.items()
                             if r == rg for c in cands}.items(),
                            key=lambda kv: kv[1])
+            if not seeds:
+                print("  [orbit] %-9s no seed accounts anywhere in this region "
+                      "— fallback cannot run" % rg, file=sys.stderr)
+                continue
             orbit[rg] = fetch_orbit1([a for a, _p in seeds])
-            print("  [orbit] %-9s %d thin heroes, %d orbit-1 players"
-                  % (rg, len(thin), len(orbit[rg])), file=sys.stderr)
+            print("  [orbit] %-9s %d thin heroes (%d of them with zero board "
+                  "candidates), %d orbit-1 players"
+                  % (rg, len(thin), len(empty), len(orbit[rg])), file=sys.stderr)
 
     print("[4/4] ranked records for the confirmed players", file=sys.stderr)
     every_id = {c["account_id"] for (cands, _n) in confirmed.values() for c in cands}
@@ -564,13 +672,18 @@ def main():
         every_id |= set(members)
     records, hero_records = fetch_ranked_records(every_id)
 
+    floor_stats = Counter()
     per_region = defaultdict(list)
     for (rg, hid), (cands, board_size) in confirmed.items():
-        if not cands:
-            continue
         hero = hero_ids[hid]
         pool = list(cands)
         from_orbit = 0
+        # NOTE: no `if not cands: continue` here. A hero-region with zero board
+        # candidates is the single case the orbit fallback was built for, and
+        # skipping it early made the fallback unreachable exactly when it
+        # mattered. The genuinely-empty case is handled by `if not scored`
+        # below, which still drops the hero but only after the fallback has had
+        # its turn.
         if len(cands) < ORBIT_MIN_CANDIDATES and orbit.get(rg):
             have = {c["account_id"] for c in cands}
             for aid, prox in orbit[rg].items():
@@ -596,17 +709,28 @@ def main():
                              "shared": prox["shared"],
                              "hero_games": hrec["games"]})
                 from_orbit += 1
+        if not pool:
+            continue
         scored = []
+        floored_out = 0
+        unknown_rank = 0
         for c in pool:
             rec = records.get(c["account_id"])
             if not rec or not rec["games"]:
                 continue
+            ok, verdict = passes_floor(c, floor_idx)
+            floor_stats[verdict] += 1
+            if verdict == "unknown":
+                unknown_rank += 1
+            if not ok:
+                floored_out += 1
+                continue
             scored.append((ceiling_value(rec), rec, c))
         if not scored:
             continue
-        # the ceiling: the confirmed player with the most net ranked wins.
-        # Ties break on the better cross-hero board position, then on their
-        # standing on this hero's own board.
+        # the ceiling: the ELIGIBLE confirmed player with the most net ranked
+        # wins. Ties break on the better cross-hero board position, then on
+        # their standing on this hero's own board.
         scored.sort(key=lambda t: (-t[0], t[2]["pos"], t[2]["hero_pos"]))
         net, rec, c = scored[0]
         t = tier.get(hero, {})
@@ -629,7 +753,8 @@ def main():
             "pct": "" if c["pos"] >= 10 ** 9 else round(100.0 * c["pos"] / max(depth[rg], 1), 3),
             "badge_level": c["badge"],
             # badge_level reads blank on every ranked row; ranked_rank is the
-            # surviving rank signal and is what the Eternus watch keys off.
+            # surviving rank signal and is what the Eternus watch and the rank
+            # floor both key off.
             "ranked_rank": c.get("ranked_rank") if c.get("ranked_rank") is not None else "",
             "rank_name": _rank_name(c.get("ranked_rank")),
             "hero_ladder_pos": "" if c["hero_pos"] >= 10 ** 9 else c["hero_pos"],
@@ -637,6 +762,12 @@ def main():
             "valve_top_hero": "YES" if hid in (c["top_heroes"] or []) else "",
             "located_on_general": len(cands),
             "scored_candidates": len(scored),
+            # how much of the floor actually bit for this hero-region, and how
+            # much of it was unreadable — a run where floored_out is 0 and
+            # rank_unknown equals the pool size has NO EFFECTIVE FLOOR
+            "floored_out": floored_out,
+            "rank_unknown": unknown_rank,
+            "min_rank": RANK_NAMES[floor_idx] if floor_idx is not None else "",
             "from_orbit": from_orbit,
             "ceiling_from_orbit": "YES" if c.get("seeds_met") else "",
             "orbit_seeds_met": c.get("seeds_met", ""),
@@ -671,7 +802,7 @@ def main():
         have = {d["hero"] for d in out if d["region"] == region}
         gap = sorted(set(tier) - have)
         if gap:
-            print("  [warn] %s: no confirmed player with ranked games for %d heroes: %s"
+            print("  [warn] %s: no eligible player with ranked games for %d heroes: %s"
                   % (region, len(gap), ", ".join(gap)), file=sys.stderr)
 
     cols = ["region", "ceiling_rank", "hero", "hero_id", "ceiling_player",
@@ -679,7 +810,8 @@ def main():
             "shrunk_winrate", "global_pos", "region_depth", "pct", "badge_level",
             "ranked_rank", "rank_name",
             "hero_ladder_pos", "match", "valve_top_hero", "located_on_general",
-            "scored_candidates", "from_orbit", "ceiling_from_orbit",
+            "scored_candidates", "floored_out", "rank_unknown", "min_rank",
+            "from_orbit", "ceiling_from_orbit",
             "orbit_seeds_met", "orbit_hero_games", "board_size", "winrate_rank",
             "elite_winrate"]
     path = os.path.join(OUT_DIR, "ceiling.csv")
@@ -688,6 +820,24 @@ def main():
         w.writeheader()
         w.writerows(out)
     print("  -> %s (%d hero-region rows)" % (path, len(out)), file=sys.stderr)
+
+    # ---- did the floor do anything? ---------------------------------------
+    if floor_idx is not None:
+        tot = sum(floor_stats.values())
+        print("\n  [floor] %d candidates checked against %s: %d passed, "
+              "%d below, %d unreadable rank (%s)"
+              % (tot, RANK_NAMES[floor_idx], floor_stats["pass"],
+                 floor_stats["below"], floor_stats["unknown"],
+                 CEILING_RANK_UNKNOWN), file=sys.stderr)
+        if tot and not floor_stats["below"] and floor_stats["unknown"] == tot:
+            print("  [floor] *** THE FLOOR IS NOT BITING. Every candidate had "
+                  "an unreadable ranked_rank, so this ordering is unfloored "
+                  "net wins exactly as before. Do not read the ceiling as "
+                  "%s+ until this line changes. ***"
+                  % RANK_NAMES[floor_idx], file=sys.stderr)
+        elif floor_stats["unknown"]:
+            print("  [floor] %d candidates passed on an unreadable rank rather "
+                  "than a checked one" % floor_stats["unknown"], file=sys.stderr)
 
     for region in REGIONS:
         rows = [d for d in out if d["region"] == region][:10]
