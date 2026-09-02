@@ -1,0 +1,195 @@
+name: Graft design
+
+# Take the LOOK from a Claude Design export and put it on top of the site's
+# OWN data logic. It moves the <x-dc> markup and the styles; it never moves
+# the <script data-dc-script> class, because that class is what reads
+# data.json. Design's version has hardcoded heroes and no fetch.
+#
+# Push the export to the repo root (any name), then:
+#   Actions -> Graft design -> Run workflow
+#     design    path to the export. default: design.html
+#     apply     false (default) = artifact + report only. true = commit
+#     strict    true (default) = fail when the new markup binds to values
+#               the site's logic does not produce
+#
+# Handles both export shapes: a plain dc export, and the "standalone" bundle
+# (gzip+base64 payloads under <script type="__bundler/...">).
+#
+# The mechanical part is reliable. The binding reconciliation is not, and
+# the report is the point of this workflow: Design's template names things
+# its own mock logic returned. Every unbound name in the report is a hole
+# you have to close by hand in renderVals.
+
+on:
+  workflow_dispatch:
+    inputs:
+      design:
+        description: "Path to the Design export in the repo"
+        required: false
+        default: "design.html"
+      apply:
+        description: "Commit the grafted docs/index.html (false = dry run)"
+        required: false
+        default: "false"
+      strict:
+        description: "Fail on unbound bindings"
+        required: false
+        default: "true"
+
+permissions:
+  contents: write
+
+jobs:
+  graft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT }}
+
+      - name: Graft
+        env:
+          DESIGN: ${{ github.event.inputs.design }}
+          STRICT: ${{ github.event.inputs.strict }}
+        run: |
+          python3 - <<'PY'
+          import os, re, sys, json, gzip, base64, pathlib
+
+          TARGET = pathlib.Path("docs/index.html")
+          SRC    = pathlib.Path(os.environ.get("DESIGN") or "design.html")
+          STRICT = (os.environ.get("STRICT") or "true").lower() == "true"
+          OUT    = pathlib.Path("output"); OUT.mkdir(exist_ok=True)
+
+          if not SRC.exists():
+              sys.exit("Design export not found at %s — push it to the repo root first." % SRC)
+          if not TARGET.exists():
+              sys.exit("%s missing. Run 'Restore site' first." % TARGET)
+
+          src  = SRC.read_text("utf-8", "replace")
+          site = TARGET.read_text("utf-8", "replace")
+
+          # ---- 1. unwrap a standalone bundle, if that is what this is --------
+          def bundler_block(text, kind):
+              m = re.search(r'<script type="__bundler/%s">(.*?)</script>' % kind, text, re.S)
+              return m.group(1).strip() if m else None
+
+          tpl_json = bundler_block(src, "template")
+          if tpl_json:
+              # The inner page is a JSON string; the gzip'd asset payloads in
+              # the manifest are all fonts and runtime js, and both get
+              # replaced below, so only the template is needed.
+              print("standalone bundle detected — unwrapping template")
+              src = json.loads(tpl_json)
+
+          # ---- 2. pull the pieces -------------------------------------------
+          def x_dc(text):
+              m = re.search(r'<x-dc[^>]*>(.*?)</x-dc>', text, re.S)
+              return m.group(1) if m else None
+
+          def logic(text):
+              m = re.search(r'(<script[^>]*data-dc-script[^>]*>)(.*?)(</script>)', text, re.S)
+              return m.groups() if m else None
+
+          new_dc = x_dc(src)
+          if new_dc is None:
+              sys.exit("No <x-dc> block in %s — not a Design export." % SRC)
+          site_dc = x_dc(site)
+          site_logic = logic(site)
+          if site_dc is None or site_logic is None:
+              sys.exit("%s has no <x-dc> / data-dc-script pair. Is it the restored site?" % TARGET)
+
+          # ---- 3. fonts: the bundle ships woff2 as blob uuids that only exist
+          #        inside the bundler. Replace the whole <helmet> with a plain
+          #        Google Fonts link for the families the markup names.
+          fams = sorted(set(re.findall(r"font-family:\s*'([A-Za-z][A-Za-z ]+)'", new_dc))
+                        | set(re.findall(r"font:[^;\"]*?\b(Archivo Black|Archivo|JetBrains Mono)\b", new_dc)))
+          fams = [f for f in fams if f.lower() not in ("monospace", "sans-serif")]
+          if fams:
+              q = "&".join("family=" + f.replace(" ", "+") + ":wght@400;500;700" for f in fams)
+              helmet = ('<helmet>\n'
+                        '<link rel="preconnect" href="https://fonts.googleapis.com">\n'
+                        '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
+                        '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?%s&display=swap">\n'
+                        '</helmet>' % q)
+          else:
+              helmet = ""
+          print("fonts: %s" % (", ".join(fams) or "none found"))
+
+          body = re.sub(r'<helmet>.*?</helmet>', '', new_dc, flags=re.S)
+          leftover = re.findall(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', body)
+          if leftover:
+              print("WARNING: %d bundle uuid refs left in the markup (unresolvable assets): %s"
+                    % (len(leftover), sorted(set(leftover))[:3]))
+
+          grafted_dc = helmet + "\n" + body
+
+          # ---- 4. binding report --------------------------------------------
+          roots = sorted(set(
+              m.split(".")[0].strip()
+              for m in re.findall(r'\{\{\s*([^}]+?)\s*\}\}', grafted_dc)
+          ))
+          # names introduced by sc-for as="x" are local, not logic outputs
+          locals_ = set(re.findall(r'\bas="([A-Za-z_$][\w$]*)"', grafted_dc))
+          wanted = [r for r in roots if r and r not in locals_ and r.isidentifier()]
+
+          logic_text = site_logic[1]
+          bound   = [r for r in wanted if re.search(r'\b%s\b' % re.escape(r), logic_text)]
+          unbound = [r for r in wanted if r not in bound]
+
+          report = []
+          report.append("# Graft report\n")
+          report.append("design:  %s (%d bytes of markup)" % (SRC, len(grafted_dc)))
+          report.append("target:  %s (logic kept, %d bytes)" % (TARGET, len(logic_text)))
+          report.append("loop vars (local, ignored): %s" % (", ".join(sorted(locals_)) or "none"))
+          report.append("\n## Bound — the site's logic already produces these\n")
+          for r in bound:
+              report.append("  ok       %s" % r)
+          report.append("\n## UNBOUND — the new markup asks for these and renderVals never returns them\n")
+          for r in unbound:
+              report.append("  MISSING  %s" % r)
+          report.append("")
+          report.append("Each MISSING name renders empty. Close them in renderVals from real")
+          report.append("data — do NOT copy Design's implementations, they are the")
+          report.append("hash-of-name-length mock. Also check the snapshot column labels:")
+          report.append("Design's export used 10k/20k/30k/40k; the real snapshots are")
+          report.append("4.8k/9.6k/14.4k/20.8k/postgame.")
+          text = "\n".join(report)
+          (OUT / "graft-report.md").write_text(text, "utf-8")
+          print(text)
+
+          # ---- 5. splice -----------------------------------------------------
+          out_html = site.replace(site_dc, grafted_dc, 1)
+          if out_html == site:
+              sys.exit("Splice failed — <x-dc> block not replaced.")
+          (OUT / "index.grafted.html").write_text(out_html, "utf-8")
+          (OUT / "index.before.html").write_text(site, "utf-8")
+
+          if "data.json" not in out_html:
+              sys.exit("Refusing: the grafted file no longer references data.json.")
+
+          if unbound and STRICT:
+              TARGET.write_text(site, "utf-8")   # leave the tree untouched
+              sys.exit("%d unbound binding(s). Artifact has the candidate file and the "
+                       "report; fix renderVals, or re-run with strict=false to commit "
+                       "a partially-wired page." % len(unbound))
+
+          TARGET.write_text(out_html, "utf-8")
+          print("grafted %s" % TARGET)
+          PY
+
+      - name: Upload candidate and report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: graft-design
+          path: output/
+
+      - name: Commit
+        if: ${{ github.event.inputs.apply == 'true' }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/index.html
+          git diff --cached --quiet || git commit -m "graft design markup onto site logic"
+          git push

@@ -1,0 +1,121 @@
+name: Restore site
+
+# Put docs/index.html back to the last version that actually read data.json.
+#
+#   Actions -> Restore site -> Run workflow
+#     commit   explicit sha to restore from. blank = auto-detect
+#     apply    false (default) = dry run, artifact only. true = commit and push
+#
+# Auto-detect walks the file's history newest-first and picks the first
+# revision whose text mentions data.json — the Design mock does not, so it
+# is skipped along with any later mock commits.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Commit sha to restore docs/index.html from (blank = auto)"
+        required: false
+        default: ""
+      apply:
+        description: "Commit and push the restore (false = dry run)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT }}
+
+      - name: Find and restore
+        id: restore
+        env:
+          WANT: ${{ github.event.inputs.commit }}
+        run: |
+          python3 - <<'PY'
+          import os, subprocess, pathlib, sys
+
+          TARGET = "docs/index.html"
+          MARKER = "data.json"
+
+          def git(*a):
+              return subprocess.run(["git", *a], capture_output=True, text=True).stdout
+
+          def blob(sha):
+              r = subprocess.run(["git", "show", "%s:%s" % (sha, TARGET)],
+                                 capture_output=True, text=True)
+              return r.stdout if r.returncode == 0 else None
+
+          want = (os.environ.get("WANT") or "").strip()
+          history = [l.split()[0] for l in git("log", "--format=%H %s", "--", TARGET).splitlines() if l]
+          if not history:
+              sys.exit("No history for %s — wrong path or shallow clone." % TARGET)
+
+          print("%d revisions of %s" % (len(history), TARGET))
+          for sha in history[:15]:
+              text = blob(sha) or ""
+              print("  %s  %7d bytes  %s  %s" % (
+                  sha[:10], len(text),
+                  "DATA" if MARKER in text else "mock",
+                  git("log", "-1", "--format=%ad %s", "--date=short", sha).strip()))
+
+          if want:
+              chosen, text = want, blob(want)
+              if text is None:
+                  sys.exit("%s does not contain %s" % (want, TARGET))
+          else:
+              chosen = text = None
+              for sha in history:
+                  t = blob(sha)
+                  if t and MARKER in t:
+                      chosen, text = sha, t
+                      break
+              if not chosen:
+                  sys.exit("No revision of %s mentions %s. Pass an explicit commit."
+                           % (TARGET, MARKER))
+
+          current = pathlib.Path(TARGET).read_text("utf-8", "replace") if pathlib.Path(TARGET).exists() else ""
+          print("\nrestoring from %s (%d bytes) over current (%d bytes)"
+                % (chosen[:10], len(text), len(current)))
+          if MARKER not in text:
+              print("WARNING: the chosen revision does not mention %s either." % MARKER)
+          if text == current:
+              print("Already identical — nothing to do.")
+
+          out = pathlib.Path("output"); out.mkdir(exist_ok=True)
+          (out / "index.restored.html").write_text(text, "utf-8")
+          (out / "index.current.html").write_text(current, "utf-8")
+          pathlib.Path(TARGET).write_text(text, "utf-8")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("chosen=%s\n" % chosen)
+              f.write("changed=%s\n" % ("true" if text != current else "false"))
+          PY
+
+      - name: Verify the restored file reads the data
+        run: |
+          grep -q "data.json" docs/index.html
+          echo "OK: docs/index.html references data.json"
+
+      - name: Upload for review
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-site
+          path: output/
+
+      - name: Commit
+        if: ${{ github.event.inputs.apply == 'true' && steps.restore.outputs.changed == 'true' }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/index.html
+          git commit -m "restore docs/index.html from ${{ steps.restore.outputs.chosen }}"
+          git push
