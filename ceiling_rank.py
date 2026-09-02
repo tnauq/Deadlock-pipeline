@@ -183,6 +183,38 @@ MAX_URL = int(os.environ.get("MAX_URL") or 9000)
 # wins expires. k=25 matches the pipeline's pool selection.
 SHRINK_K = int(os.environ.get("SHRINK_K") or 25)
 
+# ---- hero-play validation -------------------------------------------------
+# Does the candidate actually PLAY the hero whose board they are on?
+#
+# The failure this catches: Valve publishes no account ids, so identity rests
+# on deadlock-api's fuzzy name resolution, and a SHORT OR COMMON DISPLAY NAME
+# collides. Several different players called "Snakes", each on a different
+# hero board, all intersect the same general-board entry's id list and all
+# resolve to the SAME account. The output looks like one dominant flex player
+# holding five hero boards at #1; it may be five different people. Dual
+# confirmation cannot see this, because both boards agree on a name that is
+# not unique.
+#
+# The check costs NOTHING. fetch_ranked_records already returns per
+# (account, hero) rows and they are currently used only to gate orbit
+# candidates. A genuine flex player shows real games on every hero claimed;
+# a collision shows games on one and nothing on the rest.
+#
+# This is deliberately NOT exclusivity. A player with real games on five
+# heroes keeps all five — measured 2026-07-31, exclusivity dropped pool fill
+# from 98% to 83% and pushed hero-regions under 15 builds from 2 to 18, so it
+# stays off. This drops only claims with no play behind them.
+VALIDATE_HERO_PLAY = os.environ.get("VALIDATE_HERO_PLAY", "1") == "1"
+# Games on the hero required of a BOARD candidate. Orbit candidates have their
+# own, stricter gate (ORBIT_MIN_HERO_GAMES) because board membership at least
+# claims hero play whereas orbit membership claims nothing.
+CEILING_MIN_HERO_GAMES = int(os.environ.get("CEILING_MIN_HERO_GAMES") or 5)
+# What a MISSING hero-stats row means. "keep" (default) treats absence as
+# absence of evidence — the endpoint can simply not return a row. "drop" treats
+# it as evidence of absence. Only a row that EXISTS and falls under the
+# threshold is positive evidence of no play, and that case is always dropped.
+HERO_PLAY_MISSING = (os.environ.get("HERO_PLAY_MISSING") or "keep").strip().lower()
+
 # ---- hero-board-only candidates -------------------------------------------
 # Admit hero-board players who are not on the region's cross-hero board, as a
 # second tier ranked strictly behind every dual-confirmed player. See
@@ -312,6 +344,27 @@ def passes_floor(cand, floor_idx):
         # orbit candidates were never on a board and always land here
         return (CEILING_RANK_UNKNOWN != "drop"), "unknown"
     return (idx >= floor_idx), ("pass" if idx >= floor_idx else "below")
+
+
+def passes_hero_play(cand, hero_id, hero_records):
+    """(eligible, verdict, games) for one board candidate on one hero.
+
+    verdict is "pass" / "no_play" / "missing", counted separately so a run can
+    show whether the check is biting or whether the endpoint simply returned
+    nothing. Orbit candidates are exempt: they were gated on hero games at
+    admission and carry no board claim to falsify.
+    """
+    if not VALIDATE_HERO_PLAY or cand.get("match") == "orbit":
+        return True, "pass", None
+    hrec = hero_records.get((cand["account_id"], hero_id))
+    if hrec is None:
+        return (HERO_PLAY_MISSING != "drop"), "missing", None
+    g = hrec.get("games", 0)
+    if g < CEILING_MIN_HERO_GAMES:
+        # positive evidence: the account is known to the endpoint and has
+        # essentially no games on this hero, so the board claim is not theirs
+        return False, "no_play", g
+    return True, "pass", g
 
 
 def get(url):
@@ -851,6 +904,8 @@ def main():
     records, hero_records = fetch_ranked_records(every_id)
 
     floor_stats = Counter()
+    play_stats = Counter()
+    identity_audit = []
     per_region = defaultdict(list)
     for (rg, hid), (cands, board_size) in confirmed.items():
         hero = hero_ids[hid]
@@ -893,10 +948,29 @@ def main():
         scored = []
         floored_out = 0
         unknown_rank = 0
+        no_play = 0
+        play_missing = 0
         for c in pool:
             rec = records.get(c["account_id"])
             if not rec or not rec["games"]:
                 continue
+            play_ok, play_verdict, hgames = passes_hero_play(c, hid, hero_records)
+            play_stats[play_verdict] += 1
+            if play_verdict == "missing":
+                play_missing += 1
+            if not play_ok:
+                no_play += 1
+                # record WHO was rejected and for what, so a name collision is
+                # visible as a row rather than inferred from a count
+                identity_audit.append({
+                    "region": rg, "hero": hero, "hero_id": hid,
+                    "account_name": c["name"], "account_id": c["account_id"],
+                    "match": c["match"], "global_pos": c["pos"],
+                    "hero_ladder_pos": c["hero_pos"], "board_size": c["board_size"],
+                    "hero_games": hgames if hgames is not None else "",
+                    "verdict": play_verdict})
+                continue
+            c["hero_games_checked"] = hgames
             ok, verdict = passes_floor(c, floor_idx)
             floor_stats[verdict] += 1
             if verdict == "unknown":
@@ -959,6 +1033,12 @@ def main():
             "located_on_general": sum(1 for x in cands if x["match"] == "confirmed"),
             "hero_board_only_candidates": sum(1 for x in cands
                                               if x["match"] == "hero_board_only"),
+            # the ceiling player's own games on THIS hero, and how many
+            # candidates this hero-region rejected for having none
+            "ceiling_hero_games": (c.get("hero_games_checked")
+                                   if c.get("hero_games_checked") is not None else ""),
+            "rejected_no_hero_play": no_play,
+            "hero_play_missing": play_missing,
             "scored_candidates": len(scored),
             # how much of the floor actually bit for this hero-region, and how
             # much of it was unreadable — a run where floored_out is 0 and
@@ -1025,7 +1105,8 @@ def main():
             "region_depth", "pct", "badge_level",
             "ranked_rank", "rank_name",
             "hero_ladder_pos", "match", "valve_top_hero", "located_on_general",
-            "hero_board_only_candidates",
+            "hero_board_only_candidates", "ceiling_hero_games",
+            "rejected_no_hero_play", "hero_play_missing",
             "scored_candidates", "floored_out", "rank_unknown", "min_rank",
             "from_orbit", "ceiling_from_orbit",
             "orbit_seeds_met", "orbit_hero_games", "board_size", "winrate_rank",
@@ -1036,6 +1117,57 @@ def main():
         w.writeheader()
         w.writerows(out)
     print("  -> %s (%d hero-region rows)" % (path, len(out)), file=sys.stderr)
+
+    # ---- hero-play validation: did it bite, and on whom? ------------------
+    if VALIDATE_HERO_PLAY:
+        tot = sum(play_stats.values())
+        print("\n  [play] %d board candidates checked for >=%d games on their own "
+              "hero: %d passed, %d had none, %d had no hero-stats row (%s)"
+              % (tot, CEILING_MIN_HERO_GAMES, play_stats["pass"],
+                 play_stats["no_play"], play_stats["missing"], HERO_PLAY_MISSING),
+              file=sys.stderr)
+        if tot and play_stats["missing"] == tot:
+            print("  [play] *** THE CHECK IS NOT BITING. Every candidate was "
+                  "missing a hero-stats row, so nothing was validated. Confirm "
+                  "hero-stats is returning rows before trusting any multi-hero "
+                  "ceiling. ***", file=sys.stderr)
+
+    # ---- multi-hero ceilings: real flex player, or a name collision? -------
+    # This is the report the check exists for. One account holding several
+    # hero boards is either a genuine flex player or several different players
+    # sharing a display name that deadlock-api collapsed onto one id. Games on
+    # each claimed hero is what separates the two.
+    multi = defaultdict(list)
+    for d in out:
+        multi[(d["account_id"], d["region"])].append(d)
+    multi = {k: v for k, v in multi.items() if len(v) > 1}
+    if multi:
+        print("\n  [identity] %d accounts are the ceiling for more than one hero:"
+              % len(multi), file=sys.stderr)
+        for (aid, rg), ds in sorted(multi.items(), key=lambda kv: -len(kv[1])):
+            games = ", ".join("%s=%s" % (d["hero"], d["ceiling_hero_games"]
+                                         if d["ceiling_hero_games"] != "" else "?")
+                              for d in ds)
+            unver = sum(1 for d in ds if d["ceiling_hero_games"] == "")
+            print("    %-9s %-22s id=%-11s %d heroes: %s%s"
+                  % (rg, (ds[0]["ceiling_player"] or "?")[:22], aid, len(ds), games,
+                     "   <-- %d UNVERIFIED" % unver if unver else ""),
+                  file=sys.stderr)
+        print("    A genuine flex player shows real games on every hero listed. "
+              "A display-name collision shows them on one and little on the "
+              "rest — that account is several people.", file=sys.stderr)
+
+    if identity_audit:
+        apath = os.path.join(OUT_DIR, "identity_audit.csv")
+        acols = ["region", "hero", "hero_id", "account_name", "account_id",
+                 "match", "global_pos", "hero_ladder_pos", "board_size",
+                 "hero_games", "verdict"]
+        with open(apath, "w", newline="", encoding="utf-8") as f:
+            aw = csv.DictWriter(f, fieldnames=acols, extrasaction="ignore")
+            aw.writeheader()
+            aw.writerows(identity_audit)
+        print("  -> %s (%d rejected board claims)" % (apath, len(identity_audit)),
+              file=sys.stderr)
 
     # ---- did the floor do anything? ---------------------------------------
     if floor_idx is not None:
@@ -1094,14 +1226,10 @@ def main():
               "disabled this run (badge_level is blank, and ranked_rank was "
               "empty or unrecognised)", file=sys.stderr)
 
-    dup = defaultdict(list)
-    for d in out:
-        dup[(d["ceiling_player"], d["region"])].append(d["hero"])
-    shared = {k: v for k, v in dup.items() if len(v) > 1}
-    if shared:
-        print("\n  [warn] one player is the ceiling for several heroes:", file=sys.stderr)
-        for (nm, reg), hs in shared.items():
-            print("    %-16s %-8s %s" % (nm, reg, ", ".join(hs)), file=sys.stderr)
+    # (the old name-keyed duplicate warning is gone: it grouped by DISPLAY
+    # NAME, which is the very thing that cannot be trusted here. The
+    # [identity] report above groups by resolved account_id and shows the
+    # per-hero games that tell the two cases apart.)
 
 
 if __name__ == "__main__":
