@@ -3,8 +3,19 @@
 Deadlock tier-list + item-frequency pipeline.
 
 Candidates are the top qualifying players from each region's hero ladder
-(Valve's own leaderboard, passed through by deadlock-api). Ratings and item
-data come from SQL.
+(Valve's own leaderboard, passed through by deadlock-api), CROSS-REFERENCED
+against that region's general cross-hero board: the general board supplies the
+standing that orders selection (global_pos) and a second, independent
+constraint on identity, since Valve publishes no account ids and both boards
+carry only deadlock-api's fuzzy name-to-id guesses. Item data comes from SQL.
+
+MODE. 2026-09-02: reverted from the ranked-only cohort back to standard play.
+Ranked volume never grew into what the ranked-native selector assumed and the
+ladder feeding it has been degrading, so ordering on ranked win rate or ranked
+net wins now reads a shrinking, unrepresentative slice. MATCH_MODE defaults to
+"" (no match_mode filter, game_mode='Normal' still applied) and every filter in
+the file — hero-stats, orbit, pool net wins — follows it. MATCH_MODE=Ranked
+restores the old behaviour in one variable if ranked ever recovers.
 
 Outputs (./output/):
     tierlist.csv         heroes ranked by decay-weighted pool net wins, with
@@ -62,6 +73,37 @@ LADDER_YIELD = float(os.environ.get("LADDER_YIELD") or 0.34)
 LADDER_MARGIN = _env("LADDER_MARGIN", 15)
 LADDER_MIN_READ = _env("LADDER_MIN_READ", 40)
 
+# ---- general-board cross-reference (the old, restored selector) -----------
+# Each region publishes ONE cross-hero board (/v1/leaderboard/{region}) of
+# 1,001 entries, plus a per-hero board per hero. The hero boards run deeper
+# than the general board, so a hero-board entry ranked ~1,400th overall has
+# nowhere to be found on it — the ~42% location rate is that, not a bug.
+#
+# Cross-referencing does two jobs at once:
+#   1. STANDING. global_pos is the player's position on the region's overall
+#      board, which is what "elite" meant before the ranked detour. It orders
+#      selection, and it is the number ceiling_rank.py wants back.
+#   2. IDENTITY. Valve publishes no account_id (PROBES 2026-08-07), so both
+#      boards carry only deadlock-api's fuzzy possible_account_ids. Taking the
+#      INTERSECTION of the hero entry's id list and the general entry's id list
+#      for the same display name is a second independent constraint on a match
+#      that name-alone put wrong in 110 of 371 slots.
+#
+# Both boards live in the 100 req/s leaderboard bucket, so this costs
+# len(REGIONS) extra calls and nothing at all against the SQL budget.
+GENERAL_XREF = _env("GENERAL_XREF", 1)
+# 1 = drop hero-board entries that do not appear on the general board. OFF by
+# default: at ~42% location it would halve the pool, and a short pool is a
+# worse failure than a loosely-confirmed one. When off, unlocated entries are
+# kept but sort BEHIND every located entry.
+REQUIRE_GENERAL = _env("REQUIRE_GENERAL", 0)
+# What orders candidates within a hero-region.
+#   "general"  general-board position, unlocated entries last  (the old method)
+#   "winrate"  shrunk win rate on the hero                      (the ranked-era
+#              selector, kept so the two can be compared on one run)
+#   "ladder"   raw per-hero board position, no cross-reference
+SELECTION_ORDER = os.environ.get("SELECTION_ORDER") or "general"
+
 POOL_PER_HERO = _env("POOL_PER_HERO", 500)       # rows SQL returns per hero
 RECENCY_WINDOW = _env("RECENCY_WINDOW", 25)
 MAX_IDS_PER_ENTRY = _env("MAX_IDS_PER_ENTRY", 2)  # see fetch_ladders — caps the
@@ -86,14 +128,21 @@ MIN_OFFHERO_GAMES = _env("MIN_OFFHERO_GAMES", 20)
 # way, since every stat is computed from that account's games ON that hero.
 EXCLUSIVITY = (os.environ.get("EXCLUSIVITY") or "0") == "1"
 
-# A ranked mode update shipped ~2026-07-30. Confirmed live and non-trivial:
-# match_mode='Ranked' now returns real rows (924-1,080 over a 3-day sample,
-# vs. ~841k Unranked), and ~97% of those Ranked rows also carry
-# game_mode='Normal' — so the cohort currently pools Ranked and Unranked
-# together at roughly 1,400:1 with no way to tell them apart downstream.
-# Decide deliberately: MATCH_MODE=Unranked excludes ranked games (closest to
-# today's existing cohort), MATCH_MODE=Ranked switches to ranked-only once
-# there's enough volume, and "" (default) keeps pooling both as now.
+# MATCH MODE — REVERTED TO STANDARD PLAY, 2026-09-02.
+#
+# The ranked-native cohort (MATCH_MODE=Ranked everywhere, selection ordered by
+# shrunk ranked win rate, ceiling ordered by ranked net wins) is being retired.
+# Ranked volume never grew into the thing it was sized for and the ladder that
+# fed it has been degrading, so a ranked-gated selector is now reading a
+# shrinking, unrepresentative slice. The old selector — Valve's GENERAL
+# leaderboard cross-referenced against the per-hero boards, over standard-mode
+# play — is back as the default. See GENERAL_XREF below.
+#
+# "" (default) = no match_mode filter, i.e. every mode the general board is
+# itself built from, with game_mode='Normal' still applied. Set
+# MATCH_MODE=Unranked to exclude ranked games outright, or MATCH_MODE=Ranked to
+# restore the ranked-only behaviour for comparison. Nothing else needs changing
+# to switch — every filter below reads this one variable.
 MATCH_MODE = os.environ.get("MATCH_MODE") or ""
 GAME_MODE = os.environ.get("GAME_MODE") or "Normal"
 MODE_SQL = ("match_mode = '%s' AND " % MATCH_MODE if MATCH_MODE else "") + \
@@ -174,10 +223,14 @@ ORBIT_SORT = os.environ.get("ORBIT_SORT", "breadth")
 # WRONG for anything meant to track standing. It is left available for
 # exploring hero form, where "recent games only" is the actual question.
 DECAY_HALFLIFE_DAYS = float(os.environ.get("DECAY_HALFLIFE_DAYS") or 0)
-# Ranked only, regardless of what MATCH_MODE is set to for the item queries.
-# Net wins is a ladder-success statistic and unranked games do not belong in
-# it. Empty string would mean "no filter", which is NOT what is wanted here.
-DECAY_MATCH_MODE = os.environ.get("DECAY_MATCH_MODE") or "Ranked"
+# Was pinned to Ranked on the argument that net wins is a ladder-success
+# statistic. That argument dies with the ranked cohort: pool net wins is now a
+# sample-quality diagnostic over the same games everything else is measured
+# on, so it follows MATCH_MODE rather than overriding it. "" = no filter.
+# Set DECAY_MATCH_MODE=Ranked to pin it back.
+DECAY_MATCH_MODE = os.environ.get("DECAY_MATCH_MODE")
+if DECAY_MATCH_MODE is None:
+    DECAY_MATCH_MODE = MATCH_MODE
 # Costs 1-3 SQL calls against the 20/hr cap. Set 0 to skip; tierlist then
 # keeps elite_winrate as the primary sort.
 POOL_NET_WINS = _env("POOL_NET_WINS", 1)
@@ -413,8 +466,68 @@ def load_assets():
 # --------------------------------------------------------------------------
 
 
-def fetch_ladders(heroes):
+def _norm_name(s):
+    """Display names are matched case- and whitespace-insensitively.
+
+    Nothing stronger is safe: the two boards are the same upstream strings, so
+    an exact match is nearly always available, and anything fuzzier (prefix,
+    edit distance) would start joining distinct players who picked similar
+    names — which is the failure mode the id intersection exists to catch.
+    """
+    return " ".join((s or "").split()).casefold()
+
+
+def fetch_general_boards():
+    """region -> {"by_name": {norm_name: entry}, "size": n}.
+
+    One call per region, in the 100 req/s leaderboard bucket. A name claimed by
+    two different general-board entries is DROPPED rather than resolved: an
+    ambiguous standing figure is worse than none, because it silently promotes
+    the wrong player to the front of a hero's pool.
+    """
+    out = {}
+    for region in REGIONS:
+        url = "%s/v1/leaderboard/%s" % (BASE, urllib.parse.quote(region))
+        try:
+            payload = _get(url)
+        except urllib.error.HTTPError as e:
+            print("  [gb] %s -> HTTP %s — cross-reference disabled for this region"
+                  % (region, e.code), file=sys.stderr)
+            out[region] = {"by_name": {}, "size": 0}
+            continue
+        entries = payload.get("entries", []) if isinstance(payload, dict) else payload
+        by_name, dupes = {}, set()
+        for pos, e in enumerate(entries or [], 1):
+            key = _norm_name(e.get("account_name"))
+            if not key:
+                continue
+            if key in by_name:
+                dupes.add(key)
+                continue
+            ids = []
+            for a in (e.get("possible_account_ids") or []):
+                a = int(a)
+                if a not in ids:
+                    ids.append(a)
+            # `rank` is NOT a unique position — 1,001 NA entries carried 634
+            # distinct values and rank 1 was shared by 14 players. The list is
+            # monotonic in rank, so the INDEX is the position.
+            by_name[key] = {"global_pos": pos, "ids": ids,
+                            "top_hero_ids": [int(h) for h in
+                                             (e.get("top_hero_ids") or [])]}
+        for k in dupes:
+            by_name.pop(k, None)
+        out[region] = {"by_name": by_name, "size": len(entries or [])}
+        print("  [gb] %-9s general board %d entries, %d usable names (%d dropped "
+              "as duplicate names)" % (region, len(entries or []), len(by_name),
+                                       len(dupes)), file=sys.stderr)
+    return out
+
+
+def fetch_ladders(heroes, general=None):
+    general = general or {}
     ladder = {}
+    located = Counter()
     for hid in sorted(heroes):
         total = 0
         for region in REGIONS:
@@ -456,8 +569,27 @@ def fetch_ladders(heroes):
                     a = int(a)
                     if a not in all_ids:
                         all_ids.append(a)
+                # ---- general-board cross-reference ------------------------
+                gb = (general.get(region) or {}).get("by_name", {})
+                g = gb.get(_norm_name(e.get("account_name"))) if gb else None
+                # The intersection is the confirmed identity: an id that both
+                # boards independently offer for this name. Where it is empty
+                # (either the player is off the general board, or the two id
+                # lists disagree entirely) fall back to the hero board's own
+                # list, which is what the pipeline used before this change.
+                confirmed = [a for a in all_ids if g and a in g["ids"]]
+                if g:
+                    located[region] += 1
+                # Valve's own view of what the account plays. Free agreement
+                # check on the hero assignment — no query, no cost.
+                valve_top = bool(g and hid in (g.get("top_hero_ids") or []))
+                ranked_ids = confirmed + [a for a in all_ids if a not in confirmed]
                 rows.append({"hero_id": hid, "region": region, "ladder_pos": pos,
                              "account_name": e.get("account_name", ""),
+                             "global_pos": g["global_pos"] if g else None,
+                             "located_on_general": bool(g),
+                             "valve_top_hero": valve_top,
+                             "confirmed_ids": confirmed,
                              "badge_level": e.get("badge_level")
                                             or e.get("ranked_rank") or 0,
                              # A minority of names carry very long id lists (218
@@ -465,13 +597,37 @@ def fetch_ladders(heroes):
                              # inflated a ~7,600-entry leaderboard into 87,351
                              # SQL candidates — 470 chunks, 4.5+ hours at the
                              # rate limit (2026-07-31). Most entries have 1-2.
-                             "ids_ordered": all_ids[:MAX_IDS_PER_ENTRY],
-                             "ids": set(all_ids[:MAX_IDS_PER_ENTRY]),
-                             "ids_truncated": len(all_ids) > MAX_IDS_PER_ENTRY})
+                             #
+                             # ORDERING CHANGE 2026-09-02: ids the general
+                             # board also claims for this name come FIRST, so
+                             # the MAX_IDS_PER_ENTRY truncation can no longer
+                             # discard a cross-confirmed id in favour of an
+                             # unconfirmed one that merely sat earlier in the
+                             # hero board's list. Within each group the API's
+                             # native order is preserved — it is
+                             # best-match-first (92% of resolutions came from
+                             # slot 0) and re-sorting would throw that away.
+                             "ids_ordered": ranked_ids[:MAX_IDS_PER_ENTRY],
+                             "ids": set(ranked_ids[:MAX_IDS_PER_ENTRY]),
+                             "ids_truncated": len(ranked_ids) > MAX_IDS_PER_ENTRY})
             ladder[(hid, region)] = rows
             total += len(rows)
         print("  [lb] hero %-3d %-22s %d entries" % (hid, heroes[hid][:22], total),
               file=sys.stderr)
+    if general:
+        seen = sum(len(rows) for rows in ladder.values())
+        hit = sum(located.values())
+        # ~42% is the expected figure and is NOT contamination: hero boards run
+        # deeper than the 1,001-entry general board, so an entry ranked past
+        # 1,000 overall has nowhere to be located. A sharp DROP from ~42%,
+        # though, is the board degrading and is worth alarming on.
+        print("  [gb] %d of %d hero-board entries located on a general board "
+              "(%.0f%%)" % (hit, seen, 100.0 * hit / seen if seen else 0),
+              file=sys.stderr)
+        if seen and hit < 0.20 * seen:
+            print("  [gb] WARNING: location rate is far below the ~42%% baseline. "
+                  "The general board may be degrading; selection is falling back "
+                  "to per-hero ladder order for most entries.", file=sys.stderr)
     return ladder
 
 
@@ -537,7 +693,10 @@ WHERE match_id IN ({mids}) AND account_id IN ({aids})
 # match_mode is case-insensitive here (both 'ranked' and 'Ranked' returned
 # identical rows when probed), unlike /v1/analytics/* where the wrong casing
 # returns a bare 400. Lowercase matches the documented enum.
-MODE_API = (os.environ.get("MATCH_MODE") or "Ranked").lower()
+# Follows MATCH_MODE. Empty means the parameter is omitted entirely, which is
+# what returns standard-mode play — sending match_mode= with an empty value is
+# a 400, and sending "ranked" is the behaviour being retired.
+MODE_API = MATCH_MODE.lower()
 SHRINK_K = float(os.environ.get("SHRINK_K") or 25)
 
 
@@ -559,7 +718,7 @@ FROM match_player
 WHERE match_id IN (
     SELECT match_id FROM match_player
     WHERE account_id IN ({ids})
-      AND match_mode = '{mode}' AND game_mode = 'Normal'
+      AND {mode}game_mode = 'Normal'
       AND start_time >= now() - INTERVAL {days} DAY
 )
 """
@@ -578,12 +737,13 @@ def fetch_orbit1(seed_ids):
     seeds = sorted(set(int(a) for a in seed_ids if a))[:ORBIT_SEEDS]
     if not seeds:
         return {}
+    mode_sql = "match_mode = '%s' AND " % MATCH_MODE if MATCH_MODE else ""
     q = Q_ORBIT.format(ids=",".join(str(a) for a in seeds),
-                       mode=MATCH_MODE, days=ORBIT_DAYS)
+                       mode=mode_sql, days=ORBIT_DAYS)
     if len(sql_url(q)) > MAX_URL:
         seeds = seeds[:max(4, len(seeds) // 2)]
         q = Q_ORBIT.format(ids=",".join(str(a) for a in seeds),
-                           mode=MATCH_MODE, days=ORBIT_DAYS)
+                           mode=mode_sql, days=ORBIT_DAYS)
     try:
         rows = sql(q, "orbit1 from %d seeds" % len(seeds))
     except SystemExit:
@@ -622,8 +782,7 @@ SELECT account_id,
        sum(pow(0.5, dateDiff('day', start_time, now()) / {hl}))       AS wg,
        sum(won * pow(0.5, dateDiff('day', start_time, now()) / {hl})) AS ww
 FROM match_player
-WHERE match_mode = '{mode}'
-  AND start_time >= now() - INTERVAL {days} DAY
+WHERE {mode}start_time >= now() - INTERVAL {days} DAY
   AND (account_id, hero_id) IN ({pairs})
 GROUP BY account_id, hero_id
 """
@@ -638,12 +797,16 @@ def fetch_pool_wins(pairs):
     rather than ours, so the ranked-only guarantee is asserted here in SQL.
     """
     hl = DECAY_HALFLIFE_DAYS if DECAY_HALFLIFE_DAYS > 0 else 1e9
+    # "" means no match_mode filter at all — standard play, the same games the
+    # general board is built from. A bare "match_mode = ''" would match nothing.
+    mode_sql = "match_mode = '%s' AND " % DECAY_MATCH_MODE if DECAY_MATCH_MODE else ""
+
     out, chunk, i = {}, max(20, MAX_URL // 22), 0
     pairs = sorted(set(pairs))
     while i < len(pairs):
         part = pairs[i:i + chunk]
         body = ",".join("(%d,%d)" % (a, h) for a, h in part)
-        q = Q_POOL_WINS.format(hl=hl, mode=DECAY_MATCH_MODE,
+        q = Q_POOL_WINS.format(hl=hl, mode=mode_sql,
                                days=LOOKBACK_DAYS, pairs=body)
         n = len(sql_url(q))
         if n > MAX_URL:
@@ -651,7 +814,7 @@ def fetch_pool_wins(pairs):
                 raise SystemExit(
                     "pool-wins chunk of %d pairs is %d chars, over the %d limit."
                     % (len(part), n, MAX_URL))
-            fixed = len(sql_url(Q_POOL_WINS.format(hl=hl, mode=DECAY_MATCH_MODE,
+            fixed = len(sql_url(Q_POOL_WINS.format(hl=hl, mode=mode_sql,
                                                    days=LOOKBACK_DAYS, pairs="")))
             per = max((n - fixed) / len(part), 1.0)
             chunk = max(20, min(chunk - 1, int((MAX_URL - fixed) / per * 0.97)))
@@ -667,7 +830,7 @@ def fetch_pool_wins(pairs):
 
 
 def fetch_hero_stats(account_ids):
-    """Per (account, hero) ranked stats for every candidate. No SQL."""
+    """Per (account, hero) stats for every candidate, in MATCH_MODE. No SQL."""
     ids = sorted(account_ids)
     out, i = {}, 0
     # ~12 chars per id as a repeated query param; keep URLs well under the cap
@@ -676,7 +839,8 @@ def fetch_hero_stats(account_ids):
     while i < len(ids):
         part = ids[i:i + chunk]
         q = "&".join("account_ids=%d" % a for a in part)
-        url = "%s/v1/players/hero-stats?match_mode=%s&%s" % (BASE, MODE_API, q)
+        url = "%s/v1/players/hero-stats?%s%s" % (
+            BASE, ("match_mode=%s&" % MODE_API) if MODE_API else "", q)
         if len(url) > MAX_URL and chunk > 50:
             chunk = max(50, chunk // 2)   # url here is already the full string
             continue
@@ -801,10 +965,15 @@ def main():
     print("[1/5] assets", file=sys.stderr)
     heroes, hero_icon, items, component_of, abilities, hero_sigs, dead_ids = load_assets()
 
-    print("[2/5] ladders (%s), depth %d, target %d per region, exclusivity %s"
+    print("[2/5] ladders (%s), depth %d, target %d per region, exclusivity %s, "
+          "mode %s, selection by %s"
           % (", ".join(REGIONS), LEADERBOARD_DEPTH, PER_REGION,
-             "ON" if EXCLUSIVITY else "OFF"), file=sys.stderr)
-    ladder = fetch_ladders(heroes)
+             "ON" if EXCLUSIVITY else "OFF", MATCH_MODE or "standard (unfiltered)",
+             SELECTION_ORDER), file=sys.stderr)
+    # The general board is fetched FIRST so the hero boards can be cross-
+    # referenced against it as they arrive. Free bucket, one call per region.
+    general = fetch_general_boards() if GENERAL_XREF else {}
+    ladder = fetch_ladders(heroes, general)
     ladder_ids = {a for rows in ladder.values() for r in rows for a in r["ids"]}
     n_truncated = sum(1 for rows in ladder.values() for r in rows if r["ids_truncated"])
     print("  [lb] %d distinct candidate ids across all entries (%d entries hit the "
@@ -874,24 +1043,45 @@ def main():
     chosen = defaultdict(list)
     for (hid, region), rows in sorted(ladder.items()):
         taken = 0
-        # SELECTION ORDER. Previously this was ladder order, i.e. Valve's
-        # leaderboard position — but that board is not ranked-gated (~1,000
-        # entries per region while the season needs 60 normal wins to enter),
-        # so it ranks on all-mode standing while the builds we sample are
-        # ranked-only. Ordering by shrunk ranked win rate makes selection
-        # ranked-native. Entries with no resolved account keep ladder order so
-        # the exclusion reasons below still read sensibly.
-        rows = sorted(rows, key=lambda r: (
-            -shrunk(stats[(r["account_id"], hid)]["hero_wins"],
-                    stats[(r["account_id"], hid)]["hero_games"])
-            if r.get("account_id") is not None and (r["account_id"], hid) in stats
-            else 1.0,
-            r["ladder_pos"]))
+        # SELECTION ORDER — REVERTED 2026-09-02, see SELECTION_ORDER.
+        #
+        # The ranked-era selector ordered by shrunk ranked win rate, on the
+        # argument that Valve's board ranks all-mode standing while the sampled
+        # builds were ranked-only. With the cohort back on standard play that
+        # mismatch is gone, and the ranked win rate is now computed over a
+        # shrinking and unrepresentative set of games. General-board position
+        # is the original selector: a single cross-hero standing, published by
+        # Valve, that does not depend on any of the ratings that died.
+        #
+        # Unlocated entries sort behind every located one rather than being
+        # dropped — see REQUIRE_GENERAL. Within each group the per-hero board's
+        # own position breaks ties, so the exclusion reasons below still read
+        # in a sensible order.
+        def _order(r):
+            gp = r.get("global_pos")
+            if SELECTION_ORDER == "ladder":
+                return (0, 0, r["ladder_pos"])
+            if SELECTION_ORDER == "winrate":
+                s_ = (stats.get((r.get("account_id"), hid))
+                      if r.get("account_id") is not None else None)
+                return (0, -shrunk(s_["hero_wins"], s_["hero_games"]) if s_ else 1.0,
+                        r["ladder_pos"])
+            # "general" — located first, then general-board position
+            return (0 if gp else 1, gp or 0, r["ladder_pos"])
+
+        rows = sorted(rows, key=_order)
         for r in rows:
             if taken >= PER_REGION:
                 break
             base = {"hero_id": hid, "region": region, "ladder_pos": r["ladder_pos"],
-                    "account_name": r["account_name"], "badge_level": r["badge_level"]}
+                    "account_name": r["account_name"], "badge_level": r["badge_level"],
+                    "global_pos": r.get("global_pos"),
+                    "located_on_general": "YES" if r.get("located_on_general") else "",
+                    "valve_top_hero": "YES" if r.get("valve_top_hero") else "",
+                    "id_confirmed": "YES" if r.get("confirmed_ids") else ""}
+            if REQUIRE_GENERAL and not r.get("located_on_general"):
+                excluded.append(dict(base, reason="not on the region's general board"))
+                continue
             aid = r["account_id"]
             if aid is None:
                 excluded.append(dict(base, reason=(
@@ -910,11 +1100,14 @@ def main():
             s = stats[(aid, hid)]
             hg, hw = s["hero_games"], s["hero_wins"]
             if s["last_match_id"] is None:
-                excluded.append(dict(base, reason="no ranked match id on this hero"))
+                excluded.append(dict(base, reason="no match id on this hero in the sampled mode"))
                 continue
             # off-hero = every hero this account played, minus this one
             tg, tw = acct_tot[aid]
             og, ow = max(tg - hg, 0), max(tw - hw, 0)
+            # base["id_confirmed"] said only that SOME id was cross-confirmed;
+            # what matters downstream is whether the id actually chosen was.
+            base["id_confirmed"] = "YES" if aid in (r.get("confirmed_ids") or []) else ""
             chosen[hid].append(dict(base, account_id=aid,
                                     # mmr is badge-derived and badge has read 0 on
                                     # every ranked row since 2026-07-31, so it is
@@ -975,6 +1168,11 @@ def main():
                     chosen[hid].append({
                         "hero_id": hid, "region": rg, "ladder_pos": None,
                         "account_name": "", "badge_level": None,
+                        # orbit players never came off a board, so they have no
+                        # standing to cross-reference. Blank, not zero — zero
+                        # would sort them to the FRONT of a general-board order.
+                        "global_pos": None, "located_on_general": "",
+                        "valve_top_hero": "", "id_confirmed": "",
                         "account_id": aid, "mmr": None,
                         "ranked_rating": round(rating, 4),
                         "last_match_id": int(s_["last_match_id"]),
@@ -1385,7 +1583,13 @@ def main():
           [dict(c, hero=heroes.get(c["hero_id"], ""))
            for lst in chosen.values()
            for c in sorted(lst, key=lambda x: -x["ranked_rating"])],
-          ["hero_id", "hero", "region", "ladder_pos", "account_id", "account_name",
+          ["hero_id", "hero", "region", "ladder_pos",
+           # the restored cross-reference: standing on the region's general
+           # board, whether the entry was found there at all, whether Valve's
+           # own top_hero_ids agrees with the assignment, and whether the id
+           # was claimed by BOTH boards. ceiling_rank.py orders on global_pos.
+           "global_pos", "located_on_general", "valve_top_hero", "id_confirmed",
+           "account_id", "account_name",
            "ranked_rating", "hero_games", "hero_wins",
            "ranked_games", "ranked_wins", "net_wins", "net_wins_decayed",
            "offhero_games", "offhero_wins",
@@ -1456,7 +1660,8 @@ def main():
     write("hero_splits.csv", splits,
           ["hero_id", "hero", "snapshot", "split", "weak", "V_pct", "G_pct", "S_pct"])
     write("excluded.csv", excluded,
-          ["hero_id", "region", "ladder_pos", "account_name", "badge_level", "reason"])
+          ["hero_id", "region", "ladder_pos", "global_pos", "located_on_general",
+           "account_name", "badge_level", "reason"])
 
     thin = [t["hero"] for t in tier if t["thin"]]
     if thin:
@@ -1488,7 +1693,10 @@ def main():
 def write(name, rows, cols):
     path = os.path.join(OUT_DIR, name)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        # restval, because rows now come from several sources — board-sourced,
+        # orbit-sourced, exclusion records — and a source that legitimately has
+        # no general-board standing should write a blank cell, not raise.
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore", restval="")
         w.writeheader()
         w.writerows(rows)
     print("  -> %s (%d rows)" % (path, len(rows)), file=sys.stderr)
