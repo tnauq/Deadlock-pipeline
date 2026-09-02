@@ -1,0 +1,148 @@
+name: Apply design motion
+
+# Port the ANIMATION from design.html onto the real site's own markup.
+#
+# The Design export is not a variant of your site — it is a separate app in
+# dc-runtime's template language with mock data. Its markup cannot be spliced
+# in. Its motion, though, is plain CSS on two controls that your site already
+# has (.regions button, .hero), so it transplants exactly.
+#
+#   Actions -> Apply design motion -> Run workflow
+#     apply    false (default) = artifact only. true = commit
+#     revert   true = strip the injected block and restore the original
+#
+# The block is delimited by markers and re-injected in place on re-runs, so
+# running this twice does not stack two copies.
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Commit the change (false = dry run)"
+        required: false
+        default: "false"
+      revert:
+        description: "Remove the injected motion block"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+
+jobs:
+  motion:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT || github.token }}
+
+      - name: Inject
+        env:
+          REVERT: ${{ github.event.inputs.revert }}
+        run: |
+          python3 - <<'PY'
+          import os, re, sys, pathlib
+
+          TARGET = pathlib.Path("docs/index.html")
+          OUT = pathlib.Path("output"); OUT.mkdir(exist_ok=True)
+          BEGIN = "/* === design-motion: begin (generated) === */"
+          END   = "/* === design-motion: end === */"
+          REVERT = (os.environ.get("REVERT") or "false").lower() == "true"
+
+          if not TARGET.exists():
+              sys.exit("%s missing." % TARGET)
+          # newline="" keeps CRLF lines intact — read_text would silently
+          # rewrite every one of them and bury the real change in the diff.
+          site = TARGET.open("r", encoding="utf-8", newline="").read()
+          (OUT / "index.before.html").write_text(site, "utf-8")
+
+          if "data-dc-script" in site:
+              sys.exit("docs/index.html is still the Design mock. Run 'Restore site' first.")
+          if ".regions button" not in site or ".hero .ic" not in site:
+              sys.exit("Expected selectors (.regions button, .hero .ic) not found — "
+                       "this is not the site this workflow was written against.")
+
+          CSS = BEGIN + """
+          /* Motion lifted from the Claude Design export. Values are the
+             export's own: .2s on the region pills, and an overshooting
+             cubic-bezier on the hero tiles so the lift settles rather than
+             stopping flat. The site's existing
+             @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+             still overrides all of it — nothing here uses !important. */
+
+          :root{ --accent:#e0b06a; }
+
+          /* Region pills: letter-spacing opens on hover, press scales down. */
+          .regions button{
+            transition:background .2s, color .2s, letter-spacing .2s, transform .12s;
+          }
+          .regions button:hover{ letter-spacing:.18em; color:var(--text); }
+          .regions button:active{ transform:scale(.95); }
+
+          /* Hero tiles: lift on hover, press in on tap, accent ring when
+             selected. Replaces the flat .12s border/transform transition. */
+          .hero .ic{
+            transition:border-color .18s, box-shadow .25s,
+                       transform .2s cubic-bezier(.2,.9,.3,1.3);
+          }
+          .hero .nm{ transition:color .18s; }
+          .hero:hover .ic{ transform:translateY(-4px); border-color:var(--dim); }
+          .hero:active .ic{ transform:translateY(-1px) scale(.96); }
+          .hero[aria-pressed=true] .ic{
+            border-color:var(--accent);
+            transform:translateY(-3px);
+            box-shadow:0 6px 22px -6px rgba(224,176,106,.55);
+          }
+          .hero[aria-pressed=true] .nm{ color:var(--text); }
+
+          /* Touch devices fire :hover on tap and leave it stuck until the next
+             tap elsewhere, which reads as a stuck tile on a phone. */
+          @media (hover:none){
+            .hero:hover .ic{ transform:none; }
+            .regions button:hover{ letter-spacing:.12em; color:var(--dim); }
+            .regions button[aria-pressed=true]:hover{ color:var(--text); }
+          }
+          """ + END
+
+          # Idempotent: replace an existing block, else append a new <style>.
+          if BEGIN in site:
+              site_new = re.sub(re.escape(BEGIN) + r".*?" + re.escape(END), 
+                                lambda m: "" if REVERT else CSS, site, flags=re.S)
+              if REVERT:
+                  site_new = re.sub(r'<style>\s*</style>\s*', '', site_new)
+              print("existing block " + ("removed" if REVERT else "replaced"))
+          elif REVERT:
+              print("no injected block present — nothing to revert")
+              site_new = site
+          else:
+              i = site.rfind("</style>")
+              if i == -1:
+                  sys.exit("No </style> in the document to anchor to.")
+              i += len("</style>")
+              site_new = site[:i] + "\n<style>\n" + CSS + "\n</style>" + site[i:]
+              print("block injected after the last </style>")
+
+          if "data.json" not in site_new:
+              sys.exit("Refusing: result no longer references data.json.")
+
+          (OUT / "index.after.html").write_text(site_new, "utf-8")
+          TARGET.open("w", encoding="utf-8", newline="").write(site_new)
+          print("%d bytes -> %d bytes" % (len(site), len(site_new)))
+          PY
+
+      - name: Upload for review
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: design-motion
+          path: output/
+
+      - name: Commit
+        if: ${{ github.event.inputs.apply == 'true' }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/index.html
+          git diff --cached --quiet || git commit -m "apply design motion to site controls"
+          git push
