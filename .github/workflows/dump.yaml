@@ -1,0 +1,161 @@
+name: Repo dump
+
+# Concatenate the whole repo (or a subtree) into readable text chunks and
+# upload them as an artifact. Built for reading a repo from a phone.
+#
+#   Actions -> Repo dump -> Run workflow
+#     paths       glob(s) to include, space separated. default: everything
+#     max_kb      skip any single file larger than this. default: 256
+#     chunk_kb    size of each output part. default: 400
+
+on:
+  workflow_dispatch:
+    inputs:
+      paths:
+        description: "Paths/globs to include (space separated, blank = all)"
+        required: false
+        default: ""
+      max_kb:
+        description: "Skip files larger than this many KB"
+        required: false
+        default: "256"
+      chunk_kb:
+        description: "Split the dump into parts of this many KB"
+        required: false
+        default: "400"
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build dump
+        env:
+          IN_PATHS: ${{ github.event.inputs.paths }}
+          MAX_KB: ${{ github.event.inputs.max_kb }}
+          CHUNK_KB: ${{ github.event.inputs.chunk_kb }}
+        run: |
+          python3 - <<'PY'
+          import os, subprocess, fnmatch, pathlib
+
+          MAX   = int(os.environ.get("MAX_KB")   or 256) * 1024
+          CHUNK = int(os.environ.get("CHUNK_KB") or 400) * 1024
+          globs = (os.environ.get("IN_PATHS") or "").split()
+
+          OUT = pathlib.Path("output"); OUT.mkdir(exist_ok=True)
+
+          tracked = subprocess.run(
+              ["git", "ls-files", "-z"], capture_output=True, check=True
+          ).stdout.decode().split("\0")
+          tracked = [f for f in tracked if f]
+
+          if globs:
+              tracked = [f for f in tracked
+                         if any(fnmatch.fnmatch(f, g) or f.startswith(g.rstrip("/") + "/")
+                                for g in globs)]
+
+          SKIP_EXT = {
+              ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip",
+              ".gz", ".tar", ".7z", ".vpk", ".vpk_c", ".dll", ".exe", ".so",
+              ".bin", ".ttf", ".otf", ".woff", ".woff2", ".mp3", ".mp4", ".wav",
+          }
+
+          def is_text(path):
+              try:
+                  with open(path, "rb") as f:
+                      head = f.read(4096)
+              except OSError:
+                  return False
+              if b"\0" in head:
+                  return False
+              try:
+                  head.decode("utf-8")
+              except UnicodeDecodeError:
+                  return False
+              return True
+
+          included, skipped = [], []
+          for f in tracked:
+              p = pathlib.Path(f)
+              if not p.is_file():
+                  continue
+              size = p.stat().st_size
+              if p.suffix.lower() in SKIP_EXT:
+                  skipped.append((f, size, "binary ext")); continue
+              if size > MAX:
+                  skipped.append((f, size, "too large")); continue
+              if not is_text(p):
+                  skipped.append((f, size, "not text")); continue
+              included.append((f, size))
+
+          sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                               capture_output=True, text=True).stdout.strip()
+
+          head = []
+          head.append("# Repo dump")
+          head.append("")
+          head.append("repo:   %s" % os.environ.get("GITHUB_REPOSITORY", "?"))
+          head.append("ref:    %s" % os.environ.get("GITHUB_REF_NAME", "?"))
+          head.append("commit: %s" % sha)
+          head.append("files:  %d included, %d skipped" % (len(included), len(skipped)))
+          head.append("")
+          head.append("## Manifest")
+          head.append("")
+          for f, s in included:
+              head.append("  %8d  %s" % (s, f))
+          if skipped:
+              head.append("")
+              head.append("## Skipped")
+              head.append("")
+              for f, s, why in skipped:
+                  head.append("  %8d  %-11s %s" % (s, why, f))
+          head.append("")
+
+          parts, buf, n = [], [], 0
+          def flush():
+              global buf, n
+              if buf:
+                  parts.append("".join(buf)); buf, n = [], 0
+
+          for line in head:
+              buf.append(line + "\n"); n += len(line) + 1
+
+          FENCE_LANG = {
+              ".py": "python", ".md": "markdown", ".yml": "yaml", ".yaml": "yaml",
+              ".json": "json", ".cs": "csharp", ".sh": "bash", ".sql": "sql",
+              ".csv": "", ".txt": "", ".toml": "toml", ".xml": "xml",
+          }
+
+          for f, s in included:
+              body = pathlib.Path(f).read_text("utf-8", "replace")
+              lang = FENCE_LANG.get(pathlib.Path(f).suffix.lower(), "")
+              fence = "```"
+              while fence in body:
+                  fence += "`"
+              block = "\n\n---\n\n## `%s`  (%d bytes)\n\n%s%s\n%s\n%s\n" % (
+                  f, s, fence, lang, body.rstrip("\n"), fence)
+              if n and n + len(block) > CHUNK:
+                  flush()
+              buf.append(block); n += len(block)
+          flush()
+
+          width = len(str(len(parts)))
+          for i, text in enumerate(parts, 1):
+              name = OUT / ("repo-dump-%0*d-of-%d.md" % (width, i, len(parts)))
+              banner = "<!-- part %d of %d · %s @ %s -->\n\n" % (
+                  i, len(parts), os.environ.get("GITHUB_REPOSITORY", "?"), sha)
+              name.write_text(banner + text, "utf-8")
+              print("wrote %s (%d KB)" % (name, len(text) // 1024))
+
+          print("%d parts, %d files, %d skipped" % (len(parts), len(included), len(skipped)))
+          PY
+
+      - name: Upload dump
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-dump
+          path: output/
