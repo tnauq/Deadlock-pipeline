@@ -336,6 +336,49 @@ footer a{color:var(--dim)}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
+<style>
+/* === design-motion: begin (generated) === */
+/* Motion lifted from the Claude Design export. Values are the
+   export's own: .2s on the region pills, and an overshooting
+   cubic-bezier on the hero tiles so the lift settles rather than
+   stopping flat. The site's existing
+   @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+   still overrides all of it — nothing here uses !important. */
+
+:root{ --accent:#e0b06a; }
+
+/* Region pills: letter-spacing opens on hover, press scales down. */
+.regions button{
+  transition:background .2s, color .2s, letter-spacing .2s, transform .12s;
+}
+.regions button:hover{ letter-spacing:.18em; color:var(--text); }
+.regions button:active{ transform:scale(.95); }
+
+/* Hero tiles: lift on hover, press in on tap, accent ring when
+   selected. Replaces the flat .12s border/transform transition. */
+.hero .ic{
+  transition:border-color .18s, box-shadow .25s,
+             transform .2s cubic-bezier(.2,.9,.3,1.3);
+}
+.hero .nm{ transition:color .18s; }
+.hero:hover .ic{ transform:translateY(-4px); border-color:var(--dim); }
+.hero:active .ic{ transform:translateY(-1px) scale(.96); }
+.hero[aria-pressed=true] .ic{
+  border-color:var(--accent);
+  transform:translateY(-3px);
+  box-shadow:0 6px 22px -6px rgba(224,176,106,.55);
+}
+.hero[aria-pressed=true] .nm{ color:var(--text); }
+
+/* Touch devices fire :hover on tap and leave it stuck until the next
+   tap elsewhere, which reads as a stuck tile on a phone. */
+@media (hover:none){
+  .hero:hover .ic{ transform:none; }
+  .regions button:hover{ letter-spacing:.12em; color:var(--dim); }
+  .regions button[aria-pressed=true]:hover{ color:var(--text); }
+}
+/* === design-motion: end === */
+</style>
 </head>
 <body>
 <div class="backdrop" aria-hidden="true"></div>
