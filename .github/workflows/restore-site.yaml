@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.PAT }}
+          token: ${{ secrets.PAT || github.token }}
 
       - name: Find and restore
         id: restore
