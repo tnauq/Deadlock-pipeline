@@ -6,8 +6,27 @@ The per-hero leaderboard gives position WITHIN a hero, so it cannot compare
 heroes against each other — every hero has a rank 1. A hero's ceiling is
 therefore its best board player's standing in the region as a whole.
 
-WHAT ORDERS THE CEILING — changed 2026-08-07
---------------------------------------------
+WHAT ORDERS THE CEILING — REVERTED 2026-09-02 to the cross-hero board
+---------------------------------------------------------------------
+CEILING_METRIC=board (the default again) orders a hero by its best confirmed
+player's POSITION on the region's general leaderboard. CEILING_METRIC=net_wins
+restores the ranked ordering described below.
+
+Why the revert: the ranked ordering rested on ranked play being a growing,
+representative slice. It is not. Ranked volume stalled and the ranked ladder
+feeding it has been degrading run over run, so net wins is now accumulated over
+a shrinking and unrepresentative sample, and the ranked_rank floor meant to
+contain that has been unreadable on every row since 2026-08-18. The general
+board is imperfect for the reasons set out immediately below — it is all-mode
+and unfilterable — but it is PUBLISHED BY VALVE, is a single cross-hero
+ordering by construction, and does not depend on any of the ratings that died.
+An unfilterable board beats a filtered statistic computed over a slice that is
+disappearing.
+
+The ranked argument is kept verbatim below because it was correct when written
+and will be correct again if ranked recovers; net_wins is one env var away.
+
+--- ranked-era reasoning, retained ---
 It used to be the player's position on Valve's cross-hero board. That board is
 not ranked-gated, so it ranked all-mode standing while every build we sample is
 ranked-only. Worse, it cannot be filtered: the OpenAPI spec exposes no
@@ -142,13 +161,34 @@ API_KEY = os.environ.get("DEADLOCK_API_KEY")
 REGIONS = [r.strip() for r in
            (os.environ.get("REGIONS") or "NAmerica,Europe").split(",") if r.strip()]
 OUT_DIR = "output"
-MATCH_MODE = os.environ.get("MATCH_MODE") or "Ranked"
+# "" = no match_mode filter: standard play, which is what the general board is
+# itself built from. Matches the pipeline's own default. Set MATCH_MODE=Ranked
+# to go back to the ranked cohort (and set CEILING_METRIC=net_wins with it).
+MATCH_MODE = os.environ.get("MATCH_MODE") or ""
+
+# WHAT ORDERS THE CEILING.
+#   "board"     general-board position, ascending — the restored default
+#   "net_wins"  ranked net wins, descending — the 2026-08-07 to 2026-09-02
+#               behaviour, kept for comparison and for if ranked recovers
+# Whichever is not the key is still written to ceiling.csv as a reference
+# column, so one run produces both orderings' inputs and they can be diffed.
+CEILING_METRIC = (os.environ.get("CEILING_METRIC") or "board").strip().lower()
+if CEILING_METRIC not in ("board", "net_wins"):
+    raise SystemExit("CEILING_METRIC must be 'board' or 'net_wins', got %r"
+                     % CEILING_METRIC)
 MAX_URL = int(os.environ.get("MAX_URL") or 9000)
 
 # Shrinkage for the SECONDARY win-rate column. Not the ordering — kept so the
 # two can be compared when the ladder switches to percentile ranking and net
 # wins expires. k=25 matches the pipeline's pool selection.
 SHRINK_K = int(os.environ.get("SHRINK_K") or 25)
+
+# ---- hero-board-only candidates -------------------------------------------
+# Admit hero-board players who are not on the region's cross-hero board, as a
+# second tier ranked strictly behind every dual-confirmed player. See
+# all_on_board() for why their general position is CENSORED rather than
+# imputed, and why no win-rate term is mixed in. 0 = old strict behaviour.
+ALLOW_HERO_BOARD_ONLY = os.environ.get("ALLOW_HERO_BOARD_ONLY", "1") == "1"
 
 # ---- orbit fallback -------------------------------------------------------
 # Board-sourced candidates run thin on unpopular heroes — 11 of 76 hero-regions
@@ -208,8 +248,16 @@ ETERNUS_WARN_SHARE = float(os.environ.get("ETERNUS_WARN_SHARE") or 0.02)
 # `or "Phantom"` would swallow an explicit empty value, so the default is
 # applied only when the variable is genuinely unset — CEILING_MIN_RANK= means
 # OFF, not Phantom.
+# DEFAULT CHANGED 2026-09-02: off under CEILING_METRIC=board. The floor exists
+# because net wins is an ACCUMULATION that a high-volume player at a middling
+# rank can reach by grinding. Board position is not an accumulation — it is
+# already a ranking — so the failure the floor guards against does not arise,
+# and applying an unreadable rank check on top of it can only drop good
+# candidates. Under net_wins the default is Phantom exactly as before.
 _MIN_RANK_ENV = os.environ.get("CEILING_MIN_RANK")
-CEILING_MIN_RANK = ("Phantom" if _MIN_RANK_ENV is None else _MIN_RANK_ENV).strip()
+_MIN_RANK_DEFAULT = "" if CEILING_METRIC == "board" else "Phantom"
+CEILING_MIN_RANK = (_MIN_RANK_DEFAULT if _MIN_RANK_ENV is None
+                    else _MIN_RANK_ENV).strip()
 # What an unreadable rank means: "keep" (default, degrades to no floor when the
 # field is empty) or "drop" (strict — only use once ranked_rank is populated).
 CEILING_RANK_UNKNOWN = (os.environ.get("CEILING_RANK_UNKNOWN") or "keep").strip().lower()
@@ -367,51 +415,102 @@ def fetch_hero_board(region, hero_id):
         nm = e.get("account_name")
         if not nm:
             continue
-        out.append({"hero_pos": i, "name": nm,
-                    "ids": {int(a) for a in (e.get("possible_account_ids") or []) if a}})
+        # ORDER MATTERS and must never be re-sorted: the id list is
+        # best-match-first (92% of resolutions came from slot 0, 8% from slot 1,
+        # 0% from slot 2+). It was a set here, which threw that away — harmless
+        # while every candidate was dual-confirmed and the intersection was
+        # usually a single id, but a hero-board-only candidate has no
+        # intersection to fall back on and slot 0 is the whole of its identity.
+        ids = []
+        for a in (e.get("possible_account_ids") or []):
+            a = int(a)
+            if a and a not in ids:
+                ids.append(a)
+        out.append({"hero_pos": i, "name": nm, "ids": ids})
     return out
 
 
-def all_on_board(hero_entries, by_name):
+def all_on_board(hero_entries, by_name, board_size=0, region_depth=0):
     """
-    EVERY dual-confirmed player on a hero's board, not just the best one.
+    Every usable player on a hero's board, in two tiers.
 
-    Previously this returned only the lowest cross-hero position, because
-    position WAS the ordering. Net wins is not known at this stage, so all
-    confirmed candidates are returned and the winner is chosen after their
-    ranked records arrive.
+    TIER 1 — "confirmed". Display name appears on BOTH this hero's board and
+    the region's cross-hero board, AND the two candidate id lists intersect.
+    possible_account_ids is deadlock-api's own fuzzy name resolution, not an
+    identity Valve publishes, and name-only matching put the wrong player in
+    110 of 371 slots — so both signals are required. Unchanged.
 
-    A match needs BOTH the display name and an account id to agree —
-    possible_account_ids is a candidate list, and name-only matching put the
-    wrong player in 110 of 371 slots historically.
+    TIER 2 — "hero_board_only", new 2026-09-02, gated by ALLOW_HERO_BOARD_ONLY.
+    A hero-board player whose name is not on the cross-hero board at all. As
+    the general board degrades this is most of the board: confirm rate on run
+    43 was 23.7% NA / 29.3% EU, so roughly three quarters of entries were being
+    discarded outright, and thin heroes were left with four or five candidates
+    out of a board of twenty.
+
+    HOW TIER 2 IS RANKED, since it has no cross-hero position. Being absent
+    from the general board is not missing data — that board IS the region's
+    top 1,000 (limit=2000 and limit=5000 both return 1,001), so an absent
+    player is genuinely ranked below 1,000th. Their general position is
+    therefore CENSORED at region_depth + 1 rather than imputed or guessed, and
+    no second metric (win rate, net wins) is mixed into a positional ordering.
+    They sort behind every confirmed player by construction.
+
+    The censoring conflates two causes — genuinely below the cut, or a name
+    deadlock-api failed to resolve — and cannot separate them. The error only
+    ever pushes a real candidate DOWN, never promotes a weak one, so a tier-2
+    ceiling is a FLOOR on that hero's ceiling, not an estimate of it. `match`
+    carries the tier so the site can mark those rows.
     """
+    censored_pos = (region_depth or 1000) + 1
     found = []
     for he in hero_entries:
+        hit = None
         for cand in by_name.get(he["name"], []):
-            common = he["ids"] & cand["ids"]
+            # first id both boards offer, in the hero board's own order — NOT
+            # min(), which picked the numerically smallest and silently
+            # discarded best-match-first ordering
+            common = [a for a in he["ids"] if a in cand["ids"]]
             if common:
-                found.append({
+                hit = {
                     "name": cand["name"],
-                    # the id on BOTH boards — the strongest identity available
-                    "account_id": min(common),
+                    "account_id": common[0],
                     "pos": cand["pos"],
                     "hero_pos": he["hero_pos"],
                     "badge": cand["badge"],
                     "ranked_rank": cand.get("ranked_rank"),
                     "top_heroes": cand["top_heroes"],
-                })
+                    "match": "confirmed",
+                    "board_size": board_size,
+                }
                 break
+        if hit is None and ALLOW_HERO_BOARD_ONLY and he["ids"]:
+            hit = {
+                "name": he["name"],
+                # slot 0: the only identity signal a tier-2 entry has
+                "account_id": he["ids"][0],
+                "pos": censored_pos,
+                "hero_pos": he["hero_pos"],
+                "badge": None,
+                "ranked_rank": None,
+                "top_heroes": [],
+                "match": "hero_board_only",
+                "board_size": board_size,
+            }
+        if hit is not None:
+            found.append(hit)
     return found
 
 
-# --------------------------------------------------------------------------
-# RANKED RECORDS  (batched, no SQL)
-# --------------------------------------------------------------------------
+def _hs_url(base, ids):
+    """base already ends in '?' or '?match_mode=...'; join the ids correctly
+    either way rather than assuming a leading '&' is safe."""
+    q = "&".join("account_ids=%d" % a for a in ids)
+    return base + ("&" if not base.endswith("?") else "") + q
 
 
 def fetch_ranked_records(account_ids):
     """
-    account_id -> {"games": n, "wins": n} over RANKED play, all heroes.
+    account_id -> {"games": n, "wins": n} over MATCH_MODE play, all heroes.
 
     /v1/players/hero-stats is batched via repeated account_ids params, runs at
     100 req/s, and is a different bucket from /v1/sql. It returns one row per
@@ -426,7 +525,10 @@ def fetch_ranked_records(account_ids):
     # per (account, hero) as well: an orbit candidate has no board membership
     # to prove they play the hero, so the hero-level record is the only check
     per_hero = {}
-    base = "%s/v1/players/hero-stats?match_mode=%s" % (BASE, urllib.parse.quote(MATCH_MODE))
+    # An empty match_mode is omitted rather than sent blank — hero-stats 400s
+    # on match_mode= with no value.
+    params = ["match_mode=%s" % urllib.parse.quote(MATCH_MODE)] if MATCH_MODE else []
+    base = "%s/v1/players/hero-stats?%s" % (BASE, "&".join(params))
     # ~22.7 encoded chars per id (SCHEMA.md quirk 4); size the chunk against the
     # REAL url length, prefix included, rather than the query string alone
     per = 24
@@ -434,10 +536,10 @@ def fetch_ranked_records(account_ids):
     calls = 0
     for i in range(0, len(ids), chunk):
         part = ids[i:i + chunk]
-        url = base + "".join("&account_ids=%d" % a for a in part)
+        url = _hs_url(base, part)
         if len(url) > MAX_URL:
             part = part[:max(20, len(part) // 2)]
-            url = base + "".join("&account_ids=%d" % a for a in part)
+            url = _hs_url(base, part)
         try:
             rows = get(url)
         except Exception as e:
@@ -476,7 +578,7 @@ FROM match_player
 WHERE match_id IN (
     SELECT match_id FROM match_player
     WHERE account_id IN ({ids})
-      AND match_mode = '{mode}' AND game_mode = 'Normal'
+      AND {mode}game_mode = 'Normal'
       AND start_time >= now() - INTERVAL {days} DAY
 )
 """
@@ -516,8 +618,9 @@ def fetch_orbit1(seed_ids):
     if not seeds:
         return {}
     try:
+        mode_sql = "match_mode = '%s' AND " % MATCH_MODE if MATCH_MODE else ""
         rows = sql(Q_ORBIT.format(ids=",".join(str(a) for a in seeds),
-                                  mode=MATCH_MODE, days=ORBIT_DAYS),
+                                  mode=mode_sql, days=ORBIT_DAYS),
                    "orbit1 from %d seeds" % len(seeds))
     except Exception as e:
         print("  [orbit] failed (%s) — continuing without the fallback" % e,
@@ -545,23 +648,75 @@ def fetch_orbit1(seed_ids):
     return final
 
 
-def ceiling_value(rec):
+NO_BOARD_POS = 10 ** 9      # the sentinel an orbit candidate carries
+
+
+def hero_pct(cand):
+    """Position on the hero's OWN board as a fraction, 0 = best.
+
+    THE TIEBREAK FOR CENSORED CANDIDATES. Every hero-board-only player in a
+    region shares the same censored general position, so without this all of
+    them tie and two heroes whose ceilings are both their board's #1 would be
+    ordered arbitrarily. Dividing by board size makes #1 of 204 beat #1 of 18,
+    on the reasoning that the deeper board's leader has beaten more people.
+
+    Two limits worth knowing. It rewards board DEPTH, which tracks hero
+    popularity as much as difficulty, so it should stay a tiebreak and never
+    become the primary key. And on the thinnest boards it is very coarse —
+    EU Mirage has 18 entries, so consecutive positions differ by 5.6 points,
+    and the term degenerates to "is this player #1 or not".
+
+    Orbit candidates were on no board at all and return 1.0, behind everyone.
     """
-    THE ORDERING. Net wins over ranked play: wins minus losses.
+    bs = cand.get("board_size") or 0
+    if not bs or cand["hero_pos"] >= NO_BOARD_POS:
+        return 1.0
+    return cand["hero_pos"] / float(bs)
 
-    This is not a proxy for rank, it is the currency rescaled: a win is about
-    +250 Rank Points, a loss about -250, and 1000 RP buys a Subrank, so
-    accumulated RP is roughly 250 x this number. DO NOT decay it — a decayed
-    figure corresponds to no rank any player holds.
 
-    Eligibility to be scored at all is gated separately by passes_floor();
-    this function ranks whoever clears that gate.
+def ceiling_key(rec, cand):
+    """
+    THE ORDERING, as a sort key: lower is better.
 
-    Replace this one function when the ladder stops being progression-based —
-    see the module docstring, and watch the [eternus] lines in the log.
-    Everything else keys off whatever it returns.
+    CEILING_METRIC=board (default) — the player's position on the region's
+    cross-hero leaderboard, ascending. Position 1 is the region's best player,
+    so a hero whose best confirmed player sits at 7 outranks one whose best
+    sits at 308. This is a RANKING published by Valve, not a quantity we
+    accumulate, which is the whole reason for coming back to it: it cannot be
+    inflated by volume and it does not depend on any rating endpoint. Ties
+    Ties break on hero-board percentile (see hero_pct — this is what separates
+    two censored tier-2 candidates who are both their board's #1), then on net
+    wins, then on raw hero-board position.
+
+    Orbit candidates were never on a board and carry NO_BOARD_POS, so they sort
+    behind every board player and can only become a ceiling for a hero-region
+    with no confirmed board candidate at all — which is exactly the case the
+    orbit fallback exists for.
+
+    CEILING_METRIC=net_wins — ranked net wins, descending, negated here so the
+    same "lower is better" convention holds. See the retained ranked-era
+    reasoning in the module docstring; that ordering must not be decayed.
+    """
+    if CEILING_METRIC == "board":
+        return (cand["pos"], hero_pct(cand), -ceiling_net_wins(rec),
+                cand["hero_pos"])
+    return (-ceiling_net_wins(rec), cand["pos"], hero_pct(cand),
+            cand["hero_pos"])
+
+
+def ceiling_net_wins(rec):
+    """Net wins over MATCH_MODE play: wins minus losses.
+
+    The ordering under CEILING_METRIC=net_wins, and the first tiebreak under
+    "board". Still written to every row either way, so the two orderings can be
+    compared from one run's output.
     """
     return 2 * rec["wins"] - rec["games"]
+
+
+# Back-compat alias: this was the ordering function and is referenced by name
+# in the docstring and in the [eternus] warnings.
+ceiling_value = ceiling_net_wins
 
 
 def shrunk(rec, k=None):
@@ -575,6 +730,11 @@ def shrunk(rec, k=None):
 
 def main():
     tier = {r["hero"]: r for r in csv.DictReader(open(os.path.join(OUT_DIR, "tierlist.csv")))}
+
+    print("[metric] ceiling ordered by %s; match_mode=%s"
+          % ("general-board position (ascending)" if CEILING_METRIC == "board"
+             else "ranked net wins (descending)",
+             MATCH_MODE or "standard (unfiltered)"), file=sys.stderr)
 
     floor_idx = _min_rank_index()
     if floor_idx is None:
@@ -616,18 +776,30 @@ def main():
     for rg in REGIONS:
         by_name = boards[rg][0]
         n_missing = 0
+        n_tier2 = 0
         missing_heroes = []
         for hid, hero in sorted(hero_ids.items(), key=lambda kv: kv[1]):
             hb = fetch_hero_board(rg, hid)
             time.sleep(0.15)          # 100 req/s allowed; stay well clear
-            cands = all_on_board(hb, by_name) if hb else []
+            cands = all_on_board(hb, by_name, board_size=len(hb),
+                                 region_depth=depth[rg]) if hb else []
             confirmed[(rg, hid)] = (cands, len(hb))
-            if not cands:
+            n_conf = sum(1 for c in cands if c["match"] == "confirmed")
+            n_tier2 += len(cands) - n_conf
+            # thinness is counted on TIER 1 only: a hero with no dual-confirmed
+            # player is still the case the orbit fallback and the tier-2 tier
+            # exist for, and counting tier-2 here would hide it
+            if not n_conf:
                 n_missing += 1
                 missing_heroes.append(hero)
-        print("  [xref] %-9s %d heroes with a confirmed player, %d without"
+        print("  [xref] %-9s %d heroes with a dual-confirmed player, %d without; "
+              "%d hero-board-only candidates admitted (%s)"
               % (rg, sum(1 for k, v in confirmed.items()
-                         if k[0] == rg and v[0]), n_missing), file=sys.stderr)
+                         if k[0] == rg
+                         and any(c["match"] == "confirmed" for c in v[0])),
+                 n_missing, n_tier2,
+                 "tier 2 ON" if ALLOW_HERO_BOARD_ONLY else "tier 2 OFF"),
+              file=sys.stderr)
         if missing_heroes:
             # These are exactly the hero-regions the orbit fallback exists for.
             # Before 2026-08-18 they were skipped BEFORE the fallback ran and
@@ -644,18 +816,24 @@ def main():
     orbit = {}
     if ORBIT_FALLBACK:
         for rg in REGIONS:
+            def _n_conf(cands):
+                return sum(1 for c in cands if c["match"] == "confirmed")
             thin = [hid for (r, hid), (cands, _n) in confirmed.items()
-                    if r == rg and len(cands) < ORBIT_MIN_CANDIDATES]
+                    if r == rg and _n_conf(cands) < ORBIT_MIN_CANDIDATES]
             if not thin:
                 print("  [orbit] %-9s no thin hero-regions" % rg, file=sys.stderr)
                 continue
             empty = [hid for (r, hid), (cands, _n) in confirmed.items()
-                     if r == rg and not cands]
+                     if r == rg and not _n_conf(cands)]
             # seed from the strongest board positions in this region — the
             # accounts most likely to actually be near the ceiling
+            # seed only from DUAL-CONFIRMED accounts: a tier-2 id is a slot-0
+            # guess, and seeding the orbit query off a misresolved account
+            # would propagate that error to every candidate it reaches
             seeds = sorted({c["account_id"]: c["pos"]
                             for (r, _h), (cands, _n) in confirmed.items()
-                            if r == rg for c in cands}.items(),
+                            if r == rg for c in cands
+                            if c["match"] == "confirmed"}.items(),
                            key=lambda kv: kv[1])
             if not seeds:
                 print("  [orbit] %-9s no seed accounts anywhere in this region "
@@ -684,7 +862,8 @@ def main():
         # mattered. The genuinely-empty case is handled by `if not scored`
         # below, which still drops the hero but only after the fallback has had
         # its turn.
-        if len(cands) < ORBIT_MIN_CANDIDATES and orbit.get(rg):
+        n_conf = sum(1 for c in cands if c["match"] == "confirmed")
+        if n_conf < ORBIT_MIN_CANDIDATES and orbit.get(rg):
             have = {c["account_id"] for c in cands}
             for aid, prox in orbit[rg].items():
                 if aid in have:
@@ -702,9 +881,9 @@ def main():
                     continue
                 pool.append({"name": "", "account_id": aid,
                              # no board position: they were not on it
-                             "pos": 10 ** 9, "hero_pos": 10 ** 9,
+                             "pos": NO_BOARD_POS, "hero_pos": NO_BOARD_POS,
                              "badge": None, "ranked_rank": None,
-                             "top_heroes": [],
+                             "top_heroes": [], "match": "orbit", "board_size": 0,
                              "seeds_met": prox["seeds_met"],
                              "shared": prox["shared"],
                              "hero_games": hrec["games"]})
@@ -725,14 +904,16 @@ def main():
             if not ok:
                 floored_out += 1
                 continue
-            scored.append((ceiling_value(rec), rec, c))
+            scored.append((ceiling_key(rec, c), rec, c))
         if not scored:
             continue
-        # the ceiling: the ELIGIBLE confirmed player with the most net ranked
-        # wins. Ties break on the better cross-hero board position, then on
-        # their standing on this hero's own board.
-        scored.sort(key=lambda t: (-t[0], t[2]["pos"], t[2]["hero_pos"]))
-        net, rec, c = scored[0]
+        # the ceiling: the ELIGIBLE confirmed player who sorts first under
+        # ceiling_key — best general-board position by default, most net wins
+        # under CEILING_METRIC=net_wins. The key already carries its own
+        # tiebreaks, so this sort is total and never depends on pool order.
+        scored.sort(key=lambda t: t[0])
+        _key, rec, c = scored[0]
+        net = ceiling_net_wins(rec)
         t = tier.get(hero, {})
         per_region[rg].append({
             "hero": hero,
@@ -745,22 +926,39 @@ def main():
             "ranked_games": rec["games"],
             "ranked_wins": rec["wins"],
             "shrunk_winrate": round(shrunk(rec), 4),
-            # reference only — what the ceiling used to be ordered by
+            # Under CEILING_METRIC=board this IS the ordering; under net_wins
+            # it is the reference column. Either way both are always written.
             # An orbit player was never on a board, so a position would be a
             # lie. The 1e9 sentinel exists only to sort them last on ties.
-            "global_pos": "" if c["pos"] >= 10 ** 9 else c["pos"],
+            # blank for anyone not dual-confirmed: a tier-2 player's position
+            # is CENSORED (known only to be past the general board's 1,000) and
+            # an orbit player was never on a board, so printing either as a
+            # number would state a standing neither one has
+            "global_pos": c["pos"] if c["match"] == "confirmed" else "",
+            "general_pos_censored": "YES" if c["match"] == "hero_board_only" else "",
+            "hero_pct": round(hero_pct(c), 4) if c["match"] != "orbit" else "",
+            # which ordering produced ceiling_rank in THIS file. build_site_data
+            # sorts on ceiling_rank and cannot otherwise tell the two apart, so
+            # a file is never ambiguous about what it was ranked by.
+            "ceiling_metric": CEILING_METRIC,
             "region_depth": depth[rg],
-            "pct": "" if c["pos"] >= 10 ** 9 else round(100.0 * c["pos"] / max(depth[rg], 1), 3),
+            "pct": (round(100.0 * c["pos"] / max(depth[rg], 1), 3)
+                    if c["match"] == "confirmed" else ""),
             "badge_level": c["badge"],
             # badge_level reads blank on every ranked row; ranked_rank is the
             # surviving rank signal and is what the Eternus watch and the rank
             # floor both key off.
             "ranked_rank": c.get("ranked_rank") if c.get("ranked_rank") is not None else "",
             "rank_name": _rank_name(c.get("ranked_rank")),
-            "hero_ladder_pos": "" if c["hero_pos"] >= 10 ** 9 else c["hero_pos"],
-            "match": "orbit" if c.get("seeds_met") else "confirmed",
+            "hero_ladder_pos": "" if c["hero_pos"] >= NO_BOARD_POS else c["hero_pos"],
+            # confirmed | hero_board_only | orbit — how this ceiling was
+            # sourced. A hero_board_only row is a FLOOR on the hero's ceiling,
+            # not an estimate; the site should mark it as such.
+            "match": c["match"],
             "valve_top_hero": "YES" if hid in (c["top_heroes"] or []) else "",
-            "located_on_general": len(cands),
+            "located_on_general": sum(1 for x in cands if x["match"] == "confirmed"),
+            "hero_board_only_candidates": sum(1 for x in cands
+                                              if x["match"] == "hero_board_only"),
             "scored_candidates": len(scored),
             # how much of the floor actually bit for this hero-region, and how
             # much of it was unreadable — a run where floored_out is 0 and
@@ -779,21 +977,36 @@ def main():
 
     out = []
     for rg in REGIONS:
-        # Order heroes by their ceiling player's net wins, descending. Ties
-        # fall back to the cross-hero board position and then to the pool win
-        # rate, so ordering never depends on dict iteration order — one account
-        # can be the ceiling for two heroes (a McGinnis/Ivy dual-main) and
-        # would otherwise be sorted arbitrarily.
+        # Order heroes by their ceiling player's standing — general-board
+        # position ascending by default, net wins descending under
+        # CEILING_METRIC=net_wins. The pool win rate is the last tiebreak so
+        # ordering never depends on dict iteration order: one account can be
+        # the ceiling for two heroes (a McGinnis/Ivy dual-main) and would
+        # otherwise be sorted arbitrarily.
         def _wr(d):
             try:
                 return float(d["elite_winrate"])
             except (TypeError, ValueError):
                 return -1.0
+
         def _pos(d):
+            # blank means censored (tier 2) or never on a board (orbit); both
+            # sort behind every dual-confirmed ceiling
             v = d.get("global_pos")
-            return v if isinstance(v, int) else 10 ** 9
-        rows = sorted(per_region.get(rg, []),
-                      key=lambda d: (-d["net_wins"], _pos(d), -_wr(d)))
+            return v if isinstance(v, int) else NO_BOARD_POS
+
+        def _hpct(d):
+            v = d.get("hero_pct")
+            return v if isinstance(v, float) else 1.0
+
+        # hero name last so the order is TOTAL — two heroes can otherwise tie
+        # on every term (same censored position, same board size, same record)
+        # and fall back to dict insertion order, which is not reproducible
+        if CEILING_METRIC == "board":
+            key = lambda d: (_pos(d), _hpct(d), -d["net_wins"], -_wr(d), d["hero"])
+        else:
+            key = lambda d: (-d["net_wins"], _pos(d), _hpct(d), -_wr(d), d["hero"])
+        rows = sorted(per_region.get(rg, []), key=key)
         for i, d in enumerate(rows, 1):
             d["ceiling_rank"] = i
         out.extend(rows)
@@ -805,11 +1018,14 @@ def main():
             print("  [warn] %s: no eligible player with ranked games for %d heroes: %s"
                   % (region, len(gap), ", ".join(gap)), file=sys.stderr)
 
-    cols = ["region", "ceiling_rank", "hero", "hero_id", "ceiling_player",
+    cols = ["region", "ceiling_rank", "ceiling_metric", "hero", "hero_id",
+            "ceiling_player",
             "account_id", "net_wins", "ranked_games", "ranked_wins",
-            "shrunk_winrate", "global_pos", "region_depth", "pct", "badge_level",
+            "shrunk_winrate", "global_pos", "general_pos_censored", "hero_pct",
+            "region_depth", "pct", "badge_level",
             "ranked_rank", "rank_name",
             "hero_ladder_pos", "match", "valve_top_hero", "located_on_general",
+            "hero_board_only_candidates",
             "scored_candidates", "floored_out", "rank_unknown", "min_rank",
             "from_orbit", "ceiling_from_orbit",
             "orbit_seeds_met", "orbit_hero_games", "board_size", "winrate_rank",
@@ -867,7 +1083,7 @@ def main():
             print("    %-9s %-12s %-16s net %d"
                   % (d["region"], d["hero"], d["ceiling_player"], d["net_wins"]),
                   file=sys.stderr)
-        if et:
+        if et and CEILING_METRIC != "board":
             print("  [eternus] net wins tracks rank only while the ladder is "
                   "progression-based. Once a meaningful share of CEILING "
                   "players sit at Eternus, the top of the ordering is "
