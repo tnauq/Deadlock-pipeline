@@ -1,0 +1,168 @@
+name: Revert ceiling_rank.py
+
+# ZERO API CALLS. Pure git. Safe in any hour; nothing here touches the 20 SQL
+# requests/hour budget or the pipeline.
+#
+# WHY THIS EXISTS
+# ceiling_rank.py was overwritten with a play-based id-resolution patch on
+# 2026-09-03. Probe G measured it across all 76 hero-regions and it moves 28 of
+# them, but not uniformly for the better: it rescues NA Dynamo (13 -> 385 hero
+# games) while walking away from EU Ivy at a 0.890 hero share in favour of an
+# id at 0.237. The re-resolution promotes marginal top-of-board entries past
+# genuine mains, so it is net-harmful and comes out.
+#
+# THE TRAP THIS GUARDS AGAINST
+# Two versions of this file have been in play. The 1,307-line version carries
+# the 2026-09-02 identity validation (passes_identity, CEILING_MIN_ACCOUNT_GAMES,
+# the hero_board_only tier) and is what produced run 47's ceiling.csv — nine of
+# that file's columns cannot be emitted without it. A 989-line copy predating
+# all of that has also been circulating. Reverting onto the older one would
+# silently delete the identity work while appearing to fix things, and the
+# resulting ceiling.csv would lose nine columns without erroring.
+#
+# So the restored file is CHECKED before anything is committed: it must compile,
+# and it must still contain the validation markers. The job fails loudly rather
+# than committing a quiet regression.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to restore ceiling_rank.py FROM (a SHA, tag, or HEAD~1)"
+        required: true
+        default: "HEAD~1"
+        type: string
+      dry_run:
+        description: "Show the diff and run the checks, but do not commit"
+        required: false
+        default: true
+        type: boolean
+      allow_missing_validation:
+        description: "DANGEROUS. Commit even if the restored file lacks identity validation"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  revert:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Full history: HEAD~1 and any older SHA must be reachable, and the
+      # default shallow clone of depth 1 cannot resolve either.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Show what is being reverted from and to
+        run: |
+          echo "current HEAD: $(git rev-parse --short HEAD)"
+          echo "restoring from: ${{ inputs.ref }} -> $(git rev-parse --short '${{ inputs.ref }}')"
+          echo
+          echo "recent history for ceiling_rank.py:"
+          git log --oneline -10 -- ceiling_rank.py
+
+      # Written beside the working copy, not over it, so every check runs
+      # before anything is destroyed. If a check fails the tree is untouched.
+      - name: Extract the candidate file
+        run: |
+          git show '${{ inputs.ref }}:ceiling_rank.py' > /tmp/candidate.py
+          echo "candidate is $(wc -l < /tmp/candidate.py) lines"
+          echo "working copy is $(wc -l < ceiling_rank.py) lines"
+
+      - name: Check it compiles
+        run: python3 -m py_compile /tmp/candidate.py
+
+      # The nine columns run 47 emitted that the 989-line version cannot
+      # produce. Presence of these markers is the cheapest reliable test of
+      # which lineage the candidate belongs to.
+      - name: Check identity validation survived
+        run: |
+          missing=0
+          for marker in passes_identity CEILING_MIN_ACCOUNT_GAMES VALIDATE_HERO_PLAY \
+                        identity_verified hero_board_only ceiling_hero_games; do
+            if grep -q "$marker" /tmp/candidate.py; then
+              echo "  ok      $marker"
+            else
+              echo "  MISSING $marker"
+              missing=$((missing+1))
+            fi
+          done
+          echo
+          if [ "$missing" -gt 0 ]; then
+            echo "$missing identity-validation marker(s) absent from ${{ inputs.ref }}."
+            echo "That ref predates the 2026-09-02 identity work. Reverting to it"
+            echo "would drop nine columns from ceiling.csv and remove the checks"
+            echo "that run 47's audit trail depends on."
+            if [ "${{ inputs.allow_missing_validation }}" != "true" ]; then
+              echo "Refusing. Pick a newer ref, or re-run with"
+              echo "allow_missing_validation=true if this is genuinely intended."
+              exit 1
+            fi
+            echo "allow_missing_validation=true — proceeding anyway."
+          fi
+
+      # The patch being reverted added these. Their absence is the positive
+      # confirmation that the revert actually undoes it, rather than restoring
+      # some other revision that happens to compile.
+      - name: Confirm the patch is absent from the candidate
+        run: |
+          for marker in resolve_identity id_options RESOLVE_ID_BY_PLAY; do
+            if grep -q "$marker" /tmp/candidate.py; then
+              echo "  NOTE: '$marker' is present in ${{ inputs.ref }} —"
+              echo "        this ref already contains the id-resolution patch."
+            else
+              echo "  ok  '$marker' absent"
+            fi
+          done
+
+      - name: Diff
+        run: |
+          diff -u ceiling_rank.py /tmp/candidate.py > /tmp/revert.diff || true
+          if [ ! -s /tmp/revert.diff ]; then
+            echo "No difference — the working copy already matches ${{ inputs.ref }}."
+          else
+            echo "$(grep -c '^+' /tmp/revert.diff) added / $(grep -c '^-' /tmp/revert.diff) removed lines"
+            echo
+            cat /tmp/revert.diff
+          fi
+
+      - name: Upload the diff
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ceiling-rank-revert-diff
+          path: /tmp/revert.diff
+          if-no-files-found: warn
+
+      - name: Commit the revert
+        if: ${{ !inputs.dry_run }}
+        run: |
+          cp /tmp/candidate.py ceiling_rank.py
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ceiling_rank.py
+          if git diff --staged --quiet; then
+            echo "nothing to commit"
+            exit 0
+          fi
+          git commit -m "revert ceiling_rank.py to ${{ inputs.ref }}
+
+          Backs out the play-based id resolution. Probe G measured it moving 28
+          of 76 hero-regions, including regressions such as EU Ivy from a 0.890
+          hero share to 0.237, because re-resolution promotes marginal
+          top-of-board entries past genuine mains."
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          echo "reverted and pushed"
+
+      - name: Dry run notice
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "DRY RUN — nothing committed. The checks above all ran against"
+          echo "the candidate file. Re-run with dry_run=false to apply."
