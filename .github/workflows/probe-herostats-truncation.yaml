@@ -703,6 +703,185 @@ jobs:
                     open("probe_out/F_window.json", "w"), indent=2)
           PY
 
+      # ------------------------------------------------------------------
+      # PROBE G - how many ceilings does play-based id resolution move?
+      # ------------------------------------------------------------------
+      # ZERO SQL. Self-contained: leaderboards and hero-stats only, so it does
+      # NOT need a pipeline run and cannot touch the 20/hour budget.
+      #
+      # Replays the candidate resolution in all_on_board for every hero-region,
+      # both ways, and diffs them:
+      #   SLOT 0  - today's behaviour, first id the two boards share
+      #   BY PLAY - the id among the shared ones with the most games on the
+      #             hero the board is for
+      #
+      # This is the measurement that decides whether the patch is worth
+      # shipping. If it moves two rows the six bad ceilings were a fluke; if it
+      # moves twenty, slot-0 resolution has been quietly wrong all along and
+      # every past run needs re-reading.
+      #
+      # Prints hero_share for both picks so the CEILING_MIN_HERO_SHARE
+      # threshold can be chosen from the distribution instead of guessed.
+      - name: Probe G - id resolution delta
+        if: always()
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+          REGIONS: "NAmerica,Europe"
+          ID_OPTIONS_MAX: "4"
+        run: |
+          python3 - <<'PY' | tee probe_out/G_id_resolution.txt
+          import json, os, time, urllib.parse, urllib.request
+          from collections import defaultdict
+
+          BASE = "https://api.deadlock-api.com"
+          KEY = os.environ.get("DEADLOCK_API_KEY")
+          REGIONS = [r.strip() for r in (os.environ.get("REGIONS") or
+                                         "NAmerica,Europe").split(",") if r.strip()]
+          OPT_MAX = int(os.environ.get("ID_OPTIONS_MAX") or 4)
+
+          def get(url):
+              req = urllib.request.Request(
+                  url, headers={"User-Agent": "deadlock-probe/1.0"})
+              if KEY:
+                  req.add_header("X-API-Key", KEY)
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  return json.loads(r.read().decode("utf-8"))
+
+          def games(r):
+              g = r.get("matches_played")
+              if g is None:
+                  m = r.get("matches")
+                  g = len(m) if isinstance(m, list) else (m or 0)
+              return int(g)
+
+          def ids_of(e):
+              seen = []
+              for a in (e.get("possible_account_ids") or []):
+                  a = int(a)
+                  if a and a not in seen:
+                      seen.append(a)
+              return seen
+
+          heroes = {int(h["id"]): h.get("name") or str(h["id"])
+                    for h in get("%s/v1/assets/heroes" % BASE)
+                    if h.get("id") is not None}
+          print("%d heroes, %d regions\n" % (len(heroes), len(REGIONS)))
+
+          # --- build candidates exactly as all_on_board does ---------------
+          cands = {}          # (region, hero_id) -> [ {name, options, hero_pos} ]
+          for rg in REGIONS:
+              data = get("%s/v1/leaderboard/%s" % (BASE, rg))
+              entries = data.get("entries") if isinstance(data, dict) else data
+              by_name = defaultdict(list)
+              for i, e in enumerate(entries or [], 1):
+                  nm = e.get("account_name")
+                  if nm:
+                      by_name[nm].append({"pos": i, "ids": ids_of(e)})
+              for hid in sorted(heroes):
+                  try:
+                      hd = get("%s/v1/leaderboard/%s/%d" % (BASE, rg, hid))
+                  except Exception as e:
+                      print("  [hb] %s hero %d -> %s" % (rg, hid, e))
+                      continue
+                  hentries = hd.get("entries") if isinstance(hd, dict) else hd
+                  rows = []
+                  for j, he in enumerate(hentries or [], 1):
+                      nm = he.get("account_name")
+                      if not nm:
+                          continue
+                      hids = ids_of(he)
+                      for c in by_name.get(nm, []):
+                          common = [a for a in hids if a in c["ids"]]
+                          if common:
+                              rows.append({"name": nm, "hero_pos": j,
+                                           "options": common[:OPT_MAX]})
+                              break
+                  cands[(rg, hid)] = rows
+                  time.sleep(0.15)
+              print("  %s: %d hero boards processed" % (rg, len(heroes)))
+
+          multi = sum(1 for v in cands.values() for c in v if len(c["options"]) > 1)
+          print("\n%d candidates total, %d carry more than one id\n"
+                % (sum(len(v) for v in cands.values()), multi))
+
+          # --- one hero-stats pass over every option ----------------------
+          every = sorted({a for v in cands.values() for c in v
+                          for a in c["options"]})
+          acct, per_hero = defaultdict(int), {}
+          CH = 150
+          for i in range(0, len(every), CH):
+              part = every[i:i + CH]
+              q = "&".join("account_ids=%d" % a for a in part)
+              try:
+                  rows = get("%s/v1/players/hero-stats?%s" % (BASE, q)) or []
+              except Exception as e:
+                  print("  [hs] chunk failed: %s" % e)
+                  continue
+              for r in rows:
+                  a, h = r.get("account_id"), r.get("hero_id")
+                  if a is None:
+                      continue
+                  g = games(r)
+                  acct[int(a)] += g
+                  if h is not None:
+                      per_hero[(int(a), int(h))] = g
+              time.sleep(0.05)
+          print("records for %d accounts, %d (account,hero) rows\n" % (len(acct), len(per_hero)))
+
+          def share(aid, hid):
+              t = acct.get(aid, 0)
+              return (per_hero.get((aid, hid), 0) / t) if t else 0.0
+
+          # --- both resolutions, per hero-region --------------------------
+          moved, report = 0, []
+          for (rg, hid), rows in sorted(cands.items()):
+              if not rows:
+                  continue
+              def best(pick):
+                  scored = [(pick(c["options"], hid), c) for c in rows]
+                  scored = [(a, c) for a, c in scored if acct.get(a, 0) >= 100
+                            and per_hero.get((a, hid), 0) >= 5]
+                  if not scored:
+                      return None
+                  return min(scored, key=lambda ac: ac[1]["hero_pos"])
+
+              slot0 = best(lambda opts, h: opts[0])
+              byplay = best(lambda opts, h: max(
+                  enumerate(opts),
+                  key=lambda sa: (per_hero.get((sa[1], h), 0),
+                                  share(sa[1], h), acct.get(sa[1], 0), -sa[0]))[1])
+              if not slot0 or not byplay:
+                  continue
+              a0, a1 = slot0[0], byplay[0]
+              if a0 != a1:
+                  moved += 1
+                  report.append({
+                      "region": rg, "hero": heroes.get(hid, hid), "hero_id": hid,
+                      "slot0_id": a0, "slot0_hero_games": per_hero.get((a0, hid), 0),
+                      "slot0_share": round(share(a0, hid), 3),
+                      "byplay_id": a1, "byplay_hero_games": per_hero.get((a1, hid), 0),
+                      "byplay_share": round(share(a1, hid), 3),
+                  })
+
+          print("%d of %d hero-regions change their resolved id\n"
+                % (moved, len([1 for v in cands.values() if v])))
+          if report:
+              print("%-9s %-14s %12s %7s %6s %12s %7s %6s" %
+                    ("region", "hero", "slot0_id", "h_games", "share",
+                     "byplay_id", "h_games", "share"))
+              for r in report:
+                  print("%-9s %-14s %12d %7d %6.3f %12d %7d %6.3f" %
+                        (r["region"], r["hero"][:14], r["slot0_id"],
+                         r["slot0_hero_games"], r["slot0_share"],
+                         r["byplay_id"], r["byplay_hero_games"],
+                         r["byplay_share"]))
+          json.dump(report, open("probe_out/G_id_resolution.json", "w"), indent=2)
+          print()
+          print("hero_share distribution of the BY-PLAY picks tells you where")
+          print("CEILING_MIN_HERO_SHARE could sit without cutting real mains.")
+          PY
+
       - name: Upload probe output
         if: always()
         uses: actions/upload-artifact@v4
