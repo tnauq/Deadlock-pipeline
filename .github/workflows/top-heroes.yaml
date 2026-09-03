@@ -1,0 +1,76 @@
+name: Top heroes
+
+# Standalone. Does NOT run the pipeline and must not overlap with it: both
+# draw on the same /v1/sql bucket and the binding limit is 20 requests per
+# HOUR per IP, not 2 per minute. Two runs died at exactly chunk 21 before that
+# was understood. Keep this on manual dispatch, or schedule it well clear of
+# the pipeline's window.
+
+on:
+  workflow_dispatch:
+    inputs:
+      regions:
+        description: "Regions (comma separated). One region = ~5 SQL calls, both = ~10."
+        default: "NAmerica"
+        type: choice
+        options:
+          - "NAmerica"
+          - "Europe"
+          - "NAmerica,Europe"
+      days:
+        description: "Lookback window in days"
+        default: "14"
+      allow_sql:
+        description: "1 = fall through to SQL if hero-stats has no time window. 0 = stop at unwindowed career stats (free, but NOT the last N days)."
+        default: "1"
+        type: choice
+        options: ["1", "0"]
+      min_account_games:
+        description: "Games in the window below which a candidate id is treated as a resolution failure"
+        default: "20"
+      max_ids_per_entry:
+        description: "Candidate ids kept per board entry. 2 is measured best; 1 halves the SQL cost at ~8% accuracy loss."
+        default: "2"
+        type: choice
+        options: ["2", "1"]
+
+concurrency:
+  # never let two of these overlap — they would share an IP and burn the
+  # hourly SQL budget against each other
+  group: deadlock-sql
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run top_heroes
+        env:
+          REGIONS: ${{ inputs.regions }}
+          DAYS: ${{ inputs.days }}
+          ALLOW_SQL: ${{ inputs.allow_sql }}
+          MIN_ACCOUNT_GAMES: ${{ inputs.min_account_games }}
+          MAX_IDS_PER_ENTRY: ${{ inputs.max_ids_per_entry }}
+          # Optional. Raises the SQL limit and the MMR-endpoint limits; the
+          # script works without it.
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+        run: python3 top_heroes.py
+
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deadlock-top-heroes
+          # Directory, not a filename list. An explicit list is how
+          # identity_audit.csv went missing for a full run — a new output file
+          # silently never gets collected and nothing warns.
+          path: output/
+          retention-days: 7
