@@ -53,6 +53,11 @@ on:
         required: false
         default: ""
         type: string
+      window_controls:
+        description: "Control accounts for the window probe (F)"
+        required: false
+        default: "120"
+        type: string
 
 jobs:
   probe:
@@ -490,6 +495,212 @@ jobs:
           print()
           print("Cells are account_games/hero_games.")
           print("Identical columns = the match_mode filter is not being applied.")
+          PY
+
+      # ------------------------------------------------------------------
+      # PROBE F - is hero-stats a career total or a recent window?
+      # ------------------------------------------------------------------
+      # ZERO SQL. Probes A/B/C killed the truncation hypothesis: solo and
+      # batched calls agree exactly, position deltas are zero, and row counts
+      # scale linearly with ids sent. The endpoint really does report 243 games
+      # for random kid. But that account shows 32 hero rows averaging 7.6 games
+      # each - not the profile of a 216-game Bebop main - so the remaining
+      # explanation is that hero-stats covers a bounded recent window while
+      # Statlocker reports career.
+      #
+      # Two independent measurements, neither needing a timestamp lookup:
+      #
+      #   1. MATCH ID FLOOR. Match ids increase monotonically (the pipeline
+      #      relies on this at deadlock_pipeline.py line 866 to pick the most
+      #      recent build). If a hard cutoff exists, the SMALLEST match id each
+      #      account reports should cluster tightly across unrelated accounts.
+      #      A career endpoint has no reason to produce that floor - old
+      #      accounts would reach far lower than new ones.
+      #
+      #   2. LAST_PLAYED SPREAD. If the six are lapsed rather than truncated,
+      #      their last_played should sit measurably further back than the
+      #      controls', and their totals are simply what little they played
+      #      inside the window.
+      #
+      # Also dumps each suspect's hero distribution. A career total for a main
+      # is top-heavy; a thin window is flat. random kid at 7.6 games/hero
+      # across 32 heroes is already the flat shape, and this confirms it
+      # against controls rather than by eye.
+      - name: Probe F - window vs career
+        if: always()
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+          SUSPECTS: ${{ inputs.suspects }}
+          WINDOW_CONTROLS: ${{ inputs.window_controls }}
+          FILLER_DEPTH: ${{ inputs.filler_depth }}
+          MATCH_MODE: ${{ inputs.match_mode }}
+        run: |
+          python3 - <<'PY' | tee probe_out/F_window.txt
+          import datetime, json, os, statistics, time, urllib.parse, urllib.request
+
+          BASE = "https://api.deadlock-api.com"
+          KEY = os.environ.get("DEADLOCK_API_KEY")
+          MODE = os.environ.get("MATCH_MODE") or ""
+          DEPTH = int(os.environ.get("FILLER_DEPTH") or 400)
+          N_CTRL = int(os.environ.get("WINDOW_CONTROLS") or 120)
+
+          def get(url):
+              req = urllib.request.Request(
+                  url, headers={"User-Agent": "deadlock-probe/1.0"})
+              if KEY:
+                  req.add_header("X-API-Key", KEY)
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  return json.loads(r.read().decode("utf-8"))
+
+          def hs(ids):
+              params = ["match_mode=%s" % urllib.parse.quote(MODE)] if MODE else []
+              base = "%s/v1/players/hero-stats?%s" % (BASE, "&".join(params))
+              q = "&".join("account_ids=%d" % a for a in ids)
+              return get(base + ("&" if not base.endswith("?") else "") + q) or []
+
+          def games(r):
+              g = r.get("matches_played")
+              if g is None:
+                  m = r.get("matches")
+                  g = len(m) if isinstance(m, list) else (m or 0)
+              return int(g)
+
+          def as_epoch(v):
+              """last_played may be epoch seconds or an ISO string."""
+              if v is None:
+                  return None
+              if isinstance(v, (int, float)):
+                  return float(v)
+              try:
+                  return datetime.datetime.fromisoformat(
+                      str(v).replace("Z", "+00:00")).timestamp()
+              except Exception:
+                  return None
+
+          def fmt(ts):
+              if not ts:
+                  return "-"
+              return datetime.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+
+          def profile(rows):
+              """Collapse one account's hero rows into a summary."""
+              ids, played, total = [], [], 0
+              per_hero = []
+              for r in rows:
+                  g = games(r)
+                  total += g
+                  per_hero.append((r.get("hero_id"), g))
+                  m = r.get("matches")
+                  if isinstance(m, list):
+                      ids.extend(int(x) for x in m if x is not None)
+                  t = as_epoch(r.get("last_played"))
+                  if t:
+                      played.append(t)
+              per_hero.sort(key=lambda kv: -kv[1])
+              top = per_hero[0][1] if per_hero else 0
+              return {
+                  "hero_rows": len(rows),
+                  "account_games": total,
+                  "min_match_id": min(ids) if ids else None,
+                  "max_match_id": max(ids) if ids else None,
+                  "match_ids_seen": len(ids),
+                  "last_played": max(played) if played else None,
+                  "first_seen": min(played) if played else None,
+                  "top_hero_games": top,
+                  "top_hero_share": round(top / total, 3) if total else None,
+                  "mean_games_per_hero": round(total / len(rows), 1) if rows else 0,
+                  "top5": per_hero[:5],
+              }
+
+          suspects = [int(t.split(":")[0])
+                      for t in (os.environ.get("SUSPECTS") or "").split()]
+
+          controls = []
+          for region in ("NAmerica", "Europe"):
+              try:
+                  data = get("%s/v1/leaderboard/%s" % (BASE, region))
+              except Exception as e:
+                  print("control fetch failed for %s: %s" % (region, e))
+                  continue
+              entries = data.get("entries") if isinstance(data, dict) else data
+              for e in (entries or [])[:DEPTH]:
+                  for a in (e.get("possible_account_ids") or [])[:1]:
+                      if a:
+                          controls.append(int(a))
+          controls = [a for a in dict.fromkeys(controls)
+                      if a not in suspects][:N_CTRL]
+          print("%d suspects, %d controls\n" % (len(suspects), len(controls)))
+
+          prof = {}
+          for aid in suspects + controls:
+              try:
+                  prof[aid] = profile(hs([aid]))
+              except Exception as e:
+                  print("%d FAILED %s" % (aid, e))
+              time.sleep(0.05)
+
+          have_ids = [p["min_match_id"] for p in prof.values() if p["min_match_id"]]
+          if not have_ids:
+              print("NOTE: no `matches` id arrays came back on this endpoint - "
+                    "measurement 1 is unavailable, fall through to last_played.")
+          else:
+              lo, hi = min(have_ids), max(have_ids)
+              spread = (hi - lo) / lo if lo else 0
+              print("MATCH ID FLOOR across %d accounts" % len(have_ids))
+              print("  lowest  min_match_id : %d" % lo)
+              print("  highest min_match_id : %d" % hi)
+              print("  median  min_match_id : %d" % statistics.median(have_ids))
+              print("  spread as fraction of the floor: %.4f" % spread)
+              print("  TIGHT (well under ~0.01) = a hard cutoff, i.e. a window.")
+              print("  WIDE = no shared floor, i.e. career totals.\n")
+
+          print("%-12s %5s %8s %7s %9s %9s %12s" %
+                ("account", "rows", "games", "g/hero", "top_share",
+                 "last_seen", "min_match_id"))
+          for label, group in (("SUSPECT", suspects), ("control", controls[:15])):
+              for aid in group:
+                  p = prof.get(aid)
+                  if not p:
+                      continue
+                  print("%-12d %5d %8d %7.1f %9s %9s %12s  %s" %
+                        (aid, p["hero_rows"], p["account_games"],
+                         p["mean_games_per_hero"],
+                         "-" if p["top_hero_share"] is None
+                         else "%.3f" % p["top_hero_share"],
+                         fmt(p["last_played"]),
+                         p["min_match_id"] if p["min_match_id"] else "-",
+                         label))
+              print()
+
+          def summarise(group, name):
+              vals = [prof[a] for a in group if a in prof]
+              if not vals:
+                  return
+              lp = [v["last_played"] for v in vals if v["last_played"]]
+              print("%-9s n=%-4d median games=%-7d median g/hero=%-6.1f "
+                    "median last_seen=%s"
+                    % (name, len(vals),
+                       statistics.median([v["account_games"] for v in vals]),
+                       statistics.median([v["mean_games_per_hero"] for v in vals]),
+                       fmt(statistics.median(lp)) if lp else "-"))
+
+          print("GROUP COMPARISON")
+          summarise(suspects, "suspects")
+          summarise(controls, "controls")
+          print()
+          print("Suspects LAPSED (older last_seen, flat g/hero) = the six are")
+          print("low-activity accounts with large careers, and the ceiling is")
+          print("ranking on recent form while the column names promise career.")
+          print()
+          print("SUSPECT HERO DISTRIBUTIONS (hero_id, games)")
+          for aid in suspects:
+              p = prof.get(aid)
+              if p:
+                  print("  %-12d %s" % (aid, p["top5"]))
+
+          json.dump({str(k): v for k, v in prof.items()},
+                    open("probe_out/F_window.json", "w"), indent=2)
           PY
 
       - name: Upload probe output
