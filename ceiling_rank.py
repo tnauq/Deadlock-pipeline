@@ -225,34 +225,6 @@ CEILING_MIN_ACCOUNT_GAMES = int(os.environ.get("CEILING_MIN_ACCOUNT_GAMES") or 1
 # own, stricter gate (ORBIT_MIN_HERO_GAMES) because board membership at least
 # claims hero play whereas orbit membership claims nothing.
 CEILING_MIN_HERO_GAMES = int(os.environ.get("CEILING_MIN_HERO_GAMES") or 5)
-# Choose WHICH of a name's possible_account_ids to believe by hero play rather
-# than by list order. Added 2026-09-03 after run 47.
-#
-# possible_account_ids is a candidate list, and slot 0 is only best-match-first
-# on deadlock-api's own fuzzy name resolution — it knows nothing about which
-# hero board the name was found on. Run 47's six worst rows were all slot-0
-# picks that survived every existing check: account totals of 180-279 (above
-# the 100 floor), hero games of 5-43 (above the 5 floor), identity_verdict
-# pass on all six. Probes A/B/C/F ruled out truncation and a lookback window;
-# the accounts are simply the wrong people. random kid's id does not carry
-# Bebop in its top five heroes at all, and xD's does not carry Vyper.
-#
-# The fix costs no extra calls. fetch_ranked_records already returns a row per
-# (account, hero), so once the ids are fetched the hero record for every
-# candidate id is in hand and the one that actually plays the hero can be
-# picked. Set to 0 to restore slot-0-wins ordering.
-RESOLVE_ID_BY_PLAY = os.environ.get("RESOLVE_ID_BY_PLAY", "1") == "1"
-# How many ids per name to carry forward for resolution. The measured
-# distribution is 92% slot 0, 8% slot 1, 0% slot 2+, so 4 is generous; the cost
-# is only that hero-stats is asked about more accounts, on a 100 req/s bucket.
-ID_OPTIONS_MAX = int(os.environ.get("ID_OPTIONS_MAX") or 4)
-# AUDIT ONLY by default. Share of an account's games that sit on the hero it
-# was crowned for. Reported in ceiling.csv as hero_share so the threshold can
-# be chosen from data rather than guessed; set above 0 to make it a filter.
-# Run 47 reference points: the six bad rows ran 0.132-0.381, while a verified
-# ceiling like account 123795813 on Wraith sits at 0.476. The populations
-# overlap, which is exactly why this ships as a column and not a floor.
-CEILING_MIN_HERO_SHARE = float(os.environ.get("CEILING_MIN_HERO_SHARE") or 0.0)
 # What a MISSING hero-stats row means. "keep" (default) treats absence as
 # absence of evidence — the endpoint can simply not return a row. "drop" treats
 # it as evidence of absence. Only a row that EXISTS and falls under the
@@ -553,58 +525,6 @@ def fetch_hero_board(region, hero_id):
     return out
 
 
-def resolve_identity(cand, hero_id, records, hero_records):
-    """Pick which of a candidate's possible ids is actually this hero's player.
-
-    Mutates `cand` in place and returns (chosen_id, slot, hero_share).
-
-    Runs AFTER fetch_ranked_records, because the evidence it needs — games on
-    THIS hero for each candidate id — only exists once hero-stats has come
-    back. No extra requests: every id in id_options was already included in
-    the fetch.
-
-    Ordering, strongest signal first:
-      1. games on the crowned hero. A board entry asserts hero play; the id
-         that has none is not that entry, whatever its slot.
-      2. share of the account's games on that hero, which separates a main
-         from a big account that dabbles.
-      3. total account games, as a last tiebreak.
-
-    Slot order is preserved as the final term, so when nothing distinguishes
-    two ids the historical behaviour stands and the run stays reproducible.
-    """
-    opts = cand.get("id_options") or [cand["account_id"]]
-    if not RESOLVE_ID_BY_PLAY or len(opts) < 2:
-        rec = records.get(cand["account_id"]) or {}
-        hrec = hero_records.get((cand["account_id"], hero_id)) or {}
-        tot = rec.get("games", 0)
-        hg = hrec.get("games", 0)
-        cand["hero_share"] = round(hg / tot, 4) if tot else ""
-        cand["id_slot"] = 0
-        return cand["account_id"], 0, cand["hero_share"]
-
-    def score(slot_aid):
-        slot, aid = slot_aid
-        rec = records.get(aid) or {}
-        hrec = hero_records.get((aid, hero_id)) or {}
-        tot = rec.get("games", 0)
-        hg = hrec.get("games", 0)
-        share = (hg / tot) if tot else 0.0
-        return (hg, share, tot, -slot)
-
-    best_slot, best_aid = max(enumerate(opts), key=score)
-    rec = records.get(best_aid) or {}
-    hrec = hero_records.get((best_aid, hero_id)) or {}
-    tot = rec.get("games", 0)
-    share = round(hrec.get("games", 0) / tot, 4) if tot else ""
-    if best_aid != cand["account_id"]:
-        cand["id_reresolved"] = cand["account_id"]
-    cand["account_id"] = best_aid
-    cand["id_slot"] = best_slot
-    cand["hero_share"] = share
-    return best_aid, best_slot, share
-
-
 def all_on_board(hero_entries, by_name, board_size=0, region_depth=0):
     """
     Every usable player on a hero's board, in two tiers.
@@ -648,11 +568,7 @@ def all_on_board(hero_entries, by_name, board_size=0, region_depth=0):
             if common:
                 hit = {
                     "name": cand["name"],
-                    # PROVISIONAL. resolve_identity() may replace this with
-                    # another id from id_options once hero-stats has been
-                    # fetched and it is known which of them plays the hero.
                     "account_id": common[0],
-                    "id_options": common[:ID_OPTIONS_MAX],
                     "pos": cand["pos"],
                     "hero_pos": he["hero_pos"],
                     "badge": cand["badge"],
@@ -665,11 +581,8 @@ def all_on_board(hero_entries, by_name, board_size=0, region_depth=0):
         if hit is None and ALLOW_HERO_BOARD_ONLY and he["ids"]:
             hit = {
                 "name": he["name"],
-                # slot 0: the only identity signal a tier-2 entry has, and the
-                # tier that most needs resolve_identity — there is no
-                # intersection with the general board to narrow the list
+                # slot 0: the only identity signal a tier-2 entry has
                 "account_id": he["ids"][0],
-                "id_options": he["ids"][:ID_OPTIONS_MAX],
                 "pos": censored_pos,
                 "hero_pos": he["hero_pos"],
                 "badge": None,
@@ -1027,12 +940,7 @@ def main():
                   % (rg, len(thin), len(empty), len(orbit[rg])), file=sys.stderr)
 
     print("[4/4] ranked records for the confirmed players", file=sys.stderr)
-    # Every id a name might resolve to, not just the provisional pick —
-    # resolve_identity cannot choose between ids it has no records for, and
-    # hero-stats is batched on a 100 req/s bucket so the extra breadth is
-    # nearly free.
-    every_id = {a for (cands, _n) in confirmed.values() for c in cands
-                for a in (c.get("id_options") or [c["account_id"]])}
+    every_id = {c["account_id"] for (cands, _n) in confirmed.values() for c in cands}
     for members in orbit.values():
         every_id |= set(members)
     records, hero_records = fetch_ranked_records(every_id)
@@ -1081,21 +989,12 @@ def main():
         if not pool:
             continue
         scored = []
-        reresolved = 0
         floored_out = 0
         unknown_rank = 0
         no_play = 0
         play_missing = 0
         reserve = []            # failed identity; used only if nothing passes
         for c in pool:
-            # Resolve WHICH id this name is before judging whether it is
-            # credible: passes_identity would otherwise validate slot 0 and
-            # reject the entry when a sibling id was the real player.
-            if c["match"] != "orbit":
-                resolved, _slot, _share = resolve_identity(
-                    c, hid, records, hero_records)
-                if c.get("id_reresolved"):
-                    reresolved += 1
             rec = records.get(c["account_id"])
             if not rec or not rec["games"]:
                 continue
@@ -1198,11 +1097,6 @@ def main():
             # NO means every candidate failed identity validation and this row
             # is the best of a bad set — treat the ceiling player as unverified
             "identity_verified": identity_verified,
-            "id_slot": c.get("id_slot", 0),
-            "id_options_n": len(c.get("id_options") or [c["account_id"]]),
-            "id_reresolved": c.get("id_reresolved", ""),
-            "hero_share": c.get("hero_share", ""),
-            "candidates_reresolved": reresolved,
             "identity_verdict": c.get("identity_verdict", ""),
             "ceiling_account_games": rec["games"],
             "rejected_no_hero_play": no_play,
@@ -1274,8 +1168,6 @@ def main():
             "ranked_rank", "rank_name",
             "hero_ladder_pos", "match", "valve_top_hero", "located_on_general",
             "hero_board_only_candidates", "identity_verified", "identity_verdict",
-            "id_slot", "id_options_n", "id_reresolved", "hero_share",
-            "candidates_reresolved",
             "ceiling_account_games", "ceiling_hero_games",
             "rejected_no_hero_play", "hero_play_missing",
             "scored_candidates", "floored_out", "rank_unknown", "min_rank",
