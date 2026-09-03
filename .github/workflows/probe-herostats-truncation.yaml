@@ -1,0 +1,501 @@
+name: Probe hero-stats truncation
+
+# ZERO /v1/sql CALLS. Every step here uses /v1/players/hero-stats, which runs
+# at 100 req/s on its own bucket, so this is safe in ANY hour and cannot touch
+# the 20 SQL requests/hour the unkeyed API allows (probes.yml header, and the
+# "20/hour SQL budget" note in SCHEMA.md). It can run alongside daily.yml.
+#
+# WHAT IT IS FOR
+# ceiling.csv run 47 carried six ceiling players whose recorded account totals
+# sit at 180-279 games. The next lowest in the file is 783 and the median is
+# 2,323. Three have been checked against Statlocker (standard-only) and all
+# three are wrong by a wide margin:
+#
+#   random kid  Bebop   NA   recorded  5 hero /  243 acct   Statlocker  216 hero
+#   Chomper     Dynamo  NA   recorded 13 hero /  181 acct   Statlocker  285 hero
+#   xD          Vyper   EU   recorded 29 hero /  276 acct   Statlocker 3202 hero
+#
+# fetch_ranked_records() sums one row per (account, hero) into an account
+# total, so a MISSING ACCOUNT yields zero games and gets dropped, while a
+# missing SUBSET OF AN ACCOUNT'S HERO ROWS yields exactly this: a plausible
+# but too-small total, with no error raised because get() just parses whatever
+# list comes back. The leading hypothesis is a server-side row cap: at
+# MAX_URL=9000 the chunk arithmetic asks for ~370 accounts per call, which at
+# 20-40 heroes each is 8,000-15,000 rows in one response.
+#
+# These probes are ordered to kill that hypothesis or confirm it. Probe A
+# establishes ground truth, B tests the cap directly, C tests whether position
+# in the chunk decides who loses rows, D checks the second (probably dormant)
+# bug by arithmetic alone, E rules out a match_mode mismatch.
+#
+# Nothing here writes to the repo. Findings land in probe_out/ as an artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      suspects:
+        description: "account_id:hero_id pairs to investigate (space separated)"
+        required: false
+        default: "1041402331:15 867198857:11 777035798:58 99618316:66 1217629348:7 169689634:16"
+        type: string
+      chunk_sweep:
+        description: "Chunk sizes to sweep in probe B, largest first"
+        required: false
+        default: "370 185 90 45 20"
+        type: string
+      filler_depth:
+        description: "Leaderboard depth to draw padding accounts from (probe B/C)"
+        required: false
+        default: "400"
+        type: string
+      match_mode:
+        description: "MATCH_MODE for probes A-D. Empty = standard play, matching the run under investigation"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare output dir
+        run: mkdir -p probe_out
+
+      # ------------------------------------------------------------------
+      # PROBE A - ground truth, one account per call
+      # ------------------------------------------------------------------
+      # A single-id request cannot overflow any plausible row cap, so whatever
+      # comes back here is the endpoint's real answer for that account. If the
+      # solo totals match ceiling.csv, the endpoint is not the problem and the
+      # fault is upstream in candidate selection; if they come back much
+      # larger, batching is losing rows and B tells us where.
+      #
+      # Also prints hero-row COUNT per account, not just the total. That is the
+      # discriminator: a suspect with 4 hero rows solo and 4 in the batch is a
+      # genuinely narrow player, while 31 solo against 4 batched is truncation.
+      - name: Probe A - solo baseline for suspects
+        if: always()
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+          SUSPECTS: ${{ inputs.suspects }}
+          MATCH_MODE: ${{ inputs.match_mode }}
+        run: |
+          python3 - <<'PY' | tee probe_out/A_solo_baseline.txt
+          import json, os, sys, time, urllib.parse, urllib.request
+
+          BASE = "https://api.deadlock-api.com"
+          KEY = os.environ.get("DEADLOCK_API_KEY")
+          MODE = os.environ.get("MATCH_MODE") or ""
+
+          def get(url):
+              req = urllib.request.Request(
+                  url, headers={"User-Agent": "deadlock-probe/1.0"})
+              if KEY:
+                  req.add_header("X-API-Key", KEY)
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  return json.loads(r.read().decode("utf-8"))
+
+          def hs(ids):
+              params = ["match_mode=%s" % urllib.parse.quote(MODE)] if MODE else []
+              base = "%s/v1/players/hero-stats?%s" % (BASE, "&".join(params))
+              q = "&".join("account_ids=%d" % a for a in ids)
+              return get(base + ("&" if not base.endswith("?") else "") + q)
+
+          def games(r):
+              g = r.get("matches_played")
+              if g is None:
+                  m = r.get("matches")
+                  g = len(m) if isinstance(m, list) else (m or 0)
+              return int(g)
+
+          pairs = []
+          for tok in (os.environ.get("SUSPECTS") or "").split():
+              a, _, h = tok.partition(":")
+              pairs.append((int(a), int(h) if h else None))
+
+          print("MATCH_MODE=%r  (empty means standard play)" % MODE)
+          print("%-12s %6s %8s %10s %10s" %
+                ("account", "heroes", "acct_g", "hero_g", "hero_id"))
+          results = {}
+          for aid, hid in pairs:
+              try:
+                  rows = hs([aid]) or []
+              except Exception as e:
+                  print("%-12d FAILED %s" % (aid, e))
+                  continue
+              total = sum(games(r) for r in rows)
+              hero_g = next((games(r) for r in rows
+                             if hid is not None and r.get("hero_id") == hid), None)
+              results[aid] = {"hero_rows": len(rows), "account_games": total,
+                              "hero_id": hid, "hero_games": hero_g}
+              print("%-12d %6d %8d %10s %10s" %
+                    (aid, len(rows), total,
+                     "-" if hero_g is None else hero_g,
+                     "-" if hid is None else hid))
+              time.sleep(0.05)
+          json.dump(results, open("probe_out/A_solo_baseline.json", "w"), indent=2)
+          print()
+          print("Compare against ceiling.csv ceiling_account_games / "
+                "ceiling_hero_games. A large gap here means batching loses rows.")
+          PY
+
+      # ------------------------------------------------------------------
+      # PROBE B - chunk sweep, the direct test of a response row cap
+      # ------------------------------------------------------------------
+      # Same id set every time, only the batch size changes. If per-account
+      # totals climb as the chunk shrinks, rows are being dropped in the large
+      # calls and the fix is a hard ceiling on ids-per-call rather than one
+      # derived from URL length.
+      #
+      # Prints len(rows) for every call. A response landing on a round number -
+      # 1000, 5000, 10000 - is the cap stated outright, and is the single most
+      # useful line in this whole workflow.
+      #
+      # Padding ids come from the leaderboard (also 100 req/s, zero SQL) so the
+      # sweep exercises realistic chunk sizes without needing a pipeline run.
+      - name: Probe B - chunk size sweep
+        if: always()
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+          SUSPECTS: ${{ inputs.suspects }}
+          CHUNK_SWEEP: ${{ inputs.chunk_sweep }}
+          FILLER_DEPTH: ${{ inputs.filler_depth }}
+          MATCH_MODE: ${{ inputs.match_mode }}
+        run: |
+          python3 - <<'PY' | tee probe_out/B_chunk_sweep.txt
+          import json, os, time, urllib.parse, urllib.request
+          from collections import defaultdict
+
+          BASE = "https://api.deadlock-api.com"
+          KEY = os.environ.get("DEADLOCK_API_KEY")
+          MODE = os.environ.get("MATCH_MODE") or ""
+          DEPTH = int(os.environ.get("FILLER_DEPTH") or 400)
+
+          def get(url):
+              req = urllib.request.Request(
+                  url, headers={"User-Agent": "deadlock-probe/1.0"})
+              if KEY:
+                  req.add_header("X-API-Key", KEY)
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  return json.loads(r.read().decode("utf-8"))
+
+          def hs(ids):
+              params = ["match_mode=%s" % urllib.parse.quote(MODE)] if MODE else []
+              base = "%s/v1/players/hero-stats?%s" % (BASE, "&".join(params))
+              q = "&".join("account_ids=%d" % a for a in ids)
+              url = base + ("&" if not base.endswith("?") else "") + q
+              return get(url), len(url)
+
+          def games(r):
+              g = r.get("matches_played")
+              if g is None:
+                  m = r.get("matches")
+                  g = len(m) if isinstance(m, list) else (m or 0)
+              return int(g)
+
+          suspects = [int(t.split(":")[0])
+                      for t in (os.environ.get("SUSPECTS") or "").split()]
+
+          # Padding: real account ids off the general boards. possible_account_ids
+          # is the only id field the processed board still carries.
+          filler = []
+          for region in ("NAmerica", "Europe"):
+              try:
+                  data = get("%s/v1/leaderboard/%s" % (BASE, region))
+              except Exception as e:
+                  print("filler fetch failed for %s: %s" % (region, e))
+                  continue
+              entries = data.get("entries") if isinstance(data, dict) else data
+              for e in (entries or [])[:DEPTH]:
+                  for a in (e.get("possible_account_ids") or [])[:1]:
+                      if a:
+                          filler.append(int(a))
+          filler = [a for a in dict.fromkeys(filler) if a not in suspects]
+          print("%d padding accounts collected" % len(filler))
+
+          sizes = [int(s) for s in (os.environ.get("CHUNK_SWEEP") or "").split()]
+          biggest = max(sizes) if sizes else 370
+          pool = suspects + filler[:max(0, biggest - len(suspects))]
+          print("id pool: %d accounts\n" % len(pool))
+
+          totals_by_size = {}
+          for size in sizes:
+              per_acct = defaultdict(int)
+              rows_seen = []
+              for i in range(0, len(pool), size):
+                  part = pool[i:i + size]
+                  try:
+                      rows, urllen = hs(part)
+                  except Exception as e:
+                      print("  chunk of %d failed: %s" % (len(part), e))
+                      continue
+                  rows = rows or []
+                  rows_seen.append((len(part), len(rows), urllen))
+                  for r in rows:
+                      a = r.get("account_id")
+                      if a is not None:
+                          per_acct[int(a)] += games(r)
+                  time.sleep(0.05)
+              totals_by_size[size] = dict(per_acct)
+              got = sum(1 for a in pool if per_acct.get(a))
+              print("chunk=%-4d  %d/%d accounts returned any row" %
+                    (size, got, len(pool)))
+              for ids_sent, n_rows, urllen in rows_seen:
+                  flag = "  <-- ROUND NUMBER, likely a cap" if n_rows in (
+                      500, 1000, 2000, 5000, 10000, 20000) else ""
+                  print("    sent %4d ids, url %5d chars, got %6d rows%s" %
+                        (ids_sent, urllen, n_rows, flag))
+              print()
+
+          print("PER-SUSPECT ACCOUNT TOTALS BY CHUNK SIZE")
+          hdr = "%-12s" % "account" + "".join("%10d" % s for s in sizes)
+          print(hdr)
+          for a in suspects:
+              print("%-12d" % a + "".join("%10d" % totals_by_size[s].get(a, 0)
+                                          for s in sizes))
+          json.dump({str(k): v for k, v in totals_by_size.items()},
+                    open("probe_out/B_chunk_sweep.json", "w"), indent=2)
+          print()
+          print("Totals RISING as chunk size falls = rows dropped in large calls.")
+          print("Totals FLAT across all sizes = batching is not the cause; the")
+          print("endpoint genuinely reports these numbers and probe E applies.")
+          PY
+
+      # ------------------------------------------------------------------
+      # PROBE C - position within the chunk
+      # ------------------------------------------------------------------
+      # fetch_ranked_records sorts ids ascending before chunking, so if a cap
+      # truncates the tail of a response, who loses rows is decided purely by
+      # numeric id. That would be a nasty, silent, reproducible bias - the same
+      # accounts would be wrong on every single run.
+      #
+      # Sends each suspect FIRST and then LAST in an otherwise identical batch.
+      # A total that changes with position confirms tail truncation and means
+      # the sorted-id ordering is actively selecting the victims.
+      - name: Probe C - position in chunk
+        if: always()
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+          SUSPECTS: ${{ inputs.suspects }}
+          FILLER_DEPTH: ${{ inputs.filler_depth }}
+          MATCH_MODE: ${{ inputs.match_mode }}
+        run: |
+          python3 - <<'PY' | tee probe_out/C_position.txt
+          import json, os, time, urllib.parse, urllib.request
+
+          BASE = "https://api.deadlock-api.com"
+          KEY = os.environ.get("DEADLOCK_API_KEY")
+          MODE = os.environ.get("MATCH_MODE") or ""
+          DEPTH = int(os.environ.get("FILLER_DEPTH") or 400)
+
+          def get(url):
+              req = urllib.request.Request(
+                  url, headers={"User-Agent": "deadlock-probe/1.0"})
+              if KEY:
+                  req.add_header("X-API-Key", KEY)
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  return json.loads(r.read().decode("utf-8"))
+
+          def hs(ids):
+              params = ["match_mode=%s" % urllib.parse.quote(MODE)] if MODE else []
+              base = "%s/v1/players/hero-stats?%s" % (BASE, "&".join(params))
+              q = "&".join("account_ids=%d" % a for a in ids)
+              return get(base + ("&" if not base.endswith("?") else "") + q) or []
+
+          def games(r):
+              g = r.get("matches_played")
+              if g is None:
+                  m = r.get("matches")
+                  g = len(m) if isinstance(m, list) else (m or 0)
+              return int(g)
+
+          def total_for(rows, aid):
+              return sum(games(r) for r in rows if r.get("account_id") == aid)
+
+          suspects = [int(t.split(":")[0])
+                      for t in (os.environ.get("SUSPECTS") or "").split()]
+
+          filler = []
+          for region in ("NAmerica", "Europe"):
+              try:
+                  data = get("%s/v1/leaderboard/%s" % (BASE, region))
+              except Exception as e:
+                  print("filler fetch failed for %s: %s" % (region, e))
+                  continue
+              entries = data.get("entries") if isinstance(data, dict) else data
+              for e in (entries or [])[:DEPTH]:
+                  for a in (e.get("possible_account_ids") or [])[:1]:
+                      if a:
+                          filler.append(int(a))
+          filler = [a for a in dict.fromkeys(filler) if a not in suspects][:360]
+          print("padding with %d accounts\n" % len(filler))
+
+          print("%-12s %10s %10s %10s" % ("account", "first", "last", "delta"))
+          out = {}
+          for aid in suspects:
+              try:
+                  first = total_for(hs([aid] + filler), aid)
+                  time.sleep(0.1)
+                  last = total_for(hs(filler + [aid]), aid)
+              except Exception as e:
+                  print("%-12d FAILED %s" % (aid, e))
+                  continue
+              out[aid] = {"first": first, "last": last, "delta": first - last}
+              print("%-12d %10d %10d %10d" % (aid, first, last, first - last))
+              time.sleep(0.1)
+          json.dump(out, open("probe_out/C_position.json", "w"), indent=2)
+          print()
+          print("Nonzero delta = position decides who loses rows. Because")
+          print("fetch_ranked_records sorts ids ascending, the same accounts")
+          print("would be truncated on every run - a silent, stable bias.")
+          PY
+
+      # ------------------------------------------------------------------
+      # PROBE D - chunk arithmetic, offline
+      # ------------------------------------------------------------------
+      # ZERO network calls. ceiling_rank.py lines 486-491 halve `part` when a
+      # URL overflows but still advance the loop by `chunk`, so the dropped ids
+      # are never fetched. deadlock_pipeline.py gets this right at line 869
+      # with `i += len(part)`.
+      #
+      # This is probably dormant rather than the live fault: `per = 24`
+      # over-estimates the real ~22.7 chars per id, so the URL should land
+      # under MAX_URL and the halving branch should never fire. Probe D proves
+      # that rather than assuming it, and prints how many ids WOULD vanish if
+      # it ever did fire - which is what makes it worth fixing regardless.
+      - name: Probe D - chunk advance arithmetic
+        if: always()
+        continue-on-error: true
+        run: |
+          python3 - <<'PY' | tee probe_out/D_chunk_math.txt
+          BASE = "https://api.deadlock-api.com"
+
+          def simulate(n_ids, max_url, mode=""):
+              params = ["match_mode=%s" % mode] if mode else []
+              base = "%s/v1/players/hero-stats?%s" % (BASE, "&".join(params))
+              per = 24
+              chunk = max(20, (max_url - len(base) - 40) // per)
+              ids = list(range(10 ** 9, 10 ** 9 + n_ids))   # 10-digit, realistic
+              fetched, skipped, halvings = 0, 0, 0
+              for i in range(0, len(ids), chunk):
+                  part = ids[i:i + chunk]
+                  q = "&".join("account_ids=%d" % a for a in part)
+                  url = base + ("&" if not base.endswith("?") else "") + q
+                  if len(url) > max_url:
+                      halvings += 1
+                      part = part[:max(20, len(part) // 2)]
+                  fetched += len(part)
+                  skipped += len(ids[i:i + chunk]) - len(part)
+              return chunk, fetched, skipped, halvings
+
+          print("ceiling_rank.fetch_ranked_records chunk arithmetic\n")
+          print("%8s %8s %8s %9s %9s %9s" %
+                ("MAX_URL", "n_ids", "chunk", "fetched", "skipped", "halvings"))
+          for max_url in (9000, 6000, 4000, 2000):
+              for n in (500, 1500, 3000):
+                  c, f, s, h = simulate(n, max_url)
+                  print("%8d %8d %8d %9d %9d %9d" % (max_url, n, c, f, s, h))
+          print()
+          print("skipped=0 everywhere means the halving branch never fires at")
+          print("the default MAX_URL=9000 and this bug is dormant, NOT the")
+          print("cause of run 47. Fix it anyway: change the loop to advance by")
+          print("len(part), matching deadlock_pipeline.py line 869.")
+          print()
+          print("Rows requested per call at chunk=370 and ~25 heroes/account:")
+          print("  370 * 25 = 9250 rows in one response.")
+          PY
+
+      # ------------------------------------------------------------------
+      # PROBE E - match_mode
+      # ------------------------------------------------------------------
+      # The run under investigation used MATCH_MODE="" (standard play), and
+      # Statlocker was read sorted to standard only, so the two should be
+      # comparing the same match set. This rules that out rather than trusting
+      # it: if "" and Ranked return the SAME totals for a suspect, the filter
+      # is not being applied the way the header comment assumes, and the
+      # ranked_games / ranked_wins columns in ceiling.csv are mislabeled for
+      # every row, not just the six.
+      - name: Probe E - match_mode comparison
+        if: always()
+        continue-on-error: true
+        env:
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+          SUSPECTS: ${{ inputs.suspects }}
+        run: |
+          python3 - <<'PY' | tee probe_out/E_match_mode.txt
+          import json, os, time, urllib.parse, urllib.request
+
+          BASE = "https://api.deadlock-api.com"
+          KEY = os.environ.get("DEADLOCK_API_KEY")
+
+          def get(url):
+              req = urllib.request.Request(
+                  url, headers={"User-Agent": "deadlock-probe/1.0"})
+              if KEY:
+                  req.add_header("X-API-Key", KEY)
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  return json.loads(r.read().decode("utf-8"))
+
+          def hs(ids, mode):
+              params = ["match_mode=%s" % urllib.parse.quote(mode)] if mode else []
+              base = "%s/v1/players/hero-stats?%s" % (BASE, "&".join(params))
+              q = "&".join("account_ids=%d" % a for a in ids)
+              return get(base + ("&" if not base.endswith("?") else "") + q) or []
+
+          def games(r):
+              g = r.get("matches_played")
+              if g is None:
+                  m = r.get("matches")
+                  g = len(m) if isinstance(m, list) else (m or 0)
+              return int(g)
+
+          pairs = []
+          for tok in (os.environ.get("SUSPECTS") or "").split():
+              a, _, h = tok.partition(":")
+              pairs.append((int(a), int(h) if h else None))
+
+          modes = ["", "Ranked", "Unranked"]
+          print("%-12s %8s" % ("account", "hero") +
+                "".join("%14s" % (m or "(standard)") for m in modes))
+          out = {}
+          for aid, hid in pairs:
+              row = {}
+              cells = []
+              for m in modes:
+                  try:
+                      rows = hs([aid], m)
+                      acct = sum(games(r) for r in rows)
+                      hero = next((games(r) for r in rows
+                                   if hid is not None
+                                   and r.get("hero_id") == hid), 0)
+                      row[m or "standard"] = {"account": acct, "hero": hero}
+                      cells.append("%7d/%-6d" % (acct, hero))
+                  except Exception as e:
+                      row[m or "standard"] = {"error": str(e)}
+                      cells.append("%14s" % "ERR")
+                  time.sleep(0.05)
+              out[aid] = row
+              print("%-12d %8s" % (aid, "-" if hid is None else hid) +
+                    "".join(cells))
+          json.dump(out, open("probe_out/E_match_mode.json", "w"), indent=2)
+          print()
+          print("Cells are account_games/hero_games.")
+          print("Identical columns = the match_mode filter is not being applied.")
+          PY
+
+      - name: Upload probe output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: herostats-truncation-probes
+          path: probe_out/
+          if-no-files-found: warn
