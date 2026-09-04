@@ -1,53 +1,67 @@
 #!/usr/bin/env python3
 """
-Probe /v1/players/scoreboard for use as an IDENTITY VERIFIER.
+Probe /v1/analytics/scoreboards/players for use as an IDENTITY VERIFIER.
 
     python3 probe_scoreboard.py
 
 Writes ./output/probe_scoreboard.json  (paste into PROBES.md)
 
 --------------------------------------------------------------------------
-WHY THIS ENDPOINT, AGAIN
+PATH CORRECTION — 2026-09-04
 
-It was probed 2026-08-07 and filed as "NOT a ceiling source": sort_by=winrate
-and sort_by=wins both 500, match_mode is accepted and IGNORED, region is
-ignored. Every one of those failures is about RANKING. None of them touches
-the question asked here, which is only:
+PROBES records this endpoint as `/v1/players/scoreboard` (probed 2026-08-07).
+IT HAS MOVED. The live OpenAPI spec puts it at
+`/v1/analytics/scoreboards/players`, under the Analytics tag. A probe run on
+2026-09-04 against the old location returned nothing on all three guessed
+paths and was nearly recorded as "the verifier cannot be built on this
+endpoint" — a false negative caused entirely by a stale path.
 
-    does account 105508858 appear among the people who play Bebop?
-
-That matters because scoreboard is the ONLY endpoint that publishes a real
-`account_id`. The leaderboards publish display names plus deadlock-api's fuzzy
-possible_account_ids, which put the wrong player in 110 of 371 slots when used
-alone. A verifier built on scoreboard shares NO failure mode with the thing it
-is verifying — that independence is the entire point.
+LESSON WORTH KEEPING: when a probe fails to find an endpoint at all, read
+/openapi.json before concluding the capability is gone. A 404 says where the
+endpoint ISN'T.
 
 --------------------------------------------------------------------------
-THREE QUESTIONS, AND ONLY ONE OF THEM IS INTERESTING
+WHAT THE SPEC ALREADY ANSWERS — do not re-probe these
 
-Q1. DOES hero_id ACTUALLY FILTER?  <- the one that decides everything
-    PROBES records that the per-hero path TAKES hero_id. It does NOT record
-    that hero_id was verified to CHANGE the results. That is exactly the trap
-    match_mode set on this same endpoint: accepted, 200, silently ignored,
-    caught only by comparing bodies. If hero_id is ignored, every hero returns
-    one global career board and the verifier is worthless.
+| Fact | Value |
+|---|---|
+| Rate limit | 200 req/min per IP, 400 with key, 2000/min global — SHARED across ALL analytics endpoints. Fast bucket, NOT the 20/hr SQL bucket. |
+| `sort_by` | REQUIRED. Enum includes `winrate`, `wins`, `matches`, `rank`. |
+| `hero_id` | Documented query param, int32. |
+| `min_matches` | Default 20, MINIMUM 1 — low-volume accounts are reachable. |
+| `limit` | Default 100, max 10,000. `start` gives an offset. |
+| `account_ids` | Comma separated, MAX 1000 ITEMS. |
+| `min_unix_timestamp` | Present, so the window can be scoped like hero-stats. |
 
-    THE CONTROL: fetch two very different heroes and compare account-id sets.
-    Near-identical sets mean the parameter is decorative. A high overlap is
-    also possible for real reasons (both boards are dominated by the same
-    high-volume accounts), so the test reports Jaccard AND set sizes rather
-    than a bare yes/no, and an invalid hero_id is fetched as a second control.
+Note `sort_by=winrate` is now IN THE ENUM. It returned 500 on 2026-08-07 and
+was one of the two reasons this endpoint was rejected as a ceiling source.
+Whether it now answers 200 is checked below but is NOT what this probe is for.
 
-Q2. WHICH RATE-LIMIT BUCKET?
-    Decides whether 38 hero calls per run are free (100 req/s bucket, like the
-    leaderboards) or catastrophic (20/HOUR SQL bucket). Measured by timing a
-    short burst and watching for 429.
+--------------------------------------------------------------------------
+WHY VERIFY AT ALL
 
-Q3. DOES min_matches HIDE THE ACCOUNTS WE CARE ABOUT?
-    Default is 20. The accounts most in need of verification are the
-    low-volume ones — Snakes had 8 games. If min_matches cannot go below 20,
-    the verifier is blind to exactly the cases it was built for, which is a
-    limitation to record rather than a failure.
+This is the only endpoint that publishes a real `account_id`. The leaderboards
+publish display names plus deadlock-api's fuzzy `possible_account_ids`, which
+put the wrong player in 110 of 371 slots when used alone. A verifier built
+here shares NO failure mode with the thing it verifies — that independence is
+the whole point.
+
+--------------------------------------------------------------------------
+THE TWO QUESTIONS A SPEC CANNOT ANSWER
+
+Q1. IS `hero_id` APPLIED, or merely accepted?
+    `match_mode` is documented on this same endpoint and was MEASURED being
+    silently ignored on 2026-08-07 (an account with 7,651 matches came back
+    inside an 8-day window). Documentation is not behaviour here. Control:
+    fetch two very different heroes and compare account-id sets, plus an
+    impossible hero id.
+
+Q2. Does `account_ids` FILTER, and is it the cheaper shape?
+    If it works, the verifier inverts: instead of pulling thousands of players
+    per hero and intersecting, pass the candidate ids AND hero_id and see
+    which come back. One call per hero per 1,000 candidates. This is the
+    design that matters, so it gets its own control — a request for ids that
+    cannot exist must come back empty.
 """
 
 import json
@@ -59,174 +73,136 @@ import urllib.parse
 import urllib.request
 
 BASE = "https://api.deadlock-api.com"
+PATH = "/v1/analytics/scoreboards/players"
 API_KEY = os.environ.get("DEADLOCK_API_KEY")
 OUT_DIR = os.environ.get("OUT_DIR") or "output"
 
 HERO_A = int(os.environ.get("HERO_A") or 1)
 HERO_B = int(os.environ.get("HERO_B") or 15)
 LIMIT = int(os.environ.get("LIMIT") or 500)
-BURST = int(os.environ.get("BURST") or 6)
+SORT_BY = os.environ.get("SORT_BY") or "matches"
+DAYS = int(os.environ.get("DAYS") or 14)
 
 
-def get(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "deadlock-probe/1.0"})
+def url(**params):
+    params.setdefault("sort_by", SORT_BY)      # REQUIRED by the spec
+    q = "&".join("%s=%s" % (k, urllib.parse.quote(str(v)))
+                 for k, v in params.items() if v is not None)
+    return BASE + PATH + "?" + q
+
+
+def get(u):
+    req = urllib.request.Request(u, headers={"User-Agent": "deadlock-probe/1.0"})
     if API_KEY:
         req.add_header("X-API-Key", API_KEY)
-    t0 = time.time()
-    with urllib.request.urlopen(req, timeout=120) as r:
-        body = r.read()
-    return json.loads(body.decode("utf-8")), round(time.time() - t0, 2)
-
-
-def try_get(url):
-    """(payload, seconds, error) — never raises, so one 400 cannot end the run."""
     try:
-        payload, secs = get(url)
-        return payload, secs, None
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return json.loads(r.read().decode("utf-8")), None
     except urllib.error.HTTPError as e:
-        detail = ""
+        body = ""
         try:
-            detail = e.read().decode("utf-8", "replace")[:200]
+            body = e.read().decode("utf-8", "replace")[:200]
         except Exception:
             pass
-        return None, None, "HTTP %s %s" % (e.code, detail)
+        return None, "HTTP %s %s" % (e.code, body)
     except Exception as e:
-        return None, None, str(e)
+        return None, str(e)
 
 
 def ids_of(payload):
     rows = payload.get("entries", payload) if isinstance(payload, dict) else payload
-    out = []
-    for r in rows or []:
-        a = r.get("account_id") if isinstance(r, dict) else None
-        if a is not None:
-            out.append(int(a))
-    return out
-
-
-def hero_url(hero_id, limit=None, min_matches=None):
-    q = ["limit=%d" % (limit or LIMIT)]
-    if min_matches is not None:
-        q.append("min_matches=%d" % min_matches)
-    return "%s/v1/players/scoreboard/%d?%s" % (BASE, hero_id, "&".join(q))
+    return [int(r["account_id"]) for r in (rows or [])
+            if isinstance(r, dict) and r.get("account_id") is not None]
 
 
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
-    log = {"probed": time.strftime("%Y-%m-%d"), "base": BASE,
-           "hero_a": HERO_A, "hero_b": HERO_B, "limit": LIMIT, "questions": {}}
+    log = {"probed": time.strftime("%Y-%m-%d"), "path": PATH,
+           "sort_by": SORT_BY, "hero_a": HERO_A, "hero_b": HERO_B,
+           "note": "path corrected from /v1/players/scoreboard", "questions": {}}
 
-    # ---- path discovery ---------------------------------------------------
-    # PROBES says "two paths exist; the second takes hero_id" without naming
-    # them, so try the plausible shapes rather than assuming one.
-    # TEMPLATES, not string substitution. Swapping hero ids with
-    # url.replace("1", "15", 1) hits the "1" in "/v1/" — caught in testing,
-    # and it would have silently probed a nonexistent path.
-    templates = ["%s/v1/players/scoreboard/{hero}?limit=%d" % (BASE, LIMIT),
-                 "%s/v1/players/scoreboard?hero_id={hero}&limit=%d" % (BASE, LIMIT),
-                 "%s/v1/players/hero-scoreboard/{hero}?limit=%d" % (BASE, LIMIT)]
-    working, a_payload = None, None
-    for tpl in templates:
-        u = tpl.format(hero=HERO_A)
-        payload, secs, err = try_get(u)
-        print("  [path] %s -> %s" % (u.replace(BASE, ""), err or "OK %ss" % secs),
-              file=sys.stderr)
-        if payload is not None and ids_of(payload):
-            working, a_payload = tpl, payload
-            break
-    log["working_path"] = working
-    if not working:
-        log["verdict"] = ("No per-hero scoreboard path returned account ids. "
-                          "The verifier cannot be built on this endpoint.")
-        _dump(log)
-        return
+    # ---- baseline: does the path work at all? -----------------------------
+    base_payload, err = get(url(limit=LIMIT))
+    if base_payload is None:
+        log["verdict"] = "Baseline call failed: %s" % err
+        return _dump(log)
+    base_ids = ids_of(base_payload)
+    log["baseline_rows"] = len(base_ids)
+    print("  [base] %d rows, %d with account_id" % (len(base_payload or []),
+                                                    len(base_ids)), file=sys.stderr)
+    if not base_ids:
+        log["verdict"] = ("Endpoint responds but returns no account_id. "
+                          "Verifier cannot be built here.")
+        return _dump(log)
 
-    # ---- Q1: does hero_id filter? ----------------------------------------
-    a_ids = ids_of(a_payload)
-    b_payload, _s, b_err = try_get(working.format(hero=HERO_B))
-    b_ids = ids_of(b_payload) if b_payload else []
-    # a hero id that cannot exist: if it returns a full board, the parameter is
-    # not being applied at all
-    bad_payload, _s, bad_err = try_get(working.format(hero=99999))
-    bad_ids = ids_of(bad_payload) if bad_payload else []
-
-    sa, sb = set(a_ids), set(b_ids)
-    inter = len(sa & sb)
-    union = len(sa | sb) or 1
-    jac = round(inter / union, 4)
-    identical = a_ids == b_ids
-
-    q1 = {"hero_a_rows": len(a_ids), "hero_b_rows": len(b_ids),
-          "distinct_a": len(sa), "distinct_b": len(sb),
-          "overlap": inter, "jaccard": jac,
-          "byte_identical_order": identical,
-          "invalid_hero_rows": len(bad_ids), "invalid_hero_error": bad_err,
-          "hero_b_error": b_err}
-    if identical or jac > 0.95:
-        q1["verdict"] = ("hero_id IS IGNORED — two different heroes return the "
-                         "same accounts. The verifier is dead; do not retry.")
-    elif bad_ids and len(bad_ids) > 0.5 * len(a_ids):
-        q1["verdict"] = ("hero_id is not validated — an impossible hero id "
-                         "returned a full board, so filtering cannot be trusted.")
+    # ---- Q1: is hero_id applied? -----------------------------------------
+    a_payload, a_err = get(url(hero_id=HERO_A, limit=LIMIT))
+    b_payload, b_err = get(url(hero_id=HERO_B, limit=LIMIT))
+    bad_payload, bad_err = get(url(hero_id=99999, limit=LIMIT))
+    a, b = set(ids_of(a_payload or [])), set(ids_of(b_payload or []))
+    bad = ids_of(bad_payload or [])
+    jac = round(len(a & b) / (len(a | b) or 1), 4)
+    q1 = {"hero_a_ids": len(a), "hero_b_ids": len(b), "overlap": len(a & b),
+          "jaccard": jac, "invalid_hero_rows": len(bad),
+          "invalid_hero_error": bad_err, "errors": [e for e in (a_err, b_err) if e],
+          "differs_from_unfiltered": sorted(a) != sorted(set(base_ids))}
+    if not a or not b:
+        q1["verdict"] = "hero_id returned nothing — check the hero ids used."
+    elif jac > 0.95:
+        q1["verdict"] = ("hero_id IS IGNORED — two heroes return the same "
+                         "accounts. Verifier dead; record and stop.")
+    elif len(bad) > 0.5 * len(a):
+        q1["verdict"] = ("hero_id not validated — an impossible hero id "
+                         "returned a full board. Filtering untrustworthy.")
     elif jac < 0.5:
-        q1["verdict"] = ("hero_id FILTERS. Distinct account sets per hero, and "
-                         "an invalid id returns %d rows. Usable as an "
-                         "independent identity channel." % len(bad_ids))
+        q1["verdict"] = ("hero_id FILTERS (jaccard %.3f, invalid id -> %d rows). "
+                         "Usable as an independent identity channel." % (jac, len(bad)))
     else:
-        q1["verdict"] = ("Ambiguous: overlap %.2f. High-volume accounts may "
-                         "legitimately appear on both boards. Repeat with two "
-                         "heroes of very different popularity before trusting "
-                         "it." % jac)
-    log["questions"]["q1_hero_id_filters"] = q1
+        q1["verdict"] = ("Ambiguous at jaccard %.3f — retry with heroes of very "
+                         "different popularity." % jac)
+    log["questions"]["q1_hero_id_applied"] = q1
     print("  [q1] %s" % q1["verdict"], file=sys.stderr)
 
-    # ---- Q2: which rate-limit bucket? ------------------------------------
-    # The leaderboards are 100 req/s and effectively free; /v1/sql is 20/HOUR.
-    # 38 hero calls per run is nothing against the first and fatal against the
-    # second, so this decides whether the verifier can run every time.
-    t0, ok, first_429 = time.time(), 0, None
-    for i in range(BURST):
-        _p, _s, err = try_get(working.format(hero=HERO_A))
-        if err and "429" in err:
-            first_429 = i + 1
-            break
-        ok += 1
-    elapsed = round(time.time() - t0, 2)
-    q2 = {"burst": BURST, "succeeded": ok, "seconds": elapsed,
-          "first_429_at_call": first_429,
-          "observed_rate_per_s": round(ok / elapsed, 2) if elapsed else None}
-    q2["verdict"] = ("Fast bucket: %d calls in %ss with no 429. 38 hero calls "
-                     "per run is affordable." % (ok, elapsed)) if not first_429 \
-        else ("Rate limited at call %d. Budget hero calls and cache per hero."
-              % first_429)
-    log["questions"]["q2_rate_limit"] = q2
+    # ---- Q2: does account_ids filter? ------------------------------------
+    # The design that matters. If this works, verification is one call per
+    # hero per 1,000 candidates instead of pulling whole boards.
+    sample = sorted(a)[:5] if a else base_ids[:5]
+    got_payload, got_err = get(url(hero_id=HERO_A, account_ids=",".join(
+        str(i) for i in sample), limit=LIMIT))
+    got = ids_of(got_payload or [])
+    # control: ids that cannot exist must come back empty, or the parameter
+    # is being ignored the way match_mode is
+    ghost_payload, ghost_err = get(url(hero_id=HERO_A, account_ids="1,2,3",
+                                       limit=LIMIT))
+    ghost = ids_of(ghost_payload or [])
+    q2 = {"asked_for": sample, "returned": len(got),
+          "returned_only_asked": bool(got) and set(got) <= set(sample),
+          "impossible_ids_returned": len(ghost),
+          "errors": [e for e in (got_err, ghost_err) if e]}
+    if got and set(got) <= set(sample) and not ghost:
+        q2["verdict"] = ("account_ids FILTERS and the control is clean. "
+                         "Verify with one call per hero per 1,000 candidates.")
+    elif ghost:
+        q2["verdict"] = ("account_ids IGNORED — impossible ids returned %d rows. "
+                         "Fall back to pulling boards and intersecting."
+                         % len(ghost))
+    else:
+        q2["verdict"] = ("Inconclusive: asked for %d ids, got %d back."
+                         % (len(sample), len(got)))
+    log["questions"]["q2_account_ids_filter"] = q2
     print("  [q2] %s" % q2["verdict"], file=sys.stderr)
 
-    # ---- Q3: can min_matches go below its default of 20? -----------------
-    # The accounts most needing verification are low-volume ones — the id
-    # claiming NA position 15 had EIGHT games. If the floor cannot drop, the
-    # verifier is structurally blind to its main use case.
-    q3 = {}
-    for mm in (0, 1, 5, 20):
-        payload, _s, err = try_get(hero_url(HERO_A, limit=LIMIT, min_matches=mm))
-        ids = ids_of(payload) if payload else []
-        lows = 0
-        rows = payload.get("entries", payload) if isinstance(payload, dict) else payload
-        for r in (rows or []):
-            if isinstance(r, dict) and (r.get("matches") or 0) < 20:
-                lows += 1
-        q3["min_matches=%d" % mm] = {"rows": len(ids), "under_20_matches": lows,
-                                     "error": err}
-    baseline = q3.get("min_matches=20", {}).get("under_20_matches", 0)
-    loose = q3.get("min_matches=0", {}).get("under_20_matches", 0)
-    q3["verdict"] = ("min_matches LOWERS the floor (%d sub-20 accounts at 0 vs "
-                     "%d at 20) — low-volume accounts are verifiable."
-                     % (loose, baseline)) if loose > baseline else \
-        ("min_matches does NOT expose sub-20 accounts. The verifier cannot "
-         "confirm or deny low-volume ids, which are the ones most in doubt. "
-         "Record as a limitation: absence from this board is then not evidence.")
-    log["questions"]["q3_min_matches"] = q3
-    print("  [q3] %s" % q3["verdict"], file=sys.stderr)
+    # ---- Q3: has sort_by=winrate been fixed? -----------------------------
+    # Not what this probe is for, but it is one call and it was one of the two
+    # reasons the endpoint was rejected as a CEILING source on 2026-08-07.
+    wr_payload, wr_err = get(url(hero_id=HERO_A, sort_by="winrate", limit=50))
+    log["questions"]["q3_sort_by_winrate"] = {
+        "error": wr_err, "rows": len(ids_of(wr_payload or [])),
+        "verdict": ("still broken: %s" % wr_err) if wr_err else
+                   "sort_by=winrate now returns 200 — the 2026-08-07 500 is fixed. "
+                   "Revisit as a ceiling source separately."}
+    print("  [q3] %s" % log["questions"]["q3_sort_by_winrate"]["verdict"],
+          file=sys.stderr)
 
     log["verdict"] = q1["verdict"]
     _dump(log)
@@ -236,7 +212,7 @@ def _dump(log):
     path = os.path.join(OUT_DIR, "probe_scoreboard.json")
     json.dump(log, open(path, "w"), indent=2)
     print("\n  -> %s" % path, file=sys.stderr)
-    print(json.dumps(log, indent=2)[:1400], file=sys.stderr)
+    print(json.dumps(log, indent=2)[:1600], file=sys.stderr)
 
 
 if __name__ == "__main__":
