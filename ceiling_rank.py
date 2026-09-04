@@ -230,6 +230,21 @@ VALIDATE_HERO_PLAY = os.environ.get("VALIDATE_HERO_PLAY", "1") == "1"
 # recorded as "capability gone".
 #
 # Cost: one call per hero per 1,000 candidate ids, so ~1-2 calls per hero.
+# ---- career vs windowed counts -------------------------------------------
+# CAREER counts drive the IDENTITY checks; WINDOWED counts describe current
+# play. Conflating them was a real error: EU Pocket's ceiling read 35 hero
+# games while Statlocker showed the same player at 500+ career, and the
+# earlier top_heroes run labelled 162 accounts "implausible" for having zero
+# games in 14 days when most were simply inactive.
+#
+# The distinction is not cosmetic. A wrong account id is a CAREER-level
+# property — the id either belongs to that player or it does not — whereas a
+# two-week holiday is a recency fact. Testing identity against a windowed
+# count punishes absence, which is not what it is trying to detect.
+#
+# Costs one extra pass over the same free 100 req/s endpoint.
+RECENT_DAYS = int(os.environ.get("RECENT_DAYS") or 30)
+
 SCOREBOARD_CHECK = os.environ.get("SCOREBOARD_CHECK", "1") == "1"
 SCOREBOARD_PATH = "/v1/analytics/scoreboards/players"
 # Required by the endpoint. `matches` is the stable key; `winrate` returned 500
@@ -438,6 +453,9 @@ def passes_identity(cand, hero_id, rec, hero_records):
     1. ACCOUNT PLAUSIBILITY. Fewer than CEILING_MIN_ACCOUNT_GAMES games on the
        whole account contradicts the board standing being claimed for it. The
        id is wrong. Verdict "implausible_identity".
+       Tested against the CAREER record, not a window — an inactive player is
+       not a wrong id, and testing recency here would reject real accounts for
+       taking a fortnight off.
     2. HERO PLAY. The account is real, but has essentially no games on the hero
        whose board it was found on — so the board entry belongs to someone
        else with the same display name. Verdict "no_play", or "missing" when
@@ -703,9 +721,18 @@ def fetch_scoreboard_pairs(cands_by_hero):
     return pairs, checked
 
 
-def fetch_ranked_records(account_ids):
+def fetch_ranked_records(account_ids, since=None, label="career"):
     """
     account_id -> {"games": n, "wins": n} over MATCH_MODE play, all heroes.
+
+    WINDOW, made explicit 2026-09-04. This function previously sent NO
+    timestamp parameter at all, so its counts came from whatever the
+    endpoint's default window is — which has never been established. The
+    2026-09-04 probe proved only that min_unix_timestamp is HONOURED, not what
+    omitting it means. Both calls now state their window, so nothing depends
+    on an undocumented default.
+
+    since=None sends min_unix_timestamp=0, i.e. the account's whole history.
 
     /v1/players/hero-stats is batched via repeated account_ids params, runs at
     100 req/s, and is a different bucket from /v1/sql. It returns one row per
@@ -723,6 +750,7 @@ def fetch_ranked_records(account_ids):
     # An empty match_mode is omitted rather than sent blank — hero-stats 400s
     # on match_mode= with no value.
     params = ["match_mode=%s" % urllib.parse.quote(MATCH_MODE)] if MATCH_MODE else []
+    params.append("min_unix_timestamp=%d" % (0 if since is None else int(since)))
     base = "%s/v1/players/hero-stats?%s" % (BASE, "&".join(params))
     # ~22.7 encoded chars per id (SCHEMA.md quirk 4); size the chunk against the
     # REAL url length, prefix included, rather than the query string alone
@@ -762,8 +790,8 @@ def fetch_ranked_records(account_ids):
             if h is not None:
                 per_hero[(int(a), int(h))] = {"games": int(g), "wins": int(w)}
         time.sleep(0.05)
-    print("  [hs] %d accounts, %d (account,hero) rows over %d calls (no SQL used)"
-          % (len(out), len(per_hero), calls), file=sys.stderr)
+    print("  [hs/%s] %d accounts, %d (account,hero) rows over %d calls (no SQL used)"
+          % (label, len(out), len(per_hero), calls), file=sys.stderr)
     return out, per_hero
 
 
@@ -1043,7 +1071,13 @@ def main():
     every_id = {c["account_id"] for (cands, _n) in confirmed.values() for c in cands}
     for members in orbit.values():
         every_id |= set(members)
-    records, hero_records = fetch_ranked_records(every_id)
+    # career: the basis for every identity check below
+    records, hero_records = fetch_ranked_records(every_id, since=None,
+                                                 label="career")
+    # windowed: recency only, never used to reject anyone
+    recent_since = int(time.time()) - RECENT_DAYS * 86400
+    recent, recent_hero = fetch_ranked_records(every_id, since=recent_since,
+                                               label="%dd" % RECENT_DAYS)
 
     # third channel: does the scoreboard, which publishes real account ids,
     # independently agree that this account plays this hero?
@@ -1224,7 +1258,15 @@ def main():
             "identity_verdict": c.get("identity_verdict", ""),
             # independent channel: confirmed | absent | not_checked
             "scoreboard": c.get("scoreboard", ""),
+            # CAREER — what the identity checks are tested against
             "ceiling_account_games": rec["games"],
+            # WINDOWED — current activity. A low number here with a healthy
+            # career number means an inactive player, NOT a bad id.
+            "ceiling_account_games_recent":
+                recent.get(c["account_id"], {}).get("games", 0),
+            "ceiling_hero_games_recent":
+                recent_hero.get((c["account_id"], hid), {}).get("games", 0),
+            "recent_days": RECENT_DAYS,
             "rejected_no_hero_play": no_play,
             "hero_play_missing": play_missing,
             "scored_candidates": len(scored),
@@ -1296,6 +1338,8 @@ def main():
             "hero_board_only_candidates", "identity_verified", "identity_verdict",
             "scoreboard",
             "ceiling_account_games", "ceiling_hero_games",
+            "ceiling_account_games_recent", "ceiling_hero_games_recent",
+            "recent_days",
             "rejected_no_hero_play", "hero_play_missing",
             "scored_candidates", "floored_out", "rank_unknown", "min_rank",
             "from_orbit", "ceiling_from_orbit",
@@ -1380,6 +1424,48 @@ def main():
               "A display-name collision shows them on one and little on the "
               "rest — that account is several people.", file=sys.stderr)
 
+    # ---- aggregate companion, SAFE TO PUBLISH ----------------------------
+    # identity_audit.csv carries account_name and account_id and must stay on
+    # the runner: artifacts on a public repo are downloadable by anyone, which
+    # is why the workflow lists upload paths explicitly instead of globbing
+    # output/. This summary carries COUNTS ONLY — no names, no ids — so the
+    # rejection picture can be reviewed off-runner without publishing anyone's
+    # account.
+    if identity_audit or play_stats:
+        per = defaultdict(Counter)
+        for a in identity_audit:
+            per[(a["region"], a["hero"])][a["verdict"]] += 1
+        srows = []
+        for (rg, hero), c in sorted(per.items()):
+            srows.append({
+                "region": rg, "hero": hero,
+                "implausible_identity": c["implausible_identity"],
+                "no_play": c["no_play"], "missing": c["missing"],
+                "total_rejected": sum(c.values())})
+        srows.append({
+            "region": "ALL", "hero": "ALL",
+            "implausible_identity": play_stats["implausible_identity"],
+            "no_play": play_stats["no_play"], "missing": play_stats["missing"],
+            "total_rejected": sum(v for k, v in play_stats.items() if k != "pass"),
+            "passed": play_stats["pass"],
+            "scoreboard_confirmed": sb_stats["confirmed"],
+            "scoreboard_absent": sb_stats["absent"],
+            "scoreboard_not_checked": sb_stats["not_checked"],
+            "min_account_games": CEILING_MIN_ACCOUNT_GAMES,
+            "min_hero_games": CEILING_MIN_HERO_GAMES})
+        spath = os.path.join(OUT_DIR, "identity_summary.csv")
+        scols = ["region", "hero", "implausible_identity", "no_play", "missing",
+                 "total_rejected", "passed", "scoreboard_confirmed",
+                 "scoreboard_absent", "scoreboard_not_checked",
+                 "min_account_games", "min_hero_games"]
+        with open(spath, "w", newline="", encoding="utf-8") as f:
+            sw = csv.DictWriter(f, fieldnames=scols, extrasaction="ignore",
+                                restval="")
+            sw.writeheader()
+            sw.writerows(srows)
+        print("  -> %s (%d rows, counts only — safe to upload)"
+              % (spath, len(srows)), file=sys.stderr)
+
     if identity_audit:
         apath = os.path.join(OUT_DIR, "identity_audit.csv")
         acols = ["region", "hero", "hero_id", "account_name", "account_id",
@@ -1389,8 +1475,9 @@ def main():
             aw = csv.DictWriter(f, fieldnames=acols, extrasaction="ignore")
             aw.writeheader()
             aw.writerows(identity_audit)
-        print("  -> %s (%d rejected board claims)" % (apath, len(identity_audit)),
-              file=sys.stderr)
+        print("  -> %s (%d rejected board claims) — CONTAINS ACCOUNT NAMES AND "
+              "IDS, keep it off artifacts and out of the repo"
+              % (apath, len(identity_audit)), file=sys.stderr)
 
     # ---- did the floor do anything? ---------------------------------------
     if floor_idx is not None:
