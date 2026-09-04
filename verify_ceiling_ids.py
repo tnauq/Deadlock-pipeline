@@ -99,6 +99,40 @@ def norm(s):
     return re.sub(r"[^a-z0-9]+", "", s.casefold())
 
 
+def fetch_aliases(id64):
+    """Previous persona names from the profile HTML, or [].
+
+    THE DECISIVE CHECK for a mismatch. Steam shows "This user has also played
+    as:" on the profile page, and if the leaderboard name appears there the
+    account IS the right one and simply renamed. The ?xml=1 endpoint does not
+    carry alias history, so this needs the HTML page — which is why it is
+    fetched ONLY for accounts that already mismatched, a handful per run
+    rather than 76.
+
+    Absence proves nothing: Steam only lists recent aliases, and a rename from
+    long ago will not appear. An empty list means "no evidence of a rename",
+    never "not a rename".
+    """
+    url = "https://steamcommunity.com/profiles/%s" % id64
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "deadlock-identity-check/1.0"})
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            body = r.read().decode("utf-8", "replace")
+    except Exception:
+        return []
+    # the alias block sits after the "also played as" heading
+    m = re.search(r"also played as.*?</div>(.*?)</div>\s*</div>", body, re.S | re.I)
+    chunk = m.group(1) if m else ""
+    if not chunk:
+        m = re.search(r"also played as(.{0,2000})", body, re.S | re.I)
+        chunk = m.group(1) if m else ""
+    names = re.findall(r'class="[^"]*whiteLink[^"]*"[^>]*>([^<]{1,64})<', chunk)
+    if not names:
+        names = re.findall(r"<p>\s*([^<\n]{1,64}?)\s*</p>", chunk)
+    return [html.unescape(n).strip() for n in names if n.strip()]
+
+
 def contains_match(a, b, floor=4):
     """One normalised name wholly inside the other.
 
@@ -192,8 +226,18 @@ def main():
             save_cache(cache)
     save_cache(cache)
 
-    out, counts = [], {"match": 0, "match_partial": 0, "mismatch": 0,
-                       "no_profile": 0}
+    # career volume across the ceiling set, used to separate the two kinds of
+    # mismatch. Measured 2026-09-04: the confirmed WRONG account had 579
+    # career games against a ceiling median of 2,256, while the account that
+    # looked like a rename had 3,110 and heavy play on both heroes claimed.
+    vols = sorted(int(r.get("ceiling_account_games") or 0) for r in rows
+                  if (r.get("ceiling_account_games") or "").isdigit())
+    median_vol = vols[len(vols) // 2] if vols else 0
+    RENAME_VOL_FRACTION = float(os.environ.get("RENAME_VOL_FRACTION") or 0.5)
+
+    out, counts, mismatched = [], {"match": 0, "match_partial": 0,
+                                   "mismatch": 0, "likely_rename": 0,
+                                   "no_profile": 0}, []
     for r in rows:
         aid = (r.get("account_id") or "").strip()
         board = r.get("ceiling_player") or ""
@@ -212,6 +256,7 @@ def main():
             verdict = "match_partial"
         else:
             verdict = "mismatch"
+            mismatched.append((aid, board))
         counts[verdict] += 1
         out.append({
             "region": r.get("region", ""), "hero": r.get("hero", ""),
@@ -226,7 +271,44 @@ def main():
             "career_games": r.get("ceiling_account_games", ""),
             "career_hero_games": r.get("ceiling_hero_games", ""),
             "scoreboard": r.get("scoreboard", ""),
+            "steam_aliases": "", "rename_evidence": "",
         })
+
+    # ---- second pass: is each mismatch a rename or a wrong account? -------
+    # Only mismatches are fetched, so this costs a handful of requests.
+    aliases = {}
+    if mismatched:
+        print("\n  [alias] checking %d mismatched account(s) for a rename"
+              % len({a for a, _ in mismatched}), file=sys.stderr)
+        for aid in sorted({a for a, _ in mismatched}):
+            aliases[aid] = fetch_aliases(aid + STEAM64_BASE)
+            time.sleep(SLEEP_S)
+    for d in out:
+        if d["verdict"] != "mismatch":
+            continue
+        aid = d["account_id"]
+        al = aliases.get(aid, [])
+        d["steam_aliases"] = " | ".join(al)
+        vol = int(d["career_games"]) if str(d["career_games"]).isdigit() else 0
+        if any(norm(a) == norm(d["board_name"]) or
+               contains_match(a, d["board_name"]) for a in al):
+            # the board name IS one of this account's former names
+            d["verdict"] = "likely_rename"
+            d["rename_evidence"] = "board name found in Steam alias list"
+        elif median_vol and vol >= RENAME_VOL_FRACTION * median_vol:
+            # no alias evidence, but the account is a heavy player on the hero
+            # it was claimed for — a misresolution would not look like this.
+            # WEAKER than the alias test, and deliberately labelled as such.
+            d["verdict"] = "likely_rename"
+            d["rename_evidence"] = ("no alias match; career volume %d is >= %.0f%% "
+                                    "of the ceiling median %d"
+                                    % (vol, 100 * RENAME_VOL_FRACTION, median_vol))
+        else:
+            d["rename_evidence"] = ("career volume %d is far below the ceiling "
+                                    "median %d — consistent with a wrong account"
+                                    % (vol, median_vol))
+        counts["mismatch"] -= 1
+        counts[d["verdict"] if d["verdict"] != "mismatch" else "mismatch"] += 1
 
     with open(DEST, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(out[0]) if out else ["verdict"],
@@ -235,13 +317,14 @@ def main():
         w.writerows(out)
 
     total = sum(counts.values()) or 1
-    answered = counts["match"] + counts["match_partial"] + counts["mismatch"]
-    ok = counts["match"] + counts["match_partial"]
+    answered = (counts["match"] + counts["match_partial"]
+                + counts["likely_rename"] + counts["mismatch"])
+    ok = counts["match"] + counts["match_partial"] + counts["likely_rename"]
     print("\n  -> %s (%d rows)" % (DEST, len(out)), file=sys.stderr)
-    print("  [check] %d exact, %d partial (clan tag/decoration), %d MISMATCH, "
-          "%d no profile (private or gone)"
-          % (counts["match"], counts["match_partial"], counts["mismatch"],
-             counts["no_profile"]), file=sys.stderr)
+    print("  [check] %d exact, %d partial (clan tag/decoration), %d likely "
+          "rename, %d MISMATCH, %d no profile (private or gone)"
+          % (counts["match"], counts["match_partial"], counts["likely_rename"],
+             counts["mismatch"], counts["no_profile"]), file=sys.stderr)
     if answered:
         print("  [check] name agreement on answerable rows: %.1f%% (%d of %d)"
               % (100.0 * ok / answered, ok, answered),
@@ -252,11 +335,13 @@ def main():
               "true error rate is at or below the mismatch figure.",
               file=sys.stderr)
     for d in out:
-        if d["verdict"] == "mismatch":
-            print("    MISMATCH %-9s %-12s rank %-3s board=%r steam=%r  %s"
-                  % (d["region"], d["hero"], d["ceiling_rank"],
-                     d["board_name"], d["steam_persona"], d["profile_url"]),
-                  file=sys.stderr)
+        if d["verdict"] in ("mismatch", "likely_rename"):
+            print("    %-14s %-9s %-12s rank %-3s board=%r steam=%r\n"
+                  "        %s\n        aliases: %s\n        %s"
+                  % (d["verdict"].upper(), d["region"], d["hero"],
+                     d["ceiling_rank"], d["board_name"], d["steam_persona"],
+                     d["rename_evidence"], d["steam_aliases"] or "(none listed)",
+                     d["profile_url"]), file=sys.stderr)
     print("\n  Nothing is dropped on this signal. Check each mismatch by hand "
           "before acting — a renamed persona and a wrong account look "
           "identical here.", file=sys.stderr)
