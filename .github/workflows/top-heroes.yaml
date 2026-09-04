@@ -1,42 +1,67 @@
 name: Top heroes
 
-# Standalone. Does NOT run the pipeline and must not overlap with it: both
+# Standalone. Does NOT run the pipeline and must not overlap with it — both
 # draw on the same /v1/sql bucket and the binding limit is 20 requests per
-# HOUR per IP, not 2 per minute. Two runs died at exactly chunk 21 before that
-# was understood. Keep this on manual dispatch, or schedule it well clear of
-# the pipeline's window.
+# HOUR per IP, not 2 per minute.
+#
+# As of the 2026-09-03 run, /v1/players/hero-stats HONOURS
+# min_unix_timestamp / max_unix_timestamp, so top_heroes.py resolves the whole
+# board out of the free 100 req/s bucket and spends NO SQL budget. Both
+# regions is therefore cheap and is the default. SQL is only reached if that
+# window parameter stops being honoured; the concurrency group and the
+# projected-call guard inside the script cover that case.
 
 on:
   workflow_dispatch:
     inputs:
       regions:
-        description: "Regions (comma separated). One region = ~5 SQL calls, both = ~10."
-        default: "NAmerica"
+        description: "Regions. Both is free while hero-stats honours a time window."
+        default: "NAmerica,Europe"
         type: choice
         options:
+          - "NAmerica,Europe"
           - "NAmerica"
           - "Europe"
-          - "NAmerica,Europe"
       days:
         description: "Lookback window in days"
         default: "14"
+      margin:
+        description: "Games within a player's top count that count as a tie. 3 = tiebreak never fires; 5-8 is the plateau; past 12 is noise."
+        default: "5"
+        type: choice
+        options: ["5", "3", "8", "12"]
+      scarcity_pref:
+        description: "1 = break near-ties toward the RARER hero (biases scarce heroes up, common ones down). 0 = most-played always wins."
+        default: "1"
+        type: choice
+        options: ["1", "0"]
+      fallback_depth:
+        description: "How far down a player's most-played list to look for an unclaimed hero. Only used when scarcity_pref=0."
+        default: "3"
+        type: choice
+        options: ["3", "2", "1"]
+      pool_regions:
+        description: "0 = rank regions separately (NA and EU orderings measured uncorrelated). 1 = pool them."
+        default: "0"
+        type: choice
+        options: ["0", "1"]
       allow_sql:
-        description: "1 = fall through to SQL if hero-stats has no time window. 0 = stop at unwindowed career stats (free, but NOT the last N days)."
+        description: "1 = fall through to SQL if the hero-stats time window stops working. 0 = stop at unwindowed career stats (free, but NOT the last N days)."
         default: "1"
         type: choice
         options: ["1", "0"]
       min_account_games:
-        description: "Games in the window below which a candidate id is treated as a resolution failure"
+        description: "Games in the window below which a candidate id is treated as unresolved"
         default: "20"
       max_ids_per_entry:
-        description: "Candidate ids kept per board entry. 2 is measured best; 1 halves the SQL cost at ~8% accuracy loss."
+        description: "Candidate ids kept per board entry. 2 is measured best; 1 halves any SQL cost at ~8% accuracy loss."
         default: "2"
         type: choice
         options: ["2", "1"]
 
 concurrency:
-  # never let two of these overlap — they would share an IP and burn the
-  # hourly SQL budget against each other
+  # never let two of these overlap, and share this group with the pipeline
+  # workflow so they cannot burn the hourly SQL budget against each other
   group: deadlock-sql
   cancel-in-progress: false
 
@@ -52,17 +77,29 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run top_heroes
+      - name: Resolve board -> top heroes
         env:
           REGIONS: ${{ inputs.regions }}
           DAYS: ${{ inputs.days }}
           ALLOW_SQL: ${{ inputs.allow_sql }}
           MIN_ACCOUNT_GAMES: ${{ inputs.min_account_games }}
           MAX_IDS_PER_ENTRY: ${{ inputs.max_ids_per_entry }}
-          # Optional. Raises the SQL limit and the MMR-endpoint limits; the
-          # script works without it.
+          # Optional. Raises the SQL limit; the script works without it.
           DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
         run: python3 top_heroes.py
+
+      - name: Assign heroes to board positions
+        # Runs even if the step above failed partway, so a truncated
+        # top_heroes.csv still produces something inspectable rather than
+        # nothing. assign_tiers.py exits with a clear message if the file is
+        # missing entirely.
+        if: always()
+        env:
+          MARGIN: ${{ inputs.margin }}
+          SCARCITY_PREF: ${{ inputs.scarcity_pref }}
+          FALLBACK_DEPTH: ${{ inputs.fallback_depth }}
+          POOL_REGIONS: ${{ inputs.pool_regions }}
+        run: python3 assign_tiers.py
 
       - name: Upload output
         if: always()
