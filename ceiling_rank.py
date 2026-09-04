@@ -205,6 +205,41 @@ SHRINK_K = int(os.environ.get("SHRINK_K") or 25)
 # from 98% to 83% and pushed hero-regions under 15 builds from 2 to 18, so it
 # stays off. This drops only claims with no play behind them.
 VALIDATE_HERO_PLAY = os.environ.get("VALIDATE_HERO_PLAY", "1") == "1"
+
+# ---- scoreboard cross-check ----------------------------------------------
+# A THIRD, INDEPENDENT identity channel, added 2026-09-04.
+#
+# /v1/analytics/scoreboards/players is the only endpoint that publishes a real
+# account_id. Both leaderboards publish display names plus deadlock-api's own
+# fuzzy possible_account_ids, which put the wrong player in 110 of 371 slots
+# when used alone — so hero-board/general-board agreement is two views of ONE
+# fallible resolution, not two tests. The scoreboard shares no failure mode
+# with it, which is the entire reason for the call.
+#
+# Probed 2026-09-04, all three questions positive:
+#   hero_id FILTERS      jaccard 0.002 between heroes 1 and 15; an impossible
+#                        hero id returns 0 rows. Not silently ignored, which
+#                        match_mode on this same endpoint WAS.
+#   account_ids FILTERS  asked for 5 ids, got exactly those 5; ids that cannot
+#                        exist return empty.
+#   rate limit           200 req/min per IP (400 with key), shared across all
+#                        analytics endpoints. NOT the 20/hour SQL bucket.
+#
+# PATH NOTE: PROBES had this at /v1/players/scoreboard. It moved under
+# /v1/analytics/. A probe against the old path found nothing and was nearly
+# recorded as "capability gone".
+#
+# Cost: one call per hero per 1,000 candidate ids, so ~1-2 calls per hero.
+SCOREBOARD_CHECK = os.environ.get("SCOREBOARD_CHECK", "1") == "1"
+SCOREBOARD_PATH = "/v1/analytics/scoreboards/players"
+# Required by the endpoint. `matches` is the stable key; `winrate` returned 500
+# until at least 2026-08-07 and only started answering 200 on 2026-09-04.
+SCOREBOARD_SORT = os.environ.get("SCOREBOARD_SORT") or "matches"
+# Spec maximum is 1000 ids per call.
+SCOREBOARD_CHUNK = int(os.environ.get("SCOREBOARD_CHUNK") or 1000)
+# The endpoint's own default is 20, which would hide exactly the low-volume
+# accounts most in doubt. Minimum allowed is 1.
+SCOREBOARD_MIN_MATCHES = int(os.environ.get("SCOREBOARD_MIN_MATCHES") or 1)
 # Minimum games on the ACCOUNT, across all heroes, for its identity to be
 # credible at all. Added 2026-09-02 after run 45, and it is the stronger of the
 # two checks because it does not depend on which hero is claimed.
@@ -374,6 +409,23 @@ def passes_floor(cand, floor_idx):
         # orbit candidates were never on a board and always land here
         return (CEILING_RANK_UNKNOWN != "drop"), "unknown"
     return (idx >= floor_idx), ("pass" if idx >= floor_idx else "below")
+
+
+def scoreboard_verdict(cand, hero_id, sb_pairs, sb_checked):
+    """"confirmed" / "absent" / "not_checked" — reported, never fatal.
+
+    Deliberately NOT a drop condition. It is a new channel with one probe
+    behind it, and the project has twice been burned by an endpoint that
+    answered plausibly while meaning something else (match_mode accepted and
+    ignored; average_badge populated and zero). It rides alongside the two
+    checks that ARE load-bearing until a labelled sample says what its
+    false-negative rate is.
+    """
+    if not SCOREBOARD_CHECK or cand.get("match") == "orbit":
+        return ""
+    if hero_id not in sb_checked:
+        return "not_checked"
+    return "confirmed" if (cand["account_id"], hero_id) in sb_pairs else "absent"
 
 
 def passes_identity(cand, hero_id, rec, hero_records):
@@ -601,6 +653,54 @@ def _hs_url(base, ids):
     either way rather than assuming a leading '&' is safe."""
     q = "&".join("account_ids=%d" % a for a in ids)
     return base + ("&" if not base.endswith("?") else "") + q
+
+
+def fetch_scoreboard_pairs(cands_by_hero):
+    """{(account_id, hero_id)} that the scoreboard independently confirms.
+
+    cands_by_hero: {hero_id: set(account_id)} — only ids we actually need
+    checked, so a hero with 40 candidates costs one call, not a board pull.
+
+    Absence is meaningful here in a way it is not for the orbit fallback: the
+    scoreboard is a career board over all modes, so an id that genuinely plays
+    the hero should appear regardless of when or with whom it queued. An id
+    that does not is either wrong or has essentially never played the hero.
+
+    Failures return NO pairs for that hero rather than raising. A dead
+    endpoint must not silently mark every candidate unconfirmed — callers
+    check `checked` to tell "not confirmed" from "not checked".
+    """
+    pairs, checked = set(), set()
+    calls = 0
+    for hid in sorted(cands_by_hero):
+        ids = sorted(cands_by_hero[hid])
+        if not ids:
+            continue
+        ok = False
+        for i in range(0, len(ids), SCOREBOARD_CHUNK):
+            part = ids[i:i + SCOREBOARD_CHUNK]
+            u = ("%s%s?sort_by=%s&hero_id=%d&min_matches=%d&limit=%d"
+                 "&account_ids=%s"
+                 % (BASE, SCOREBOARD_PATH, SCOREBOARD_SORT, hid,
+                    SCOREBOARD_MIN_MATCHES, len(part),
+                    ",".join(str(a) for a in part)))
+            try:
+                rows = get(u)
+                calls += 1
+            except Exception as e:
+                print("  [sb] hero %d chunk failed: %s" % (hid, e), file=sys.stderr)
+                continue
+            ok = True
+            body = rows.get("entries", rows) if isinstance(rows, dict) else rows
+            for r in body or []:
+                a = r.get("account_id") if isinstance(r, dict) else None
+                if a is not None:
+                    pairs.add((int(a), hid))
+        if ok:
+            checked.add(hid)
+    print("  [sb] %d calls, %d (account,hero) pairs confirmed across %d heroes"
+          % (calls, len(pairs), len(checked)), file=sys.stderr)
+    return pairs, checked
 
 
 def fetch_ranked_records(account_ids):
@@ -945,8 +1045,24 @@ def main():
         every_id |= set(members)
     records, hero_records = fetch_ranked_records(every_id)
 
+    # third channel: does the scoreboard, which publishes real account ids,
+    # independently agree that this account plays this hero?
+    sb_pairs, sb_checked = set(), set()
+    if SCOREBOARD_CHECK:
+        print("  [sb] scoreboard cross-check", file=sys.stderr)
+        need = defaultdict(set)
+        for (_rg, hid), (cands, _n) in confirmed.items():
+            for c in cands:
+                # orbit candidates were never claimed by a board, so there is
+                # no board claim to corroborate
+                if c["match"] != "orbit":
+                    need[hid].add(c["account_id"])
+        sb_pairs, sb_checked = fetch_scoreboard_pairs(need)
+
     floor_stats = Counter()
     play_stats = Counter()
+    sb_stats = Counter()
+    sb_agree = Counter()
     identity_audit = []
     fallback_heroes = []
     per_region = defaultdict(list)
@@ -1000,6 +1116,13 @@ def main():
                 continue
             play_ok, play_verdict, hgames = passes_identity(c, hid, rec, hero_records)
             play_stats[play_verdict] += 1
+            c["scoreboard"] = scoreboard_verdict(c, hid, sb_pairs, sb_checked)
+            if c["scoreboard"]:
+                sb_stats[c["scoreboard"]] += 1
+                # agreement between two independent channels is the number
+                # worth watching: where they disagree, one of them is wrong
+                if play_verdict == "pass":
+                    sb_agree[c["scoreboard"]] += 1
             if play_verdict == "missing":
                 play_missing += 1
             if not play_ok:
@@ -1015,7 +1138,8 @@ def main():
                     "match": c["match"], "global_pos": c["pos"],
                     "hero_ladder_pos": c["hero_pos"], "board_size": c["board_size"],
                     "hero_games": hgames if hgames is not None else "",
-                    "verdict": play_verdict})
+                    "verdict": play_verdict,
+                    "scoreboard": c.get("scoreboard", "")})
                 continue
             c["hero_games_checked"] = hgames
             c["identity_verdict"] = "pass"
@@ -1098,6 +1222,8 @@ def main():
             # is the best of a bad set — treat the ceiling player as unverified
             "identity_verified": identity_verified,
             "identity_verdict": c.get("identity_verdict", ""),
+            # independent channel: confirmed | absent | not_checked
+            "scoreboard": c.get("scoreboard", ""),
             "ceiling_account_games": rec["games"],
             "rejected_no_hero_play": no_play,
             "hero_play_missing": play_missing,
@@ -1168,6 +1294,7 @@ def main():
             "ranked_rank", "rank_name",
             "hero_ladder_pos", "match", "valve_top_hero", "located_on_general",
             "hero_board_only_candidates", "identity_verified", "identity_verdict",
+            "scoreboard",
             "ceiling_account_games", "ceiling_hero_games",
             "rejected_no_hero_play", "hero_play_missing",
             "scored_candidates", "floored_out", "rank_unknown", "min_rank",
@@ -1204,6 +1331,30 @@ def main():
             print("  [play] those rows are kept so no hero vanishes, but their "
                   "ceiling player should not be trusted.", file=sys.stderr)
 
+    # ---- scoreboard: does the independent channel agree? ------------------
+    if SCOREBOARD_CHECK and sb_stats:
+        tot = sum(sb_stats.values())
+        print("\n  [sb] %d candidates cross-checked: %d confirmed, %d absent, "
+              "%d not checked"
+              % (tot, sb_stats["confirmed"], sb_stats["absent"],
+                 sb_stats["not_checked"]), file=sys.stderr)
+        agreed = sb_agree["confirmed"] + sb_agree["absent"]
+        if agreed:
+            print("  [sb] of candidates that PASSED hero-stats validation, %.0f%% "
+                  "are also on the scoreboard for that hero."
+                  % (100.0 * sb_agree["confirmed"] / agreed), file=sys.stderr)
+            print("  [sb] the remainder are the disagreements worth reading — one "
+                  "of the two channels is wrong about them. Scoreboard is NOT a "
+                  "drop condition yet; it needs a labelled sample first.",
+                  file=sys.stderr)
+        unver = [d for d in out if d.get("scoreboard") == "absent"]
+        if unver:
+            print("  [sb] %d CEILINGS are absent from the scoreboard for their own "
+                  "hero: %s" % (len(unver), ", ".join(
+                      "%s/%s (%s)" % (d["region"], d["hero"],
+                                      (d["ceiling_player"] or "?")[:14])
+                      for d in unver[:10])), file=sys.stderr)
+
     # ---- multi-hero ceilings: real flex player, or a name collision? -------
     # This is the report the check exists for. One account holding several
     # hero boards is either a genuine flex player or several different players
@@ -1233,7 +1384,7 @@ def main():
         apath = os.path.join(OUT_DIR, "identity_audit.csv")
         acols = ["region", "hero", "hero_id", "account_name", "account_id",
                  "match", "global_pos", "hero_ladder_pos", "board_size",
-                 "hero_games", "verdict"]
+                 "hero_games", "verdict", "scoreboard"]
         with open(apath, "w", newline="", encoding="utf-8") as f:
             aw = csv.DictWriter(f, fieldnames=acols, extrasaction="ignore")
             aw.writeheader()
