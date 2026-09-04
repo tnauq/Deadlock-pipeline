@@ -1,0 +1,66 @@
+name: Verify ceiling identities
+
+# Checks that each ceiling player's resolved account_id actually BELONGS to
+# the display name it was matched from, by reading Steam's own profile XML.
+#
+# No API key and no Steam account needed —
+# steamcommunity.com/profiles/{id64}?xml=1 is public. Statlocker's
+# /api/public/profiles would answer the same question in bulk, but it is
+# gated behind a hand-reviewed key application; this route is unblocked today
+# and Statlocker becomes a second opinion later rather than a dependency.
+#
+# Zero deadlock-api calls, so it cannot touch the 20/hour SQL budget and does
+# not join the site-publish or deadlock-sql concurrency groups.
+#
+# Runs SEPARATELY from the refresh, not inside it. Steam throttles, ~76
+# requests at a courtesy 1s gap takes a couple of minutes, and a throttled
+# Steam must never be able to fail the data refresh.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sleep:
+        description: "Seconds between Steam requests. Courtesy client, not a scraper — do not lower without reason."
+        default: "1.0"
+      src_csv:
+        description: "Which file in output/ to verify. ceiling.csv is the set where a wrong id changes published output."
+        default: "ceiling.csv"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The verifier reads output/ceiling.csv, which the refresh does not
+      # commit. Pull it from that workflow's most recent artifact rather than
+      # re-running the pipeline — this job must cost no API budget at all.
+      - name: Fetch latest aggregates
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: daily-refresh.yml
+          name: deadlock-aggregates
+          path: output
+          if_no_artifact_found: fail
+
+      - name: Verify ceiling identities
+        env:
+          STEAM_SLEEP: ${{ inputs.sleep }}
+          SRC_CSV: ${{ inputs.src_csv }}
+        run: python3 verify_ceiling_ids.py
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deadlock-identity-check
+          retention-days: 30
+          path: |
+            output/ceiling_identity_check.csv
+            output/steam_names_cache.csv
