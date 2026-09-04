@@ -5,26 +5,41 @@ name: Verify ceiling identities
 #
 # No API key and no Steam account needed —
 # steamcommunity.com/profiles/{id64}?xml=1 is public. Statlocker's
-# /api/public/profiles would answer the same question in bulk, but it is
-# gated behind a hand-reviewed key application; this route is unblocked today
-# and Statlocker becomes a second opinion later rather than a dependency.
+# /api/public/profiles would answer the same question in bulk, but it is gated
+# behind a hand-reviewed key application; this route is unblocked today and
+# Statlocker becomes a second opinion later rather than a dependency.
 #
 # Zero deadlock-api calls, so it cannot touch the 20/hour SQL budget and does
-# not join the site-publish or deadlock-sql concurrency groups.
-#
-# Runs SEPARATELY from the refresh, not inside it. Steam throttles, ~76
-# requests at a courtesy 1s gap takes a couple of minutes, and a throttled
+# not join the site-publish or deadlock-sql concurrency groups. It runs
+# SEPARATELY from the refresh on purpose: Steam throttles, and a throttled
 # Steam must never be able to fail the data refresh.
+#
+# ARTIFACT DOWNLOAD — rewritten 2026-09-04. The first version used
+# dawidd6/action-download-artifact with `workflow: daily-refresh.yml` and got
+# `Not Found` from list-workflow-runs-for-a-workflow: that parameter wants the
+# FILENAME of the workflow, and "Daily refresh" is its display name. This
+# version uses the preinstalled `gh` CLI, which accepts either, so it does not
+# matter what the refresh's file is called. It also drops a third-party action
+# and its Node deprecation warning.
 
 on:
   workflow_dispatch:
     inputs:
+      refresh_workflow:
+        description: "The refresh workflow to pull output/ from. Display name or filename both work."
+        default: "Daily refresh"
       sleep:
         description: "Seconds between Steam requests. Courtesy client, not a scraper — do not lower without reason."
         default: "1.0"
       src_csv:
         description: "Which file in output/ to verify. ceiling.csv is the set where a wrong id changes published output."
         default: "ceiling.csv"
+
+# `gh run download` reads another workflow's artifacts, which the default
+# token cannot do without this.
+permissions:
+  contents: read
+  actions: read
 
 jobs:
   verify:
@@ -39,15 +54,27 @@ jobs:
           python-version: "3.12"
 
       # The verifier reads output/ceiling.csv, which the refresh does not
-      # commit. Pull it from that workflow's most recent artifact rather than
-      # re-running the pipeline — this job must cost no API budget at all.
+      # commit. Pull it from that workflow's most recent successful run rather
+      # than re-running the pipeline — this job must cost no API budget at all.
       - name: Fetch latest aggregates
-        uses: dawidd6/action-download-artifact@v6
-        with:
-          workflow: daily-refresh.yml
-          name: deadlock-aggregates
-          path: output
-          if_no_artifact_found: fail
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WF: ${{ inputs.refresh_workflow }}
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          echo "Looking for the most recent successful run of: ${WF}"
+          RUN_ID=$(gh run list --workflow "${WF}" --status success \
+                     --limit 1 --json databaseId --jq '.[0].databaseId' || true)
+          if [ -z "${RUN_ID:-}" ] || [ "${RUN_ID}" = "null" ]; then
+            echo "No successful run found for '${WF}'. Available workflows:"
+            gh workflow list --all
+            echo "Re-run this job with refresh_workflow set to one of the above."
+            exit 1
+          fi
+          echo "Using run ${RUN_ID}"
+          gh run download "${RUN_ID}" --name deadlock-aggregates --dir output
+          ls -la output
 
       - name: Verify ceiling identities
         env:
