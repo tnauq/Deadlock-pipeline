@@ -54,6 +54,7 @@ the range before trusting any single ordering.
 """
 
 import csv
+import math
 import os
 import sys
 from collections import Counter, defaultdict
@@ -89,6 +90,27 @@ SCARCITY_PREF = os.environ.get("SCARCITY_PREF", "1") == "1"
 # swing 18+ places between them, so pooling positions across regions compares
 # numbers that are not on the same scale.
 POOL_REGIONS = os.environ.get("POOL_REGIONS", "0") == "1"
+# HYBRID: move a hero only where its ratio is EXTREME enough to be evidence,
+# and leave everything else on the base ordering.
+#
+# The first attempt gated on expected_se / expected_pos and qualified ZERO
+# heroes, which exposed the real property: the minimum of n draws is
+# approximately EXPONENTIAL, and an exponential's standard deviation equals
+# its mean. So relative uncertainty is ~1.0 for every hero at every draw
+# count. Lash's se of 8.5 looks precise only because its expectation is 9;
+# in relative terms it is exactly as uncertain as Lady Geist's 71-on-77.
+# The correction is equally noisy everywhere, not merely at the thin end.
+#
+# So the gate is extremity, not precision. Under the null that hero choice is
+# unrelated to board position, ratio ~ Exponential(1), giving
+#   P(ratio <= r) = 1 - exp(-r)      for a hero doing BETTER than expected
+#   P(ratio >= r) = exp(-r)          for one doing worse
+# A hero moves only when that probability falls below HYBRID_P. NA Sinclair at
+# ratio 0.11 gives p = 0.10; EU Lash at 5.14 gives p = 0.006. Everything in
+# the middle stays where the base ordering put it, because one draw from an
+# exponential is not evidence of anything.
+HYBRID_P = float(os.environ.get("HYBRID_P") or 0.10)
+
 # Rows whose identity could not be resolved carry no heroes and are skipped.
 # They are counted, because a gap at the TOP of the board matters far more
 # than one at the bottom: 19 of the NA top 50 had no hero data.
@@ -219,13 +241,38 @@ def expected_position_rerank(claimed, rare, board_n):
             "expected_pos": round(exp, 1),
             "ratio": round(d["board_pos"] / exp, 3),
             # spread of the minimum of n draws, in the same units as exp
+            # kept for reference, but note it is ~= expected_pos for every n:
+            # the minimum of n draws is near-exponential, sd == mean
             "expected_se": round(exp * (n / (n + 2.0)) ** 0.5, 1),
             "draws": n,
         }
+        r = out[hero]["ratio"]
+        # two-sided-ish: how unlikely is a ratio this extreme, either way
+        out[hero]["p"] = round(min(1 - math.exp(-r), math.exp(-r)), 4)
     order = sorted(out, key=lambda h: (out[h]["ratio"], claimed[h]["board_pos"], h))
     for i, h in enumerate(order, 1):
         out[h]["rank"] = i
     return out
+
+
+def hybrid_ranks(base_rank, exp):
+    """Corrected rank where the correction is measured, base rank elsewhere.
+
+    Qualifying heroes are re-sorted among the POSITIONS they collectively
+    occupy in the base ordering. Non-qualifying heroes do not move at all.
+    That keeps it a genuine hybrid rather than a full rerank with some heroes
+    pinned — a thin hero neither gains nor loses from a correction that could
+    not be computed for it.
+    """
+    qual = [h for h, v in exp.items() if v["p"] <= HYBRID_P]
+    if not qual:
+        return dict(base_rank), []
+    slots = sorted(base_rank[h] for h in qual if h in base_rank)
+    reordered = sorted(qual, key=lambda h: (exp[h]["ratio"], base_rank.get(h, 0), h))
+    out = dict(base_rank)
+    for slot, hero in zip(slots, reordered):
+        out[hero] = slot
+    return out, qual
 
 
 def ranks(claimed):
@@ -279,17 +326,40 @@ def main():
 
         chosen_name = os.environ.get("ORDERING") or (
             "scarcity_3" if SCARCITY_PREF else "fallback_%d" % FALLBACK_DEPTH)
-        if chosen_name not in results and chosen_name != "expected_pos":
+        if chosen_name not in results and chosen_name not in ("expected_pos",
+                                                              "hybrid"):
             chosen_name = "fallback_3"
-        # expected_pos reranks fallback_3's assignment rather than producing
-        # its own, so the claim records come from there either way
-        chosen = results["fallback_3" if chosen_name == "expected_pos"
-                         else chosen_name]
-        print("  ordering written from: %s" % chosen_name, file=sys.stderr)
+        # expected_pos is a RANKING RULE, not an assignment rule — it has no
+        # greedy walk of its own. ASSIGN_FOR_EXPECTED names which assignment
+        # it reranks when it is the published ordering.
+        assign_name = (os.environ.get("ASSIGN_FOR_EXPECTED") or "scarcity_3") \
+            if chosen_name in ("expected_pos", "hybrid") else chosen_name
+        if assign_name not in results:
+            assign_name = "fallback_3"
+        chosen = results[assign_name]
+        print("  ordering written from: %s (claims from %s)"
+              % (chosen_name, assign_name), file=sys.stderr)
 
-        exp = expected_position_rerank(results["fallback_3"], rare, len(sub))
+        # Rerank the assignment that is actually being PUBLISHED, not a fixed
+        # one. Reranking fallback_3 while publishing scarcity_3 conflated two
+        # changes — a different set of claims and a different ranking rule —
+        # and made Sinclair look like a 34-place disagreement about the
+        # correction when it was really about which player claimed it.
+        exp = expected_position_rerank(chosen, rare, len(sub))
         rk = {n: ranks(c) for n, c in results.items()}
         rk["expected_pos"] = {h: v["rank"] for h, v in exp.items()}
+        hyb, qual = hybrid_ranks(ranks(chosen), exp)
+        rk["hybrid"] = hyb
+        print("  [hybrid] correction applied to %d of %d heroes "
+              "(p <= %.2f under Exponential(1)); the rest keep their %s rank"
+              % (len(qual), len(exp), HYBRID_P, assign_name),
+              file=sys.stderr)
+        if qual:
+            print("  [hybrid] moved: %s"
+                  % ", ".join("%s(ratio %.2f, p=%.3f)"
+                              % (h, exp[h]["ratio"], exp[h]["p"])
+                              for h in sorted(qual, key=lambda x: exp[x]["ratio"])),
+                  file=sys.stderr)
         top_exp = sorted(exp, key=lambda h: exp[h]["rank"])[:6]
         print("  expected_pos top6: %s"
               % ", ".join("%s(ratio %.2f, n=%d)"
@@ -321,6 +391,8 @@ def main():
                 "expected_pos": e.get("expected_pos", ""),
                 "obs_over_expected": e.get("ratio", ""),
                 "expected_se": e.get("expected_se", ""),
+                "expected_p": e.get("p", ""),
+                "correction_applied": ("YES" if hero in qual else "") if e else "",
                 **{"rank_" + n: rk[n].get(hero, "") for n in rk},
             })
 
@@ -336,8 +408,9 @@ def main():
     _write("tier_assignment.csv", out_rows, cols)
     scols = (["region", "hero", "rank", "best_rank", "worst_rank", "rank_range",
               "near_tie", "rarity", "expected_pos", "obs_over_expected",
-              "expected_se"]
-             + ["rank_" + n for n, _ in VARIANTS] + ["rank_expected_pos"])
+              "expected_se", "expected_p"]
+             + ["rank_" + n for n, _ in VARIANTS]
+             + ["rank_expected_pos", "rank_hybrid", "correction_applied"])
     _write("tier_sensitivity.csv", sens_rows, scols)
 
 
