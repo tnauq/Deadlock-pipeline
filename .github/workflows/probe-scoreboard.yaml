@@ -1,0 +1,67 @@
+name: Probe scoreboard
+
+# One-off. Answers whether /v1/players/scoreboard can serve as an INDEPENDENT
+# identity verifier — it is the only endpoint that publishes a real
+# account_id, while the leaderboards publish display names plus fuzzy
+# candidate id lists.
+#
+# This endpoint was already probed 2026-08-07 and filed as "NOT a ceiling
+# source" (sort_by=winrate 500, match_mode accepted and ignored, region
+# ignored). Every one of those failures is about RANKING and none of them
+# affects verification, which is why it is being revisited for a different
+# purpose rather than re-probed for the same one.
+#
+# Spends NO /v1/sql budget — scoreboard is a separate endpoint. Safe to run
+# alongside anything, so it does not join the deadlock-sql concurrency group.
+#
+# The result belongs in PROBES.md whichever way it lands. A negative answer is
+# worth as much as a positive one: it closes the idea permanently instead of
+# leaving it to be reconsidered a third time.
+
+on:
+  workflow_dispatch:
+    inputs:
+      hero_a:
+        description: "First hero id for the filter control. Pick a POPULAR hero."
+        default: "1"
+      hero_b:
+        description: "Second hero id. Pick an UNPOPULAR one — two similar heroes can overlap for legitimate reasons and muddy the test."
+        default: "15"
+      limit:
+        description: "Rows per call. Depth 5000 was confirmed working in the 2026-08-07 probe; 500 is enough to compare sets."
+        default: "500"
+      burst:
+        description: "Consecutive calls used to identify the rate-limit bucket. Keep small."
+        default: "6"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Probe scoreboard
+        env:
+          HERO_A: ${{ inputs.hero_a }}
+          HERO_B: ${{ inputs.hero_b }}
+          LIMIT: ${{ inputs.limit }}
+          BURST: ${{ inputs.burst }}
+          # Optional. Raises rate limits; the probe works without it, and
+          # running WITHOUT a key is arguably the more useful measurement
+          # since that is what the scheduled jobs experience.
+          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+        run: python3 probe_scoreboard.py
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deadlock-probe-scoreboard
+          path: output/
+          retention-days: 30
