@@ -1,7 +1,7 @@
 name: Probe scoreboard
 
-# One-off. Answers whether /v1/players/scoreboard can serve as an INDEPENDENT
-# identity verifier — it is the only endpoint that publishes a real
+# One-off. Answers whether /v1/analytics/scoreboards/players can serve as an
+# INDEPENDENT identity verifier — it is the only endpoint that publishes a real
 # account_id, while the leaderboards publish display names plus fuzzy
 # candidate id lists.
 #
@@ -11,8 +11,14 @@ name: Probe scoreboard
 # affects verification, which is why it is being revisited for a different
 # purpose rather than re-probed for the same one.
 #
-# Spends NO /v1/sql budget — scoreboard is a separate endpoint. Safe to run
-# alongside anything, so it does not join the deadlock-sql concurrency group.
+# PATH CORRECTED 2026-09-04. PROBES had this at /v1/players/scoreboard; the
+# live OpenAPI spec puts it under /v1/analytics/. The first run of this
+# workflow probed the old path, found nothing, and would have been recorded as
+# a false negative. Read /openapi.json before concluding a capability is gone.
+#
+# Spends NO /v1/sql budget — analytics endpoints are their own bucket at
+# 200 req/min per IP. Safe to run alongside anything, so it deliberately does
+# not join the deadlock-sql concurrency group.
 #
 # The result belongs in PROBES.md whichever way it lands. A negative answer is
 # worth as much as a positive one: it closes the idea permanently instead of
@@ -28,11 +34,13 @@ on:
         description: "Second hero id. Pick an UNPOPULAR one — two similar heroes can overlap for legitimate reasons and muddy the test."
         default: "15"
       limit:
-        description: "Rows per call. Depth 5000 was confirmed working in the 2026-08-07 probe; 500 is enough to compare sets."
+        description: "Rows per call. Spec allows up to 10000; 500 is enough to compare sets."
         default: "500"
-      burst:
-        description: "Consecutive calls used to identify the rate-limit bucket. Keep small."
-        default: "6"
+      sort_by:
+        description: "REQUIRED by the endpoint. `matches` is the safe default; `winrate` returned 500 on 2026-08-07 and is checked separately by the probe."
+        default: "matches"
+        type: choice
+        options: ["matches", "wins", "rank", "winrate"]
 
 jobs:
   probe:
@@ -51,7 +59,7 @@ jobs:
           HERO_A: ${{ inputs.hero_a }}
           HERO_B: ${{ inputs.hero_b }}
           LIMIT: ${{ inputs.limit }}
-          BURST: ${{ inputs.burst }}
+          SORT_BY: ${{ inputs.sort_by }}
           # Optional. Raises rate limits; the probe works without it, and
           # running WITHOUT a key is arguably the more useful measurement
           # since that is what the scheduled jobs experience.
