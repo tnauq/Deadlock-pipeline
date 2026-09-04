@@ -71,7 +71,17 @@ def _env(name, default):
 # 1 = strict (skip the player if their #1 is taken). 3 = use the full list.
 FALLBACK_DEPTH = _env("FALLBACK_DEPTH", 3)
 # Games within the top count that count as a tie for that player.
+# ABSOLUTE tie band, in games. Kept for comparability with earlier runs, but
+# it behaves inconsistently across activity levels: median hero1_games over a
+# 14-day window is 20 (quartiles 12-30), so MARGIN=5 is 25% of a typical top
+# count and over 40% for a low-activity player. That — not co-mains — is why
+# 33 of 38 EU placements came back flagged near_tie.
 MARGIN = _env("MARGIN", 3)
+# PROPORTIONAL tie band, as a fraction of the player's OWN top count, so it
+# means the same thing for a 12-game player and a 60-game one. Only 13% of
+# players have #1 and #2 within 10% of each other, so this fires far less
+# often than the absolute band at its usual settings.
+MARGIN_PCT = float(os.environ.get("MARGIN_PCT") or 0.15)
 # Break near-ties toward the rarer hero. See the header.
 SCARCITY_PREF = os.environ.get("SCARCITY_PREF", "1") == "1"
 # Regions are ranked SEPARATELY by default. NA and EU ceiling orderings are
@@ -119,8 +129,13 @@ def rarity(rows):
     return c
 
 
-def assign(rows, depth, margin, scarcity, rare):
-    """Greedy walk down the board. Returns hero -> assignment record."""
+def assign(rows, depth, margin, scarcity, rare, margin_pct=None):
+    """Greedy walk down the board. Returns hero -> assignment record.
+
+    margin_pct, when set, replaces the absolute game band with a fraction of
+    the player's own top count — the same band for a 12-game player and a
+    60-game one.
+    """
     claimed = {}
     used = set()
     for r in sorted(rows, key=lambda x: x["board_pos"]):
@@ -128,13 +143,14 @@ def assign(rows, depth, margin, scarcity, rare):
         if not picks or r.get("account_id") in used:
             continue
         top = picks[0][1]
+        band = top * margin_pct if margin_pct is not None else margin
         free = [(h, g) for h, g in picks if h not in claimed]
         if not free:
             continue
         if scarcity:
             # among heroes this player plays within MARGIN of their top count,
             # take the rarest; outside the margin, most-played still wins
-            tied = [(h, g) for h, g in free if top - g <= margin]
+            tied = [(h, g) for h, g in free if top - g <= band]
             pick = min(tied, key=lambda hg: (rare[hg[0]], -hg[1], hg[0])) if tied \
                 else max(free, key=lambda hg: (hg[1], hg[0]))
         else:
@@ -149,7 +165,7 @@ def assign(rows, depth, margin, scarcity, rare):
             "margin_to_top": top - g,
             # a claim taken on a near-tie is the fragile kind: this player
             # could as easily have been assigned elsewhere
-            "near_tie": "YES" if (top - g) <= margin and len(r["picks"]) > 1 else "",
+            "near_tie": "YES" if (top - g) <= band and len(r["picks"]) > 1 else "",
             "rarity": rare[h],
         }
         used.add(r.get("account_id"))
@@ -157,11 +173,59 @@ def assign(rows, depth, margin, scarcity, rare):
 
 
 VARIANTS = [
-    ("strict_1",      dict(depth=1, scarcity=False)),
-    ("fallback_2",    dict(depth=2, scarcity=False)),
-    ("fallback_3",    dict(depth=3, scarcity=False)),
-    ("scarcity_3",    dict(depth=3, scarcity=True)),
+    ("strict_1",     dict(depth=1, scarcity=False)),
+    ("fallback_2",   dict(depth=2, scarcity=False)),
+    ("fallback_3",   dict(depth=3, scarcity=False)),
+    ("scarcity_3",   dict(depth=3, scarcity=True)),
+    ("scarcity_pct", dict(depth=3, scarcity=True, pct=True)),
 ]
+# "expected_pos" is a sixth ordering and is NOT a greedy walk — it reranks
+# fallback_3. See expected_position_rerank().
+
+
+def expected_position_rerank(claimed, rare, board_n):
+    """Rerank by observed position DIVIDED BY the position headcount predicts.
+
+    THE POPULARITY CORRECTION, done smoothly instead of by a tie band.
+
+    Under "walk down the board and take the first player who plays hero X", a
+    hero's rank is the MINIMUM of n draws, where n is how many board players
+    play it. For n draws over a board of N the expected best position is about
+    (N+1)/(n+1) — so popularity buys position for free, with no reference to
+    the hero at all. Lash appeared in 111 NA top-3 lists and landed at
+    position 7 against an expectation of ~9: essentially nothing. Lady Geist
+    appeared in 13 and landed at 29 against an expectation of ~72, which is
+    the largest overperformance on the board.
+
+    ratio = observed_pos / expected_pos. Below 1 means the hero's best player
+    sits higher up the ladder than headcount alone predicts; that is the
+    quantity worth ranking on, and it needs no threshold.
+
+    TWO LIMITS, both real:
+      - It assumes board position is INDEPENDENT of which hero you play. If a
+        hero genuinely helps you climb, this correction absorbs part of the
+        very effect being measured. The correction is conservative for that
+        reason, not neutral.
+      - At n = 13 the estimate is noisy. expected_se is written alongside so a
+        thin hero's ratio is not read with the same confidence as Lash's. The
+        minimum of n draws has a standard error of roughly its own expectation
+        for small n, so a 13-player hero's interval is enormous.
+    """
+    out = {}
+    for hero, d in claimed.items():
+        n = max(rare.get(hero, 0), 1)
+        exp = (board_n + 1.0) / (n + 1.0)
+        out[hero] = {
+            "expected_pos": round(exp, 1),
+            "ratio": round(d["board_pos"] / exp, 3),
+            # spread of the minimum of n draws, in the same units as exp
+            "expected_se": round(exp * (n / (n + 2.0)) ** 0.5, 1),
+            "draws": n,
+        }
+    order = sorted(out, key=lambda h: (out[h]["ratio"], claimed[h]["board_pos"], h))
+    for i, h in enumerate(order, 1):
+        out[h]["rank"] = i
+    return out
 
 
 def ranks(claimed):
@@ -201,7 +265,8 @@ def main():
 
         results = {}
         for name, kw in VARIANTS:
-            c = assign(sub, kw["depth"], MARGIN, kw["scarcity"], rare)
+            c = assign(sub, kw["depth"], MARGIN, kw["scarcity"], rare,
+                       MARGIN_PCT if kw.get("pct") else None)
             results[name] = c
             missing = universe - set(c)
             via = Counter(d["via"] for d in c.values())
@@ -212,12 +277,24 @@ def main():
                      "  MISSING: %s" % ", ".join(sorted(missing)) if missing else ""),
                   file=sys.stderr)
 
-        chosen_name = "scarcity_3" if SCARCITY_PREF else "fallback_%d" % FALLBACK_DEPTH
-        chosen_name = chosen_name if chosen_name in results else "fallback_3"
-        chosen = results[chosen_name]
+        chosen_name = os.environ.get("ORDERING") or (
+            "scarcity_3" if SCARCITY_PREF else "fallback_%d" % FALLBACK_DEPTH)
+        if chosen_name not in results and chosen_name != "expected_pos":
+            chosen_name = "fallback_3"
+        # expected_pos reranks fallback_3's assignment rather than producing
+        # its own, so the claim records come from there either way
+        chosen = results["fallback_3" if chosen_name == "expected_pos"
+                         else chosen_name]
         print("  ordering written from: %s" % chosen_name, file=sys.stderr)
 
+        exp = expected_position_rerank(results["fallback_3"], rare, len(sub))
         rk = {n: ranks(c) for n, c in results.items()}
+        rk["expected_pos"] = {h: v["rank"] for h, v in exp.items()}
+        top_exp = sorted(exp, key=lambda h: exp[h]["rank"])[:6]
+        print("  expected_pos top6: %s"
+              % ", ".join("%s(ratio %.2f, n=%d)"
+                          % (h, exp[h]["ratio"], exp[h]["draws"]) for h in top_exp),
+              file=sys.stderr)
         base = rk[chosen_name]
         print("  spearman vs %s:" % chosen_name, file=sys.stderr)
         for n in rk:
@@ -229,6 +306,7 @@ def main():
             if d:
                 out_rows.append(dict(d, region=rg, rank=base[hero],
                                      variant=chosen_name))
+            e = exp.get(hero, {})
             seen = [rk[n][hero] for n in rk if hero in rk[n]]
             sens_rows.append({
                 "region": rg, "hero": hero, "rank": base.get(hero, ""),
@@ -240,6 +318,9 @@ def main():
                 # anything about the hero.
                 "rank_range": (max(seen) - min(seen)) if seen else "",
                 "near_tie": d["near_tie"] if d else "",
+                "expected_pos": e.get("expected_pos", ""),
+                "obs_over_expected": e.get("ratio", ""),
+                "expected_se": e.get("expected_se", ""),
                 **{"rank_" + n: rk[n].get(hero, "") for n in rk},
             })
 
@@ -254,7 +335,9 @@ def main():
             "rarity", "variant"]
     _write("tier_assignment.csv", out_rows, cols)
     scols = (["region", "hero", "rank", "best_rank", "worst_rank", "rank_range",
-              "near_tie", "rarity"] + ["rank_" + n for n, _ in VARIANTS])
+              "near_tie", "rarity", "expected_pos", "obs_over_expected",
+              "expected_se"]
+             + ["rank_" + n for n, _ in VARIANTS] + ["rank_expected_pos"])
     _write("tier_sensitivity.csv", sens_rows, scols)
 
 
