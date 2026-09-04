@@ -5,6 +5,12 @@ on:
     - cron: "0 */4 * * *"   # every 4 hours, on the hour (00/04/08/12/16/20 UTC)
                             # was daily; raised while ranked mode saturates
   workflow_dispatch:
+    inputs:
+      match_mode:
+        description: "Applies to BOTH scripts. Empty = standard play (default). Ranked restores the retired ranked cohort."
+        default: ""
+        type: choice
+        options: ["", "Unranked", "Ranked"]
 
 # The commit step pushes docs/data.json, icons and the archive back to the repo,
 # so the job needs write access. Without this the default GITHUB_TOKEN may be
@@ -27,6 +33,50 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
+
+    # MATCH_MODE MOVED TO JOB LEVEL — 2026-09-04.
+    #
+    # It was set per-step on "Run pipeline" only, so ceiling_rank.py never saw
+    # it and fell back to its own default. The 13:43 run built the cohort,
+    # items, pool net wins and elite_winrate on RANKED while the ceiling and
+    # every identity check ran over ALL modes — two halves of one artifact
+    # describing different populations, with nothing in the output saying so.
+    # Defined once here, it is inherited by every step and cannot drift again.
+    #
+    # DEFAULT IS NOW "" (standard play). The ranked experiment described below
+    # is over: volume never accumulated the way the comment hoped, the ladder
+    # feeding it degraded, and ordering on ranked win rate turned out to select
+    # on the very quantity being reported. Expect elite_winrate to fall ~4
+    # points versus ranked runs — that is the selection inflation coming out,
+    # not a regression. Set match_mode=Ranked on a manual dispatch to compare.
+    #
+    # PER_REGION 20 gives NA and EU their own set of ~20 builds each.
+    # LEADERBOARD_DEPTH 100 is the backfill room to find 20 QUALIFYING
+    # players per region. RECENCY_WINDOW stays at 25 deliberately — 99% of
+    # qualifying players played the hero within their last 20 games, so
+    # widening it would add almost no volume while letting stale builds in.
+    #
+    # Candidate selection does not filter on badge at all (removed
+    # 2026-07-31): average_badge_team0/1 went populated-but-zero after the
+    # 2026-07-30 soft reset and never recovered. The pool is driven by account
+    # ids seen on Valve's own leaderboards, cross-referenced against the
+    # general board, which does not depend on match_player's badge fields.
+    env:
+      DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
+      PER_REGION: "20"
+      LEADERBOARD_DEPTH: "100"
+      MATCH_MODE: ${{ inputs.match_mode }}
+      REGIONS: "NAmerica,Europe"
+      # Window for the RECENCY counts only. Identity checks always test the
+      # CAREER record: a wrong account id is a career-level property, whereas a
+      # fortnight off is a recency fact, and testing identity against a window
+      # rejects real accounts for being inactive.
+      RECENT_DAYS: "30"
+      # Third identity channel: /v1/analytics/scoreboards/players, the only
+      # endpoint publishing real account ids. 200 req/min analytics bucket, so
+      # it cannot touch the 20/hr SQL budget.
+      SCOREBOARD_CHECK: "1"
+
     steps:
       - uses: actions/checkout@v4
 
@@ -34,43 +84,16 @@ jobs:
         with:
           python-version: "3.12"
 
-      # PER_REGION 20 gives NA and EU their own set of ~20 builds each.
-      # LEADERBOARD_DEPTH 100 is the backfill room to find 20 QUALIFYING
-      # players per region. Depth costs almost nothing in quality: the
-      # SQL_BADGE_FLOOR of 110 (Eternus) gates entry regardless of ladder
-      # position, and median mmr falls only ~0.7 across the first 40 places.
-      # RECENCY_WINDOW stays at 25 deliberately — 99% of qualifying players
-      # played the hero within their last 20 games, so widening it would add
-      # almost no volume while letting stale builds in.
-      #
-      # MATCH_MODE=Ranked, set 2026-07-30. Deadlock's ranked mode is new and
-      # thin (~1,080 games total across a 3-day sample vs ~841k Unranked, per
-      # diagnose_match_mode.py) — deliberate choice to run on partial data now
-      # and let the daily cron accumulate real ranked volume over time, rather
-      # than keep pooling ranked into the unranked cohort indefinitely.
-      # EXPECT EARLY RUNS TO BE THIN. build_site_data.py refuses to publish
-      # below MIN_HEROES=30, so if ranked volume is too low for enough heroes
-      # to qualify, the build step fails on purpose and yesterday's data.json
-      # stays live — that's the safety net working, not a bug. Revisit this
-      # setting once hero-region coverage looks like it did under Unranked.
-      # Candidate selection no longer filters on badge at all (removed
-      # 2026-07-31). average_badge_team0/1 on match_player went to a
-      # populated-but-zero state across the entire ranked dataset after the
-      # 2026-07-30 soft reset and never recovered within the same day — see
-      # diagnose_badge_gap.py's findings if this needs revisiting. The pool is
-      # now driven directly by account ids seen on Valve's own per-hero
-      # leaderboards (fetch_ladders), which is the actual "top players" signal
-      # this site needs and doesn't depend on match_player's badge fields at
-      # all. mmr/median_mmr in tierlist.csv may still read oddly while badge
-      # is broken upstream — that's cosmetic and reference-only, not published
-      # to the site (see build_site_data.py).
+      - name: Show effective settings
+        # Both scripts print their own mode line. This is the contract they
+        # are supposed to agree with — if the three ever disagree again, it is
+        # visible in the first 20 lines rather than 10 minutes in.
+        run: |
+          echo "MATCH_MODE='${MATCH_MODE}' (empty = standard play, no filter)"
+          echo "REGIONS=${REGIONS} PER_REGION=${PER_REGION} DEPTH=${LEADERBOARD_DEPTH}"
+          echo "RECENT_DAYS=${RECENT_DAYS} SCOREBOARD_CHECK=${SCOREBOARD_CHECK}"
+
       - name: Run pipeline
-        env:
-          DEADLOCK_API_KEY: ${{ secrets.DEADLOCK_API_KEY }}
-          PER_REGION: "20"
-          LEADERBOARD_DEPTH: "100"
-          MATCH_MODE: "Ranked"
-          REGIONS: "NAmerica,Europe"
         run: python3 deadlock_pipeline.py
 
       - name: Fetch any new icons
@@ -116,8 +139,9 @@ jobs:
         run: python3 orbit_audit.py
 
       # docs/ plus archive/ are committed. output/ still stays off the repo:
-      # candidates.csv and excluded.csv carry Steam account IDs and display
-      # names. Nothing in the archive contains account-level data.
+      # candidates.csv, excluded.csv and identity_audit.csv carry Steam account
+      # IDs and display names. Nothing in the archive contains account-level
+      # data.
       #
       # One trimmed snapshot per region per DAY, for charting change over time.
       # The pipeline runs 6x/day but builds are a 20-player sample, so runs 4h
@@ -148,10 +172,16 @@ jobs:
           fi
 
       # Artifacts on a public repo are downloadable by anyone, so the
-      # player-level CSVs are excluded here too. That is why
-      # output/ability_order.csv is NOT listed: it carries account ids so that
-      # build_site_data.py can pick out the ceiling player's pick order, and it
-      # must stay on the runner. ability_frequency.csv is aggregate and safe.
+      # player-level CSVs are excluded here. That is why output/ is NOT
+      # globbed and why output/ability_order.csv is NOT listed: it carries
+      # account ids so that build_site_data.py can pick out the ceiling
+      # player's pick order, and it must stay on the runner.
+      #
+      # identity_audit.csv is excluded for the same reason — it names every
+      # rejected board claim, with account_name and account_id. Its aggregate
+      # companion identity_summary.csv carries COUNTS ONLY (per hero-region
+      # rejection reasons, plus a totals row with the scoreboard agreement
+      # figures) and is safe to publish, so that is what is listed instead.
       - name: Upload aggregate CSVs
         if: always()
         uses: actions/upload-artifact@v4
@@ -167,3 +197,6 @@ jobs:
             output/imbue_frequency.csv
             output/source_items.csv
             output/orbit_audit.csv
+            output/identity_summary.csv
+            output/pool_audit.csv
+            output/items_manifest.json
