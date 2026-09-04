@@ -10,6 +10,12 @@ name: Top heroes
 # regions is therefore cheap and is the default. SQL is only reached if that
 # window parameter stops being honoured; the concurrency group and the
 # projected-call guard inside the script cover that case.
+#
+# assign_tiers.py computes ALL SEVEN orderings on every run regardless of
+# which one is published — strict_1, fallback_2, fallback_3, scarcity_3,
+# scarcity_pct, expected_pos and hybrid all land in tier_sensitivity.csv. The
+# `ordering` input only decides which one tier_assignment.csv is written from,
+# so choosing wrong costs nothing but a re-read of the sensitivity file.
 
 on:
   workflow_dispatch:
@@ -25,26 +31,55 @@ on:
       days:
         description: "Lookback window in days"
         default: "14"
+
+      ordering:
+        description: "Which ordering tier_assignment.csv is written from. All seven are always computed."
+        default: "scarcity_3"
+        type: choice
+        options:
+          - "scarcity_3"     # near-ties broken toward the rarer hero, absolute band
+          - "scarcity_pct"   # same, band proportional to the player's own top count
+          - "hybrid"         # scarcity_3, but heroes with an extreme ratio are moved
+          - "expected_pos"   # full rerank on observed / expected position
+          - "fallback_3"     # raw most-played, no scarcity tiebreak
+          - "fallback_2"
+          - "strict_1"
       margin:
-        description: "Games within a player's top count that count as a tie. 3 = tiebreak never fires; 5-8 is the plateau; past 12 is noise."
+        description: "Absolute tie band in games (scarcity_3). 3 = never fires; 5-8 is the plateau; past 12 is noise."
         default: "5"
         type: choice
         options: ["5", "3", "8", "12"]
-      scarcity_pref:
-        description: "1 = break near-ties toward the RARER hero (biases scarce heroes up, common ones down). 0 = most-played always wins."
-        default: "1"
+      margin_pct:
+        description: "Proportional tie band as a fraction of the player's own top count (scarcity_pct)."
+        default: "0.15"
         type: choice
-        options: ["1", "0"]
-      fallback_depth:
-        description: "How far down a player's most-played list to look for an unclaimed hero. Only used when scarcity_pref=0."
-        default: "3"
+        options: ["0.15", "0.10", "0.20", "0.30"]
+      hybrid_p:
+        description: "Hybrid moves a hero only when its ratio is this unlikely under Exponential(1). Lower = fewer heroes move."
+        default: "0.10"
         type: choice
-        options: ["3", "2", "1"]
+        options: ["0.10", "0.05", "0.20"]
+      assign_for_expected:
+        description: "Which assignment expected_pos/hybrid rerank. Must match `ordering` to compare like with like."
+        default: "scarcity_3"
+        type: choice
+        options: ["scarcity_3", "fallback_3", "scarcity_pct"]
       pool_regions:
         description: "0 = rank regions separately (NA and EU orderings measured uncorrelated). 1 = pool them."
         default: "0"
         type: choice
         options: ["0", "1"]
+      scarcity_pref:
+        description: "Only used when `ordering` is left unset. 1 = scarcity_3, 0 = fallback_N."
+        default: "1"
+        type: choice
+        options: ["1", "0"]
+      fallback_depth:
+        description: "How far down a player's most-played list to look for an unclaimed hero, when scarcity is off."
+        default: "3"
+        type: choice
+        options: ["3", "2", "1"]
+
       allow_sql:
         description: "1 = fall through to SQL if the hero-stats time window stops working. 0 = stop at unwindowed career stats (free, but NOT the last N days)."
         default: "1"
@@ -95,10 +130,14 @@ jobs:
         # missing entirely.
         if: always()
         env:
+          ORDERING: ${{ inputs.ordering }}
           MARGIN: ${{ inputs.margin }}
+          MARGIN_PCT: ${{ inputs.margin_pct }}
+          HYBRID_P: ${{ inputs.hybrid_p }}
+          ASSIGN_FOR_EXPECTED: ${{ inputs.assign_for_expected }}
+          POOL_REGIONS: ${{ inputs.pool_regions }}
           SCARCITY_PREF: ${{ inputs.scarcity_pref }}
           FALLBACK_DEPTH: ${{ inputs.fallback_depth }}
-          POOL_REGIONS: ${{ inputs.pool_regions }}
         run: python3 assign_tiers.py
 
       - name: Upload output
