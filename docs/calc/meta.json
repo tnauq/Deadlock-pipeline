@@ -1,7 +1,7 @@
 {
  "n_items": 156,
  "n_heroes": 38,
- "n_props": 445,
+ "n_props": 444,
  "n_unresolved_conditionals": 115,
  "n_toggled": 12,
  "toggles": {
@@ -10,7 +10,7 @@
   "long_range": 2,
   "after_proc": 3
  },
- "property_types": 58,
+ "property_types": 59,
  "property_type_counts": [
   [
    "MODIFIER_VALUE_HEALTH_MAX",
@@ -26,7 +26,7 @@
   ],
   [
    "MODIFIER_VALUE_OUT_OF_COMBAT_HEALTH_REGEN",
-   28
+   27
   ],
   [
    "MODIFIER_VALUE_MOVEMENT_SPEED_MAX",
@@ -46,7 +46,7 @@
   ],
   [
    "MODIFIER_VALUE_SPRINT_SPEED_BONUS",
-   19
+   18
   ],
   [
    "MODIFIER_VALUE_MOVEMENT_SPEED_SLOW_PERCENT",
@@ -243,16 +243,20 @@
   [
    "MODIFIER_VALUE_BASE_HEALTH_PERCENT",
    1
+  ],
+  [
+   "MODIFIER_VALUE_ULTIMATE_COOLDOWN_REDUCTION_PERCENTAGE",
+   1
   ]
  ],
  "units": {
-  "%": 260,
-  "m": 48,
-  "null": 135,
+  "%": 261,
+  "m": 47,
+  "null": 134,
   "m/s": 1,
   "s": 1
  },
- "items_kb": 157.3,
+ "items_kb": 157.1,
  "items_gz_kb": 16.0,
  "heroes_kb": 428.8,
  "heroes_gz_kb": 13.5,
@@ -284,8 +288,8 @@
  "n_self_penalties": 12,
  "n_effect_only": 4,
  "n_abilities": 221,
- "abilities_kb": 471.1,
- "abilities_gz_kb": 63.0,
+ "abilities_kb": 471.5,
+ "abilities_gz_kb": 63.2,
  "dps_checked": 38,
  "dps_failed": 0
 }
