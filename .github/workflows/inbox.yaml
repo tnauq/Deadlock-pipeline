@@ -1,0 +1,207 @@
+name: inbox
+
+# Unpack an inbox DROP: a zip whose entries are REPO-RELATIVE paths (no
+# wrapping folder) with a README-INBOX.md at its root. Same convention as the
+# Dl_toolkit inbox, plus three guards for this repo:
+#
+#   1. Only zips carrying README-INBOX.md at their root are drops. Any other
+#      zip is reported and left alone — batch-fix.zip, a Dl_toolkit drop that
+#      was uploaded here on 2026-08-12, would otherwise unpack a tools/ folder
+#      and a stray workflow into this repo.
+#   2. ALL OR NOTHING. Every entry's CRC is checked, every .py must compile,
+#      every .json parse, every .yml load and every .html still end in
+#      </html> — in memory, before a single file is written. One bad entry
+#      and nothing is applied or committed.
+#   3. Workflow files need secrets.PAT (Contents + Workflows write — the same
+#      kind of token the Dl_toolkit inbox uses). Without one, everything else
+#      is applied and the zip is KEPT, so a re-run after adding the secret
+#      finishes the job.
+#
+#   Upload the zip to the repo root (or inbox/). The upload's own push runs
+#   this; Actions -> inbox -> Run workflow does the same by hand.
+#
+# Zero API calls, zero SQL. Safe in any hour.
+
+on:
+  push:
+    paths: ["*.zip", "inbox/*.zip"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Two uploads in quick succession must not unpack the same zip twice in
+# parallel and race each other's push. The second run waits, then finds the
+# zip already gone and exits cleanly.
+concurrency:
+  group: inbox
+  cancel-in-progress: false
+
+jobs:
+  unpack:
+    # The inbox's own commit deletes the zip, which is itself a push touching
+    # *.zip. With a PAT that push triggers workflows, so skip our own commits.
+    if: github.event_name == 'workflow_dispatch' || !startsWith(github.event.head_commit.message, 'Unpack inbox')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # PAT when present (can write workflow files), else the job token
+          token: ${{ secrets.PAT || github.token }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Unpack drops
+        env:
+          HAS_PAT: ${{ secrets.PAT != '' }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          pip install --quiet pyyaml || echo "pyyaml unavailable - .yml files will not be parse-checked"
+          python3 - <<'PY'
+          import glob, json, os, subprocess, sys, zipfile
+
+          MARK = "README-INBOX.md"
+          HAS_PAT = os.environ.get("HAS_PAT") == "true"
+          EVENT = os.environ.get("EVENT", "")
+          SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY") or os.devnull
+
+          def committed_at(path):
+              out = subprocess.run(["git", "log", "-1", "--format=%ct", "--", path],
+                                   capture_output=True, text=True).stdout.strip()
+              return int(out or 0)
+
+          def safe(name):
+              parts = name.split("/")
+              return (not name.startswith("/") and "\\" not in name and ".." not in parts
+                      and parts[0] != ".git" and ":" not in parts[0] and all(parts))
+
+          def fail(msg):
+              print("::error::" + msg)
+              print("NOTHING was applied or committed.")
+              sys.exit(1)
+
+          # ---- find drops; oldest first, so a newer drop's copy of a file wins
+          zips = sorted(set(glob.glob("*.zip") + glob.glob("inbox/*.zip")),
+                        key=lambda p: (committed_at(p), p))
+          drops, strays = [], []
+          for z in zips:
+              try:
+                  with zipfile.ZipFile(z) as zf:
+                      names = [n for n in zf.namelist() if not n.endswith("/")]
+              except zipfile.BadZipFile:
+                  strays.append((z, "not a readable zip"))
+                  continue
+              if MARK in names:
+                  drops.append(z)
+              elif any(n.endswith("/" + MARK) for n in names):
+                  strays.append((z, "README-INBOX.md is inside a folder - zip the "
+                                    "folder's CONTENTS so paths start at the repo root"))
+              else:
+                  strays.append((z, "no README-INBOX.md at its root, so not an inbox drop"))
+          for z, why in strays:
+              print("::warning::left alone: %s (%s)" % (z, why))
+          if not drops:
+              msg = "No inbox drop found (a zip with README-INBOX.md at its root)."
+              if EVENT == "workflow_dispatch":
+                  fail(msg)
+              print(msg + " Nothing to do.")
+              sys.exit(0)
+
+          # ---- read everything into memory and check it, before writing ----
+          planned, source, held = {}, {}, []
+          for z in drops:
+              with zipfile.ZipFile(z) as zf:
+                  broken = zf.testzip()
+                  if broken:
+                      fail("%s: CRC check failed on %s - the zip is corrupt" % (z, broken))
+                  names = [n for n in zf.namelist() if not n.endswith("/")]
+                  bad = [n for n in names if not safe(n)]
+                  if bad:
+                      fail("%s has unsafe paths: %s" % (z, ", ".join(bad[:5])))
+                  for n in names:
+                      if n.startswith(".github/workflows/") and not HAS_PAT:
+                          held.append((z, n))
+                          continue
+                      planned[n] = zf.read(n)
+                      source[n] = z
+
+          try:
+              import yaml
+          except ImportError:
+              yaml = None
+          problems = []
+          for n, data in sorted(planned.items()):
+              try:
+                  if n.endswith(".py"):
+                      compile(data.decode("utf-8"), n, "exec")
+                  elif n.endswith(".json"):
+                      json.loads(data.decode("utf-8"))
+                  elif n.endswith((".yml", ".yaml")) and yaml:
+                      yaml.safe_load(data.decode("utf-8"))
+                  elif n.endswith(".html") and b"</html>" not in data[-400:].lower():
+                      raise ValueError("does not end in </html> - truncated?")
+              except Exception as e:
+                  problems.append("%s: %s" % (n, e))
+          if problems:
+              for p in problems:
+                  print("::error::" + p)
+              fail("structural check failed on %d file(s). Re-zip and re-upload."
+                   % len(problems))
+
+          # ---- apply ---------------------------------------------------------
+          status = {}
+          for n, data in planned.items():
+              if not os.path.exists(n):
+                  status[n] = "NEW"
+              else:
+                  with open(n, "rb") as f:
+                      status[n] = "UNCHANGED" if f.read() == data else "MODIFIED"
+              os.makedirs(os.path.dirname(n) or ".", exist_ok=True)
+              with open(n, "wb") as f:
+                  f.write(data)
+          kept = sorted({z for z, _n in held})
+          for z in drops:
+              if z in kept:
+                  print("::warning::%s kept: workflow file(s) need a PAT secret - add "
+                        "one and re-run to finish: %s"
+                        % (z, ", ".join(n for zz, n in held if zz == z)))
+              else:
+                  os.remove(z)
+                  print("unpacked and removed %s" % z)
+
+          # ---- report ------------------------------------------------------
+          lines = ["## Inbox", "", "| file | change | from |", "|---|---|---|"]
+          for n in sorted(planned):
+              lines.append("| `%s` | %s | %s |" % (n, status[n], source[n]))
+          for z, n in held:
+              lines.append("| `%s` | HELD BACK (needs PAT) | %s |" % (n, z))
+          for z, why in strays:
+              lines.append("| `%s` | left alone: %s | |" % (z, why))
+          lines += ["", "Every applied file passed the structural check."]
+          with open(SUMMARY, "a") as f:
+              f.write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          with open(os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), "inbox_names"), "w") as f:
+              f.write(", ".join(os.path.basename(z) for z in drops))
+          PY
+
+      - name: Commit
+        run: |
+          git config user.name  "inbox"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "nothing to commit"
+            exit 0
+          fi
+          git commit -m "Unpack inbox: $(cat "$RUNNER_TEMP/inbox_names" 2>/dev/null)"
+          # Daily refresh may push docs/data.json while this runs; rebase onto it
+          for i in 1 2 3; do
+            git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}" && exit 0
+            sleep 10
+          done
+          echo "::error::push failed after 3 attempts"
+          exit 1
