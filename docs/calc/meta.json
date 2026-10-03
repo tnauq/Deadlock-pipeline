@@ -1,8 +1,8 @@
 {
- "n_items": 154,
- "n_heroes": 44,
- "n_props": 442,
- "n_unresolved_conditionals": 115,
+ "n_items": 156,
+ "n_heroes": 39,
+ "n_props": 445,
+ "n_unresolved_conditionals": 116,
  "n_toggled": 12,
  "toggles": {
   "close_range": 2,
@@ -18,7 +18,7 @@
   ],
   [
    "MODIFIER_VALUE_WEAPON_DAMAGE_INCREASE",
-   32
+   33
   ],
   [
    "MODIFIER_VALUE_TECH_POWER",
@@ -89,15 +89,15 @@
    7
   ],
   [
+   "MODIFIER_VALUE_BONUS_BULLET_SPEED_PERCENT",
+   6
+  ],
+  [
    "MODIFIER_VALUE_BONUS_ABILITY_DURATION_PERCENTAGE",
    6
   ],
   [
    "MODIFIER_VALUE_MELEE_RESIST",
-   5
-  ],
-  [
-   "MODIFIER_VALUE_BONUS_BULLET_SPEED_PERCENT",
    5
   ],
   [
@@ -181,6 +181,10 @@
    2
   ],
   [
+   "MODIFIER_VALUE_TECH_DAMAGE_TAKEN_HEALS_ATTACKER",
+   2
+  ],
+  [
    "MODIFIER_VALUE_HEAL_AMP_CAST_PERCENT",
    2
   ],
@@ -190,10 +194,6 @@
   ],
   [
    "MODIFIER_VALUE_ZOOM_INCREASE_PERCENT",
-   1
-  ],
-  [
-   "MODIFIER_VALUE_TECH_DAMAGE_TAKEN_HEALS_ATTACKER",
    1
   ],
   [
@@ -250,16 +250,16 @@
   ]
  ],
  "units": {
-  "%": 259,
+  "%": 262,
   "m": 47,
   "null": 134,
   "m/s": 1,
   "s": 1
  },
- "items_kb": 155.6,
- "items_gz_kb": 15.8,
- "heroes_kb": 461.7,
- "heroes_gz_kb": 14.8,
+ "items_kb": 157.1,
+ "items_gz_kb": 16.0,
+ "heroes_kb": 410.7,
+ "heroes_gz_kb": 13.6,
  "slot_model": {
   "total": 12,
   "unlocked_at_start": 9,
@@ -270,7 +270,7 @@
  "exclusions": {
   "disabled": 77,
   "not_shopable": 77,
-  "not_in_wiki_list": 95,
+  "not_in_wiki_list": 93,
   "unnamed": 55,
   "alt_mode": 23,
   "lost_class_pin": 1
@@ -279,18 +279,18 @@
   "_disabled+not_shopable+not_in_wiki_list": 15,
   "_unnamed+disabled+not_shopable+not_in_wiki_list": 55,
   "_alt_mode+disabled+not_shopable+not_in_wiki_list": 6,
-  "_not_in_wiki_list": 2,
   "_disabled+not_shopable+lost_class_pin": 1,
   "_alt_mode+not_in_wiki_list": 17
  },
- "n_excluded": 96,
+ "n_excluded": 94,
  "expected_items": 156,
+ "wiki_orphans": [],
  "n_slot_or_cost_mismatch": 0,
  "n_self_penalties": 12,
  "n_effect_only": 4,
- "n_abilities": 229,
- "abilities_kb": 479.7,
- "abilities_gz_kb": 64.0,
- "dps_checked": 44,
+ "n_abilities": 156,
+ "abilities_kb": 373.5,
+ "abilities_gz_kb": 53.0,
+ "dps_checked": 39,
  "dps_failed": 0
 }
