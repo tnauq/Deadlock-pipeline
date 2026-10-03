@@ -6,7 +6,7 @@ or items). make_images.py then reads from ./icons/ and never touches the network
 
     python3 fetch_icons.py
 
-Reads  ./output/tierlist.csv, ./output/item_frequency.csv
+Reads  ./output/tierlist.csv, ./output/item_frequency.csv, ./output/roster.csv
 Writes ./icons/<sha1>.png  plus  ./icons/index.json  (url -> filename)
 """
 
@@ -23,7 +23,11 @@ INDEX = os.path.join(ICONS, "index.json")
 
 def urls_from_csvs():
     urls = set()
-    for name, col in (("tierlist.csv", "icon_url"), ("item_frequency.csv", "icon_url")):
+    # roster.csv carries every RELEASED hero, including one with no pool yet —
+    # a new hero's art has to be fetched before its stats exist, or the site
+    # lists it as NEW with a blank tile (added 2026-10-03, for Rat King).
+    for name, col in (("tierlist.csv", "icon_url"), ("item_frequency.csv", "icon_url"),
+                      ("roster.csv", "icon_url")):
         path = os.path.join("output", name)
         if not os.path.exists(path):
             continue

@@ -255,6 +255,41 @@ def bearing_props(item):
 # ---------------------------------------------------------------------------
 
 
+def released_heroes(heroes):
+    """Heroes that can actually be picked — the same rule as
+    deadlock_pipeline._hero_released, with the same guard.
+
+    Build 6711 (2026-09-29) replaced m_bPlayerSelectable with
+    m_eHeroDevelopmentState, and the six hero-vote candidates shipped as
+    PreRelease with disabled=false, so `not disabled` alone let all six into
+    this bundle (44 hero blocks instead of 38). deadlock-api now derives
+    player_selectable from development_state == release. A released set that
+    collapses to under half of the live set is an upstream flag glitch (every
+    hero read non-selectable when 6711 first shipped, until deadlock-api was
+    patched), not heroes leaving the game, so the old rule is kept for that run.
+    """
+    live = [h for h in heroes if not h.get("disabled") and not h.get("in_development")]
+
+    def ok(h):
+        ps = h.get("player_selectable")
+        if ps is not None:
+            return bool(ps)
+        ds = str(h.get("development_state") or "").strip().lower()
+        return ds == "release" if ds else True
+
+    rel = [h for h in live if ok(h)]
+    if live and len(rel) < 0.5 * len(live):
+        print("[calc] WARNING: only %d of %d live heroes read as released — "
+              "treating it as an upstream flag glitch and keeping all %d"
+              % (len(rel), len(live), len(live)), file=sys.stderr)
+        return live
+    held = sorted(h.get("name") or str(h.get("id")) for h in live if not ok(h))
+    if held:
+        print("[calc] %d unreleased hero(es) left out until Valve releases them: %s"
+              % (len(held), ", ".join(held)), file=sys.stderr)
+    return rel
+
+
 def load_allowlist(path):
     """name -> (slot, cost) from the wiki list. Doubles as a cross-check."""
     data = json.load(open(path))
@@ -512,10 +547,22 @@ def main():
     heroes_raw, items_raw = load_assets(a.raw_dir, a.dump_raw)
     print("[calc] %d hero records, %d item records"
           % (len(heroes_raw), len(items_raw)), file=sys.stderr)
+    heroes_raw = released_heroes(heroes_raw)
 
     allow = load_allowlist(WIKI_LIST) if os.path.exists(WIKI_LIST) else {}
     if not allow:
         print("[calc] WARNING: no wiki allowlist at %s" % WIKI_LIST, file=sys.stderr)
+    # The allowlist matches on DISPLAY NAME, so a rename silently drops the
+    # item: the 2026-09-29 patch renamed Spirit Shredder Bullets -> Spirit
+    # Shredder and Armor Piercing Rounds -> Armor Piercer, and both vanished
+    # from the calculator (154 of 156) until ref/shop_items_wiki.json caught
+    # up. Name the orphans so the next rename is a one-line read, not a hunt.
+    live_names = {it.get("name") for it in items_raw if it.get("type") == "upgrade"}
+    wiki_orphans = sorted(n for n in allow if n not in live_names)
+    if wiki_orphans:
+        print("[calc] WARNING: %d allowlist name(s) match no item in the assets "
+              "(renamed or removed by a patch? update %s): %s"
+              % (len(wiki_orphans), WIKI_LIST, ", ".join(wiki_orphans)), file=sys.stderr)
     items, stats = build_items(items_raw, allow)
     sig_classes = {c for h in heroes_raw
                    for c in [(h.get("items") or {}).get("signature%d" % k)
@@ -537,6 +584,9 @@ def main():
     if len(items) != EXPECTED_ITEMS:
         problems.append("catalogue size %d, expected %d (%+d) — check exclusions"
                         % (len(items), EXPECTED_ITEMS, len(items) - EXPECTED_ITEMS))
+    if wiki_orphans:
+        problems.append("allowlist names with no live item (renamed?): %s"
+                        % ", ".join(wiki_orphans))
     check_no_sign_token(itext, problems)
     dps_checked, dps_failed = check_dps(heroes, problems)
 
@@ -564,6 +614,7 @@ def main():
                                if k.startswith("exclcombo_")},
         "n_excluded": stats["excluded_total"],
         "expected_items": EXPECTED_ITEMS,
+        "wiki_orphans": wiki_orphans,
         "n_slot_or_cost_mismatch": stats["mismatch_slot_or_cost"],
         "n_self_penalties": sum(1 for i in items for p in i["props"] if p["penalty"]),
         "n_effect_only": sum(1 for i in items if not i["props"]),

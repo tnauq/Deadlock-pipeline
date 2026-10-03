@@ -25,6 +25,8 @@ Outputs (./output/):
     item_frequency.csv   hold rates per hero per net-worth snapshot
     hero_splits.csv      V/G/S soul share and split classification, per snapshot
     excluded.csv         ladder entries dropped, with the reason
+    roster.csv           every RELEASED hero, with or without data this run —
+                         how a new hero reaches the site before it has a pool
 
 NAMING NOTE. hero_games / hero_wins count a player's games and wins ON THE HERO
 named in the same row, across the whole lookback. They were called games_all /
@@ -354,20 +356,70 @@ def _pick(d, keys):
     return ""
 
 
+def _hero_released(h):
+    """True when the hero can actually be picked in matchmaking.
+
+    BUILD 6711 (2026-09-29) removed m_bPlayerSelectable from heroes.vdata in
+    favour of m_eHeroDevelopmentState (Release / PreRelease / DebugOnly).
+    deadlock-api now derives `player_selectable` as development_state ==
+    release and also publishes `development_state` itself.
+
+    disabled/in_development alone stopped being enough at that build: the six
+    hero-vote candidates (Rat King, Deadman Danny, Solomon, Violet, Nurse
+    Harrow, Baba) shipped as PreRelease with BOTH flags false, so they passed
+    the old filter while nobody could play them. Rat King flipped to Release
+    in build 6736 (2026-10-02); the other five are still PreRelease and join
+    the roster on their own the moment Valve flips them — nothing here needs
+    editing per hero.
+    """
+    if h.get("disabled") or h.get("in_development"):
+        return False
+    ps = h.get("player_selectable")
+    if ps is not None:
+        return bool(ps)
+    ds = str(h.get("development_state") or "").strip().lower()
+    if ds:
+        return ds == "release"
+    return True        # a payload with neither field predates both; trust the old flags
+
+
 def load_assets():
-    heroes, hero_icon = {}, {}
+    heroes, hero_icon, hero_meta = {}, {}, {}
     _hero_sig_classes = {}
-    for h in _get(BASE + "/v1/assets/heroes"):
-        hid = h.get("id")
-        if hid is None or h.get("disabled") or h.get("in_development"):
-            continue
-        heroes[int(hid)] = h.get("name") or ("hero_%s" % hid)
-        hero_icon[int(hid)] = _pick(h.get("images"),
-                                    ("icon_hero_card", "icon_image_small",
-                                     "icon_hero_card_webp", "icon_image_small_webp",
-                                     "minimap_image"))
-        _hero_sig_classes[int(hid)] = [(h.get("items") or {}).get("signature%d" % k)
-                                       for k in (1, 2, 3, 4)]
+    hero_recs = [h for h in _get(BASE + "/v1/assets/heroes")
+                 if h.get("id") is not None
+                 and not h.get("disabled") and not h.get("in_development")]
+    released = [h for h in hero_recs if _hero_released(h)]
+    # GUARD. When build 6711 first shipped, the API parsed EVERY hero as
+    # non-selectable until it was patched (deadlock-api commit 3475ae2, "every
+    # hero parsed as non-selectable"). Trusting that
+    # would empty the roster and the run would die with nothing to show. A
+    # sudden collapse of the released set is an upstream flag glitch, not 30
+    # heroes leaving the game — fall back to the old filter and say so loudly.
+    if hero_recs and len(released) < 0.5 * len(hero_recs):
+        print("  [assets] WARNING: only %d of %d non-disabled heroes read as "
+              "released — treating that as an upstream flag glitch and using "
+              "disabled/in_development alone this run"
+              % (len(released), len(hero_recs)), file=sys.stderr)
+        released = hero_recs
+    released_ids = {int(h["id"]) for h in released}
+    held_back = sorted((h.get("name") or str(h.get("id"))) for h in hero_recs
+                       if int(h["id"]) not in released_ids)
+    if held_back:
+        print("  [assets] %d hero(es) not yet released, skipped until Valve flips "
+              "them: %s" % (len(held_back), ", ".join(held_back)), file=sys.stderr)
+    for h in released:
+        hid = int(h["id"])
+        heroes[hid] = h.get("name") or ("hero_%s" % hid)
+        hero_icon[hid] = _pick(h.get("images"),
+                               ("icon_hero_card", "icon_image_small",
+                                "icon_hero_card_webp", "icon_image_small_webp",
+                                "minimap_image", "top_bar_vertical_image"))
+        hero_meta[hid] = {"class_name": h.get("class_name") or "",
+                          "hero_type": h.get("hero_type") or "",
+                          "development_state": h.get("development_state") or ""}
+        _hero_sig_classes[hid] = [(h.get("items") or {}).get("signature%d" % k)
+                                  for k in (1, 2, 3, 4)]
 
     _assets = _get(BASE + "/v1/assets/items")
     # DISABLED RECORDS ARE EXCLUDED. Without this the dump's 78
@@ -458,7 +510,8 @@ def load_assets():
     print("  [assets] icons: %d/%d heroes, %d/%d items"
           % (sum(1 for v in hero_icon.values() if v), len(heroes), have_icons, len(items)),
           file=sys.stderr)
-    return heroes, hero_icon, items, component_of, abilities, hero_sigs, _dead_ids
+    return (heroes, hero_icon, items, component_of, abilities, hero_sigs, _dead_ids,
+            hero_meta)
 
 
 # --------------------------------------------------------------------------
@@ -963,7 +1016,8 @@ def main():
     excluded = []
 
     print("[1/5] assets", file=sys.stderr)
-    heroes, hero_icon, items, component_of, abilities, hero_sigs, dead_ids = load_assets()
+    (heroes, hero_icon, items, component_of, abilities, hero_sigs, dead_ids,
+     hero_meta) = load_assets()
 
     print("[2/5] ladders (%s), depth %d, target %d per region, exclusivity %s, "
           "mode %s, selection by %s"
@@ -974,6 +1028,20 @@ def main():
     # referenced against it as they arrive. Free bucket, one call per region.
     general = fetch_general_boards() if GENERAL_XREF else {}
     ladder = fetch_ladders(heroes, general)
+    # A hero released hours ago has no per-hero board yet: Valve's board is
+    # built from games already played. That is where every NEW hero starts,
+    # and until 2026-10-03 such a hero was silently dropped here — the orbit
+    # fill below only topped up heroes that already had a board player, so
+    # Rat King (released in build 6736) never reached tierlist.csv, never got
+    # an icon fetched, and never appeared on the site.
+    no_board = sorted(hid for hid in heroes
+                      if not any(ladder.get((hid, rg)) for rg in REGIONS))
+    if no_board:
+        print("  [lb] %d hero(es) have NO board entries in any region: %s — a "
+              "new hero starts here; its pool comes from the orbit fill until "
+              "its own leaderboard fills in"
+              % (len(no_board), ", ".join("%s (%d)" % (heroes[h], h)
+                                          for h in no_board)), file=sys.stderr)
     ladder_ids = {a for rows in ladder.values() for r in rows for a in r["ids"]}
     n_truncated = sum(1 for rows in ladder.values() for r in rows if r["ids_truncated"])
     print("  [lb] %d distinct candidate ids across all entries (%d entries hit the "
@@ -1128,7 +1196,16 @@ def main():
     orbit_added = 0
     if ORBIT_FILL:
         short = defaultdict(list)
-        for hid, lst in chosen.items():
+        # EVERY released hero, not just the ones already in `chosen`. Looping
+        # over chosen.items() skipped any hero with zero board players in
+        # both regions — exactly a newly released hero — so the one case the
+        # fill matters most was the one it could never reach. Same bug class
+        # ceiling_rank.py fixed on 2026-08-18. Costs no extra SQL: the orbit
+        # query is one call per region and runs whenever ANY hero-region is
+        # short, and the hero-stats lookup for orbit members already returns
+        # every hero they play.
+        for hid in sorted(heroes):
+            lst = chosen.get(hid, [])
             for rg in REGIONS:
                 have = [c for c in lst if c["region"] == rg]
                 if len(have) < PER_REGION:
@@ -1578,6 +1655,41 @@ def main():
            "lane_split", "lane_weak", "lane_role", "median_rating", "top5_rating",
            "top_rating", "players", "builds_sampled", "thin", "by_region",
            "top_account_id", "icon_url"])
+
+    # ROSTER — every released hero, WHETHER OR NOT it produced data this run.
+    # tierlist.csv only carries heroes with a sampled pool, so a hero with no
+    # pool yet (a new release) had no row anywhere and the site could not even
+    # show its art. build_site_data.py lists roster heroes it cannot rank as
+    # NEW, and fetch_icons.py downloads their icons from here. Aggregates only
+    # — no account ids — so it is safe to upload with the other CSVs.
+    in_tier = {t["hero_id"] for t in tier}
+    roster = []
+    for hid in sorted(heroes, key=lambda h: heroes[h]):
+        lst = chosen.get(hid, [])
+        roster.append({
+            "hero_id": hid, "hero": heroes[hid],
+            "class_name": hero_meta.get(hid, {}).get("class_name", ""),
+            "hero_type": hero_meta.get(hid, {}).get("hero_type", ""),
+            "development_state": hero_meta.get(hid, {}).get("development_state", ""),
+            "icon_url": hero_icon.get(hid, ""),
+            "board_entries": sum(len(ladder.get((hid, rg)) or []) for rg in REGIONS),
+            "players": len(lst),
+            "orbit_players": sum(1 for c in lst if c.get("source") == "orbit"),
+            "builds_sampled": builds.get(hid, 0),
+            "in_tierlist": "YES" if hid in in_tier else "",
+        })
+    write("roster.csv", roster,
+          ["hero_id", "hero", "class_name", "hero_type", "development_state",
+           "icon_url", "board_entries", "players", "orbit_players",
+           "builds_sampled", "in_tierlist"])
+    missing = [r for r in roster if not r["in_tierlist"]]
+    if missing:
+        print("  [roster] %d released hero(es) produced no pool this run and will "
+              "show as NEW on the site: %s"
+              % (len(missing), ", ".join("%s (%d board entries)"
+                                         % (r["hero"], r["board_entries"])
+                                         for r in missing)), file=sys.stderr)
+
     # sorted by ranked_rating now, since mmr is dead while badge reads 0
     write("candidates.csv",
           [dict(c, hero=heroes.get(c["hero_id"], ""))

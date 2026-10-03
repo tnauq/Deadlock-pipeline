@@ -65,6 +65,12 @@ h1{font-size:clamp(24px,7vw,38px);letter-spacing:.04em;margin-top:4px}
 .tier-chip[data-t=S]{background:var(--s)} .tier-chip[data-t=A]{background:var(--a)}
 .tier-chip[data-t=B]{background:var(--b)} .tier-chip[data-t=C]{background:var(--c)}
 .tier-chip[data-t=D]{background:var(--d)}
+/* NEW is not a tier: heroes the ladder cannot place yet (a fresh release has
+   an empty leaderboard). Dashed and accent-coloured so it reads as provisional.
+   Higher specificity than the theme's .tier-chip rules, so it survives them. */
+.tier-chip[data-t=NEW]{background:var(--panel-2);color:var(--accent,#e0b06a);
+  font-size:12px;letter-spacing:.12em}
+.tier-row:has(.tier-chip[data-t=NEW]){border-left:3px dashed var(--accent,#e0b06a)}
 .strip{
   display:flex;gap:6px;overflow-x:auto;padding:8px 8px 8px 0;
   scrollbar-width:thin;-webkit-overflow-scrolling:touch;
@@ -107,6 +113,8 @@ h1{font-size:clamp(24px,7vw,38px);letter-spacing:.04em;margin-top:4px}
 .badge.tier[data-t=S]{background:var(--s)} .badge.tier[data-t=A]{background:var(--a)}
 .badge.tier[data-t=B]{background:var(--b)} .badge.tier[data-t=C]{background:var(--c)}
 .badge.tier[data-t=D]{background:var(--d)}
+.badge.tier[data-t=NEW]{background:transparent;color:var(--accent,#e0b06a);
+  border:1px dashed var(--accent,#e0b06a)}
 .note{
   margin-top:12px;padding:9px 12px;border-radius:8px;font-size:12.5px;
   background:rgba(224,145,60,.10);border:1px solid rgba(224,145,60,.35);color:#f0c48a;
@@ -501,6 +509,11 @@ footer{margin-top:48px;border-top:1px solid var(--frame)}
     <dt>Builds</dt>
     <dd>Taken from the most recent game of the hero's top 20 players in that region.</dd>
 
+    <dt>New</dt>
+    <dd>Heroes the ladder cannot place yet — usually a fresh release whose own leaderboard
+    has not filled in. They are listed with whatever builds exist, never ranked, and move
+    into the tiers once a leaderboard player is confirmed.</dd>
+
     <dt>Calculator</dt>
     <dd>Stats are computed from Valve's own asset data. Percentages of the same kind add
     together; resistances combine multiplicatively. Conditional item effects count only
@@ -656,18 +669,37 @@ function renderDetail(){
   head.appendChild(meta);
   d.appendChild(head);
 
-  const lab = el('div','section-label');
-  lab.textContent = 'Items held by net worth · of ' + entry.of_builds + ' builds';
-  d.appendChild(lab);
+  // NEW = the ladder cannot place this hero yet (build_site_data.py NEW_TIER).
+  // Say why, and say where its builds came from, so a thin sample on a fresh
+  // release is not read as a verdict.
+  if (entry.tier === 'NEW'){
+    const note = el('div','note');
+    note.textContent = entry.of_builds
+      ? 'Not ranked yet. No player has a confirmed ' + R().label + ' leaderboard spot on this hero, '
+        + 'so it cannot be placed against the others — new heroes start here. The '
+        + entry.of_builds + ' build' + (entry.of_builds === 1 ? '' : 's')
+        + ' below come from strong players who share matches with the top of the ladder. '
+        + 'It joins the tiers once its own leaderboard fills in.'
+      : 'Not ranked yet. No ' + R().label + ' leaderboard players or sampled builds for this hero so far '
+        + '— new heroes start here. Builds appear as people play it, and it joins the tiers '
+        + 'once its own leaderboard fills in.';
+    d.appendChild(note);
+  }
 
-  const cols = el('div','cols');
-  const builds = R().builds[entry.slug] || {};
-  for (const snap of DATA.snapshots)
-    cols.appendChild(renderCol(snap, builds[snap] || [], entry));
-  d.appendChild(cols);
+  if (entry.of_builds || entry.tier !== 'NEW'){
+    const lab = el('div','section-label');
+    lab.textContent = 'Items held by net worth · of ' + entry.of_builds + ' builds';
+    d.appendChild(lab);
 
-  const abil = renderAbilities(entry.slug);
-  if (abil) d.appendChild(abil);
+    const cols = el('div','cols');
+    const builds = R().builds[entry.slug] || {};
+    for (const snap of DATA.snapshots)
+      cols.appendChild(renderCol(snap, builds[snap] || [], entry));
+    d.appendChild(cols);
+
+    const abil = renderAbilities(entry.slug);
+    if (abil) d.appendChild(abil);
+  }
 
   mountCalc(d, entry.slug);
 }

@@ -6,6 +6,7 @@ Turn the pipeline CSVs into one JSON file the static site reads.
 
 Reads  ./output/tierlist.csv, ./output/item_frequency.csv, ./output/ceiling.csv
        ./output/ability_frequency.csv, ./output/ability_order.csv  (both optional)
+       ./output/roster.csv  (optional — every released hero; see NEW_TIER)
 Writes ./docs/data.json
 
 MERGES BY REGION. Both regions are processed in one run again as of
@@ -49,6 +50,18 @@ REGION_LABEL = {"NAmerica": "NA", "Europe": "EU"}
 # others moved.
 TIER_NAMES = ["S", "A", "B", "C", "D"]
 _Z_CUTS = [1.2, 0.4, -0.4, -1.2]
+
+# NOT A TIER. A pseudo-row after D for heroes the ceiling cannot place yet:
+#   * no ceiling row in this region at all, or
+#   * a ceiling that came only from the ORBIT — a player who shares matches
+#     with the top of the ladder but is on no board, so there is no position
+#     to rank against everyone else's best board player, or
+#   * a released hero with no pool at all yet (roster.csv only).
+# Every newly released hero starts here: its own leaderboard is empty until
+# people have played it. It moves into S-D on its own once a board player is
+# confirmed. NEW heroes are kept OUT of the bell allocation, so they never
+# shift another hero's tier.
+NEW_TIER = "NEW"
 
 
 def _phi(z):
@@ -104,6 +117,10 @@ def main():
     abil_rows = read("ability_frequency.csv", required=False)
     order_rows = read("ability_order.csv", required=False)
     imbue_rows = read("imbue_frequency.csv", required=False)
+    # Every released hero, data or not (deadlock_pipeline.py, 2026-10-03).
+    # Optional so a run against an older pipeline still publishes — it just
+    # cannot show a hero that has no pool yet.
+    roster_rows = read("roster.csv", required=False)
 
     if len(tier_rows) < MIN_HEROES:
         raise SystemExit("refusing to build: only %d heroes" % len(tier_rows))
@@ -123,6 +140,27 @@ def main():
             "winrate": float(r["elite_winrate"]),
             "winrate_rank": int(r["rank"]),
         }
+    # Released heroes with no pool this run — a new hero's first hours. They
+    # get a hero entry (name + art) so the site can list them as NEW rather
+    # than not at all. No win rate: there is nothing to compute one from.
+    roster_only = []
+    for r in roster_rows:
+        s = slug(r.get("hero") or "")
+        if not s or s in heroes:
+            continue
+        heroes[s] = {
+            "id": int(r["hero_id"]),
+            "name": r["hero"],
+            "slug": s,
+            "icon": icon_ref(r.get("icon_url", "")),
+            "winrate": None,
+            "winrate_rank": None,
+        }
+        roster_only.append(s)
+    if roster_only:
+        print("  [roster] %d released hero(es) with no pool yet, listed as %s: %s"
+              % (len(roster_only), NEW_TIER, ", ".join(heroes[s]["name"] for s in roster_only)),
+              file=sys.stderr)
 
     # ---- deduped item lookup ---------------------------------------------
     meta = {}
@@ -335,13 +373,19 @@ def main():
         rows = sorted((r for r in ceil_rows if r["region"] == rg), key=_rank)
         if not rows:
             raise SystemExit("no ceiling rows for %s" % rg)
-        sizes = allocate(len(rows))
+        # Split off what the ceiling cannot place (see NEW_TIER) BEFORE the
+        # bell is fitted. An orbit-only ceiling sorts last by construction
+        # (NO_BOARD_POS in ceiling_rank.py), so left in, a day-old hero would
+        # land at the bottom of D for want of a leaderboard rather than on
+        # merit, and would shrink every other tier's share by one slot.
+        ranked = [r for r in rows if slug(r["hero"]) in heroes
+                  and (r.get("match") or "").strip() != "orbit"]
+        placed = {slug(r["hero"]) for r in ranked}
+        sizes = allocate(len(ranked))
         order, i = [], 0
         for name, n in zip(TIER_NAMES, sizes):
-            for r in rows[i:i + n]:
+            for r in ranked[i:i + n]:
                 s = slug(r["hero"])
-                if s not in heroes:
-                    continue
                 # Only what the page renders. Ladder position, percentile and
                 # the ceiling player's display name stay in output/ceiling.csv
                 # and are deliberately NOT published — the site never shows
@@ -353,6 +397,19 @@ def main():
                     "of_builds": of_builds[rg].get(s, 0),
                 })
             i += n
+        # Everything this run knows about that the ceiling could not place:
+        # orbit-only ceilings, tier-list heroes with no ceiling row here, and
+        # roster heroes with no pool at all. Listed, never ranked — rank is
+        # null so nothing downstream mistakes list order for a placement.
+        unplaced = sorted((s for s in heroes if s not in placed),
+                          key=lambda s: (-of_builds[rg].get(s, 0), heroes[s]["name"]))
+        for s in unplaced:
+            order.append({
+                "slug": s,
+                "tier": NEW_TIER,
+                "rank": None,
+                "of_builds": of_builds[rg].get(s, 0),
+            })
         regions[rg] = {
             "label": REGION_LABEL[rg],
             "depth": int(rows[0]["region_depth"]),
@@ -366,6 +423,11 @@ def main():
         }
         print("  [%s] %d heroes, tiers %s" % (rg, len(order), dict(zip(TIER_NAMES, sizes))),
               file=sys.stderr)
+        if unplaced:
+            print("  [%s] %d listed as %s (no board-backed ceiling yet): %s"
+                  % (rg, len(unplaced), NEW_TIER,
+                     ", ".join("%s (%d builds)" % (heroes[s]["name"], of_builds[rg].get(s, 0))
+                               for s in unplaced)), file=sys.stderr)
 
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     for rg in regions:
@@ -413,7 +475,8 @@ def main():
     data = {
         "generated_at": now,
         "snapshots": SNAPSHOTS,
-        "tiers": TIER_NAMES,
+        # NEW last: the page renders rows in this order and skips empty ones
+        "tiers": TIER_NAMES + [NEW_TIER],
         "region_order": order,
         "heroes": merged_heroes,
         "items": merged_items,
