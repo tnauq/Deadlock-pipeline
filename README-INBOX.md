@@ -1,61 +1,74 @@
-# Inbox drop: new-hero support and the calculator item fix (2026-10-03)
+# Inbox drop: new-hero build fallback (2026-10-03, second drop)
 
-    deadlock_pipeline.py       MODIFIED - new heroes reach the tier list; writes output/roster.csv
-    build_site_data.py         MODIFIED - NEW row for heroes the ladder can't place yet
-    fetch_icons.py             MODIFIED - fetches art for heroes with no data yet
-    docs/index.html            MODIFIED - NEW row styling, and a note on the hero panel
-    build_calc_data.py         MODIFIED - leaves unreleased heroes out of the calculator
-    ref/shop_items_wiki.json   MODIFIED - two items renamed in the 2026-09-29 patch
+    deadlock_pipeline.py   MODIFIED - new-hero sweep, a relaxed games bar, first-seen tracking
+    build_site_data.py     MODIFIED - stores first_seen, flags new heroes, single builds
+    docs/index.html        MODIFIED - single-build items, and notes that say where builds came from
+    orbit_audit.py         MODIFIED - counts sweep builds separately from board builds
 
-Before editing, I checked all six against live main (f5aeb42): their blob hashes
-matched the versions these edits started from. The only commit since the 7ca5aba
-dump touched docs/data.json.
+Before editing, I checked all four against live main (1da4724): their blob
+hashes matched the versions these edits started from.
 
-## Why Rat King never showed up
+## The goal is unchanged
 
-Every hero reaches tierlist.csv through Valve's per-hero leaderboard. A hero
-released hours ago has an empty leaderboard. The orbit fill is meant to top up
-short heroes, but it only looped over heroes that already had a board player.
-Rat King had zero in both regions, so he never got a pool, never got a tier-list
-row, and never had his icon fetched.
+Each region's top 20 players **on the hero**, one build each: their most
+recent game on it. For a new hero, Valve's per-hero leaderboard can't supply
+that yet, so this fills the gap with the closest thing available. Established
+heroes are untouched.
 
-deadlock-api was fine. It published the Rat King build (assets-6737) 23
-minutes after release, and docs/calc/heroes.json already carries his stats.
+## What a NEW hero's pool is built from now, in order
 
-## What changes on the site
+1. **Its own leaderboard players.** The selection is the same as for every
+   other hero.
+2. **The sweep.** These are players the run already identified from any hero's
+   leaderboard, or from the region's top-1000 general ladder, who have 3 or more
+   games on the new hero. They're ordered by ladder position. Their per-hero
+   stats arrive with every run anyway, so this adds no SQL calls. The general
+   ladder costs a few extra per-hero stats calls, which aren't SQL.
+3. **The orbit, at the same 3-game bar.** These are players who shared matches
+   with top players.
 
-- A hero the ladder can't place yet goes in a **NEW** row under D. This covers
-  three cases: no ceiling row, a ceiling that comes from the orbit only, or no
-  pool at all yet. The hero shows its art and whatever builds exist.
-- NEW heroes are never ranked, and they don't shift any other hero's tier.
-- A hero moves into S–D on its own once a leaderboard player is confirmed for
-  it in that region.
+One build per player. A player is never used for the same hero in both regions.
+
+## How "new" is decided
+
+A hero is new for **14 days** from the first time it appears. That date is
+stored as `first_seen` in `docs/data.json`. The commit step already commits that
+file, so nothing new is committed. On the first run, Rat King gets his real
+release date, 2026-10-02, so he stays new until Oct 16. A hero released later
+is marked automatically, because it won't be in the published file yet. The
+check fails closed: if `data.json` is missing, or implausibly many heroes read
+as new, the fallback is off for that run.
+
+## On the site
+
+- A new hero with 1–2 builds in a region now shows its items. The 2-builds
+  rule had been hiding NA's only Rat King build.
+- The NEW note says the builds are the most recent games of the
+  highest-ranked players who have played the hero.
+- Once a new hero is ranked but its leaderboard still can't supply 20, a note
+  says how many builds came from the fallback.
+- Ranking is unchanged. A new hero stays in NEW until its own leaderboard
+  confirms a player.
 
 ## Next Daily refresh log
 
 ```
-[assets] 5 hero(es) not yet released, skipped until Valve flips them: Baba, Deadman Danny, Nurse Harrow, Solomon, Violet
-[lb] 1 hero(es) have NO board entries in any region: Rat King (84) - ...
-[NAmerica] 1 listed as NEW (no board-backed ceiling yet): Rat King (N builds)
-[calc] items 156 (...)        <- was 154: Spirit Shredder + Armor Piercer are back
+[new] 1 new hero(es), fallback ON (within 14 days of first seen): Rat King (since 2026-10-02)
+[new] Rat King       NAmerica  0 board + N sweep (M on the general board) + K orbit = x/20   [bar 3 games; ...]
+[new] Rat King       Europe    ...
 ```
 
-This adds no SQL calls. The orbit query already runs every run, because Mirage
-and Lady Geist are short.
+## Cost
 
-## The other five
-
-Deadman Danny, Solomon, Violet, Nurse Harrow and Baba are still PreRelease in
-build 6745. Their card art isn't in the game files yet. Rat King's card art
-shipped in the same build that released him. When Valve releases each of the
-five, it shows up as NEW on the next run, art included, with no code change
-needed.
+- **SQL:** while a hero is new, at most one or two extra calls per run, for
+  the extra builds' items. The orbit query already runs every run.
+- **Per-hero stats:** about 15 extra calls, which don't count toward the SQL
+  limit.
 
 ## Not in this drop
 
-- `daily.yml`, an optional one-line change that uploads `output/roster.csv`
-  with the other aggregates. Workflow files need a PAT secret in this repo, so I
-  kept it out.
-- `batch-fix.zip` at the repo root is a Dl_toolkit drop that was uploaded here
-  on 2026-08-12. This repo's inbox leaves it alone because it has no
-  README-INBOX.md. It's safe to delete.
+- **The second orbit ring.** The 2026-08-08 measurement put it at the
+  population mean: 0.504 median win rate, against 0.530 for orbit-1 and 0.568
+  for the seeds. Adding it would fill the 20 with average players. It would
+  also need extra SQL, because the orbit-1 list is too long for one query URL.
+  It's held until a run shows the sweep can't fill a new hero.

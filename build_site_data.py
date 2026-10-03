@@ -162,6 +162,48 @@ def main():
               % (len(roster_only), NEW_TIER, ", ".join(heroes[s]["name"] for s in roster_only)),
               file=sys.stderr)
 
+    # first_seen is the pipeline's NEW-HERO STATE: load_first_seen() in
+    # deadlock_pipeline.py reads it back from the published data.json on the
+    # next run, so it is written for EVERY hero ("" = predates tracking) and a
+    # roster without the column (older pipeline) leaves the previous value.
+    new_slugs = set()
+    roster_first = {}
+    for r in roster_rows:
+        s = slug(r.get("hero") or "")
+        if s and "first_seen" in r:
+            roster_first[s] = (r.get("first_seen") or "").strip()
+            if (r.get("new") or "").strip().upper() == "YES":
+                new_slugs.add(s)
+    if roster_first:
+        # A date, once recorded, is never cleared: a run whose pipeline
+        # failed closed (no readable state) reports "" for everyone, and
+        # writing that over a real date would end a new hero's fallback early.
+        prev_first = {}
+        try:
+            with open(os.path.join(DOCS, "data.json"), encoding="utf-8") as f:
+                for k, v in ((json.load(f).get("heroes")) or {}).items():
+                    if v.get("first_seen"):
+                        prev_first[k] = v["first_seen"]
+        except Exception:
+            pass
+        for s, h in heroes.items():
+            h["first_seen"] = roster_first.get(s, "") or prev_first.get(s, "")
+    if new_slugs:
+        print("  [new] new hero(es): %s" % ", ".join(sorted(new_slugs)), file=sys.stderr)
+
+    # How many of a NEW hero's builds came from the fallback rather than its
+    # own board, per region, so the page can say so. source_items.csv is the
+    # pipeline's postgame holdings split by source; of_builds is per source.
+    filled = defaultdict(int)
+    if new_slugs:
+        seen_src = set()
+        for r in read("source_items.csv", required=False):
+            s = slug(r.get("hero") or "")
+            key = (r.get("region"), s, r.get("source"))
+            if s in new_slugs and r.get("source") != "board" and key not in seen_src:
+                seen_src.add(key)
+                filled[(r.get("region"), s)] += int(r.get("of_builds") or 0)
+
     # ---- deduped item lookup ---------------------------------------------
     meta = {}
     for r in item_rows:
@@ -340,7 +382,10 @@ def main():
         rg, s = r["region"], slug(r["hero"])
         if rg not in builds or r["snapshot"] not in SNAPSHOTS:
             continue
-        if int(r["count"]) < 2:
+        # held-by-1 items are kept only for a NEW hero under 3 builds, matching
+        # the pipeline's own rule — otherwise one build shows as an empty panel
+        min_c = 1 if (s in new_slugs and int(r.get("of_builds") or 0) < 3) else 2
+        if int(r["count"]) < min_c:
             continue
         builds[rg][s][r["snapshot"]].append([int(r["count"]), r["item_id"]])
         of_builds[rg][s] = int(r["of_builds"])
@@ -396,6 +441,10 @@ def main():
                     "rank": len(order) + 1,
                     "of_builds": of_builds[rg].get(s, 0),
                 })
+                if s in new_slugs:
+                    order[-1]["new"] = True
+                    if filled.get((rg, s)):
+                        order[-1]["filled"] = filled[(rg, s)]
             i += n
         # Everything this run knows about that the ceiling could not place:
         # orbit-only ceilings, tier-list heroes with no ceiling row here, and
@@ -410,6 +459,12 @@ def main():
                 "rank": None,
                 "of_builds": of_builds[rg].get(s, 0),
             })
+            # a NEW-HERO flag, distinct from the NEW tier: the page uses it to
+            # show held-by-1 items and to say where the builds came from
+            if s in new_slugs:
+                order[-1]["new"] = True
+                if filled.get((rg, s)):
+                    order[-1]["filled"] = filled[(rg, s)]
         regions[rg] = {
             "label": REGION_LABEL[rg],
             "depth": int(rows[0]["region_depth"]),

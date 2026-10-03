@@ -512,7 +512,9 @@ footer{margin-top:48px;border-top:1px solid var(--frame)}
     <dt>New</dt>
     <dd>Heroes the ladder cannot place yet — usually a fresh release whose own leaderboard
     has not filled in. They are listed with whatever builds exist, never ranked, and move
-    into the tiers once a leaderboard player is confirmed.</dd>
+    into the tiers once a leaderboard player is confirmed. For a hero's first two weeks,
+    any builds its leaderboard cannot supply come from the highest-ranked players who
+    have played it, one game each.</dd>
 
     <dt>Calculator</dt>
     <dd>Stats are computed from Valve's own asset data. Percentages of the same kind add
@@ -674,21 +676,39 @@ function renderDetail(){
   // release is not read as a verdict.
   if (entry.tier === 'NEW'){
     const note = el('div','note');
-    note.textContent = entry.of_builds
-      ? 'Not ranked yet. No player has a confirmed ' + R().label + ' leaderboard spot on this hero, '
-        + 'so it cannot be placed against the others — new heroes start here. The '
-        + entry.of_builds + ' build' + (entry.of_builds === 1 ? '' : 's')
-        + ' below come from strong players who share matches with the top of the ladder. '
-        + 'It joins the tiers once its own leaderboard fills in.'
-      : 'Not ranked yet. No ' + R().label + ' leaderboard players or sampled builds for this hero so far '
-        + '— new heroes start here. Builds appear as people play it, and it joins the tiers '
-        + 'once its own leaderboard fills in.';
+    const n = entry.of_builds, rg = R().label;
+    const builds = n + ' build' + (n === 1 ? '' : 's');
+    // entry.new = released within the last two weeks (deadlock_pipeline.py
+    // NEW_HERO_DAYS): its builds come from the new-hero fallback, which takes
+    // the highest-ranked players who have played it, one game each.
+    note.textContent = !n
+      ? 'Not ranked yet. No ' + rg + ' leaderboard players or sampled builds for this hero so far '
+        + '\u2014 new heroes start here. Builds appear as top players pick it up, and it joins '
+        + 'the tiers once its own leaderboard fills in.'
+      : entry.new
+      ? 'Not ranked yet. Its own ' + rg + ' leaderboard is still filling in, so it cannot be placed '
+        + 'against the others. Until it does, '
+        + (n === 1
+           ? 'the build below is the most recent game of the highest-ranked ' + rg
+             + ' player who has played it.'
+           : 'the ' + builds + ' below are the most recent games of the highest-ranked ' + rg
+             + ' players who have played it, one per player.')
+      : 'Not ranked yet. No player has a confirmed ' + rg + ' leaderboard spot on this hero, '
+        + 'so it cannot be placed against the others. The ' + builds
+        + ' below come from strong players who share matches with the top of the ladder.';
+    d.appendChild(note);
+  } else if (entry.new && entry.filled){
+    // ranked, but its leaderboard cannot fill 20 yet, so the fallback topped it up
+    const note = el('div','note');
+    note.textContent = 'New hero. ' + entry.filled + ' of these ' + entry.of_builds
+      + ' builds are the most recent games of strong ' + R().label + ' players who have played it '
+      + 'but are not on its own leaderboard yet.';
     d.appendChild(note);
   }
 
   if (entry.of_builds || entry.tier !== 'NEW'){
     const lab = el('div','section-label');
-    lab.textContent = 'Items held by net worth · of ' + entry.of_builds + ' builds';
+    lab.textContent = 'Items held by net worth · of ' + entry.of_builds + ' build' + (entry.of_builds === 1 ? '' : 's');
     d.appendChild(lab);
 
     const cols = el('div','cols');
@@ -705,7 +725,10 @@ function renderDetail(){
 }
 
 function renderCol(snap, all, entry){
-  const list = all.filter(p => p[0] >= 2);
+  // held-by-1 items show only on a NEW hero under 3 builds (the pipeline keeps
+  // them for exactly that case); everywhere else 2+ is the noise floor
+  const floor = (entry.new && entry.of_builds < 3) ? 1 : 2;
+  const list = all.filter(p => p[0] >= floor);
   const col = el('div','col');
   const h3 = el('h3'); h3.textContent = snap;
   const rule = el('div','rule');

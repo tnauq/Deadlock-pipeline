@@ -74,14 +74,18 @@ def main():
                          "older than the orbit fill")
 
     # (region, hero) -> {"orbit": {match_ids}, "board": {match_ids}}
-    groups = defaultdict(lambda: {"orbit": set(), "board": set()})
+    # "sweep" rows (a NEW hero's top-ladder fill, deadlock_pipeline.py
+    # new_hero_fill) are counted on their own and kept OUT of both groups —
+    # filed under "board" they would pass off fallback builds as board ones.
+    groups = defaultdict(lambda: {"orbit": set(), "board": set(), "sweep": set()})
     seeds_met = defaultdict(list)
     for r in cands:
         key = (r["region"], r["hero"])
         mid = (r.get("last_match_id") or "").strip()
         if not mid:
             continue
-        which = "orbit" if (r.get("source") or "") == "orbit" else "board"
+        src = (r.get("source") or "").strip()
+        which = src if src in ("orbit", "sweep") else "board"
         groups[key][which].add(mid)
         if which == "orbit":
             v = (r.get("orbit_seeds_met") or "").strip()
@@ -138,6 +142,7 @@ def main():
         rec = {
             "region": rg, "hero": hero,
             "orbit_builds": n_o, "board_builds": n_b,
+            "sweep_builds": len(g["sweep"]),
             "orbit_share": round(100.0 * n_o / max(n_o + n_b, 1), 1),
             "mean_seeds_met": round(sum(seeds_met[(rg, hero)]) /
                                     len(seeds_met[(rg, hero)]), 2)
@@ -162,7 +167,7 @@ def main():
 
     cols = ["region", "hero", "board_builds", "orbit_builds", "orbit_share",
             "mean_seeds_met", "jaccard", "baseline", "vs_baseline",
-            "orbit_only", "board_only"]
+            "orbit_only", "board_only", "sweep_builds"]
     path = os.path.join(OUT, "orbit_audit.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")

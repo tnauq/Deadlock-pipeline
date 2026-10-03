@@ -26,7 +26,8 @@ Outputs (./output/):
     hero_splits.csv      V/G/S soul share and split classification, per snapshot
     excluded.csv         ladder entries dropped, with the reason
     roster.csv           every RELEASED hero, with or without data this run —
-                         how a new hero reaches the site before it has a pool
+                         how a new hero reaches the site before it has a pool,
+                         plus first_seen / new for the new-hero fallback
 
 NAMING NOTE. hero_games / hero_wins count a player's games and wins ON THE HERO
 named in the same row, across the whole lookback. They were called games_all /
@@ -40,6 +41,7 @@ Stdlib only.  Run:  python3 deadlock_pipeline.py
 """
 
 import csv
+import datetime
 import json
 import math
 import os
@@ -198,6 +200,43 @@ ORBIT_MIN_SEEDS_MET = _env("ORBIT_MIN_SEEDS_MET", 1)
 # for the few who met 2+. The `[orbit] seeds met:` line prints the
 # distribution; if it is overwhelmingly {1: ...} this choice barely matters.
 ORBIT_SORT = os.environ.get("ORBIT_SORT", "breadth")
+
+# ---- new-hero fallback (2026-10-03) ---------------------------------------
+# THE GOAL DOES NOT CHANGE: each region's top 20 players ON THE HERO, one build
+# each, their most recent game on it. A hero released days ago has an empty
+# per-hero board, so "top on the hero" cannot be read off Valve's board, and
+# the orbit alone produced 3 builds for Rat King on his first day. While a
+# hero is NEW, its shortfall after its own board players is filled, in order:
+#
+#   1. SWEEP — accounts this run already resolved from ANY hero's board or the
+#      region's general board, with NEW_HERO_MIN_GAMES+ games on the new hero,
+#      ordered by general-board position (the site's own definition of top).
+#      Their hero-stats come back with every hero in one row set, so this is
+#      free: no SQL, plus a few hero-stats calls for general-board ids.
+#   2. ORBIT — orbit-1 players at the same relaxed bar, by seeds met.
+#
+# One build per player, unique players across regions, exactly as for board
+# players. Established heroes are untouched: same board selection, same
+# 5-game orbit. A hero is NEW for NEW_HERO_DAYS after it first appears; the
+# first-seen date lives in the committed docs/data.json (see
+# load_first_seen). NEW_HERO_IDS forces heroes into the set by id.
+NEW_HERO_DAYS = _env("NEW_HERO_DAYS", 14)
+# Early players sit at 2-4 games: Rat King's first 3 qualifiers had 16 games
+# between them, all just over the orbit's 5-game bar.
+NEW_HERO_MIN_GAMES = _env("NEW_HERO_MIN_GAMES", 3)
+# Sweep ids are resolved from display names; an account with almost no games
+# cannot be the player standing on that board. Same floor ceiling_rank.py uses.
+NEW_HERO_MIN_ACCOUNT_GAMES = _env("NEW_HERO_MIN_ACCOUNT_GAMES", 100)
+NEW_HERO_FORCE = {int(x) for x in (os.environ.get("NEW_HERO_IDS") or "").split(",")
+                  if x.strip().isdigit()}
+SITE_DATA = os.environ.get("SITE_DATA") or os.path.join("docs", "data.json")
+# Seeds the one-time migration (load_first_seen). Rat King was released in
+# build 6736 on 2026-10-02 (GameTracking-Deadlock heroes.vdata). Listing him
+# here keeps him NEW even if a run of the previous code ranks him somewhere
+# before this one first runs. Later heroes need no entry: they are absent from
+# the published data.json the first time they appear, which is what marks them.
+KNOWN_RELEASES = {84: "2026-10-02"}
+
 # Unkeyed /v1/sql allows 2 req/min AND 20 req/hr (SCHEMA.md quirk #5). The
 # hourly cap is the binding one for chunked queries — it is what killed the
 # 2026-07-31 runs at chunk 21 both times. An X-API-Key raises this.
@@ -935,6 +974,237 @@ def account_totals(stats):
     return tot
 
 
+# --------------------------------------------------------------------------
+# NEW HEROES
+# --------------------------------------------------------------------------
+
+
+def load_first_seen(heroes, today):
+    """(hid -> first_seen, set of NEW hero ids).
+
+    first_seen is "YYYY-MM-DD", or "" for a hero that predates tracking. The
+    state lives in the committed docs/data.json, which build_site_data.py
+    writes every run, so it needs no new file and no new commit step:
+
+      * a hero absent from the last publish was released since — today
+      * a hero carrying first_seen keeps it
+      * MIGRATION, the first run after 2026-10-03 only: no hero carries the
+        field yet. A hero in KNOWN_RELEASES gets its real release date; any
+        other hero the last publish could not place in ANY region (tier NEW
+        everywhere, or in no order at all) was not established either.
+        Everything else predates tracking.
+
+    Fails CLOSED. With no readable site data, or with an implausible share of
+    the roster reading as new, the fallback is OFF for the run: a polluted
+    established pool is worse than one thin new hero.
+    """
+    try:
+        with open(SITE_DATA, encoding="utf-8") as f:
+            prev = json.load(f)
+        prev_heroes = prev.get("heroes") or {}
+    except Exception as e:
+        print("  [new] no readable %s (%s) — new-hero fallback OFF this run"
+              % (SITE_DATA, e), file=sys.stderr)
+        return {hid: "" for hid in heroes}, set()
+    if not prev_heroes:
+        print("  [new] %s lists no heroes — new-hero fallback OFF this run" % SITE_DATA,
+              file=sys.stderr)
+        return {hid: "" for hid in heroes}, set()
+
+    by_id = {}
+    for h in prev_heroes.values():
+        try:
+            by_id[int(h.get("id"))] = h
+        except (TypeError, ValueError):
+            continue
+    tracked = any("first_seen" in h for h in prev_heroes.values())
+    unplaced = set()
+    if not tracked:
+        regions = prev.get("regions") or {}
+        for s in prev_heroes:
+            tiers = [o.get("tier") for b in regions.values()
+                     for o in (b.get("order") or []) if o.get("slug") == s]
+            if not tiers or all(t == "NEW" for t in tiers):
+                unplaced.add(s)
+
+    first = {}
+    for hid in heroes:
+        h = by_id.get(hid)
+        if h is None:
+            first[hid] = today
+        elif "first_seen" in h:
+            first[hid] = h.get("first_seen") or ""
+        elif not tracked and hid in KNOWN_RELEASES:
+            first[hid] = KNOWN_RELEASES[hid]
+        elif not tracked and h.get("slug") in unplaced:
+            first[hid] = today
+        else:
+            first[hid] = ""
+
+    new = set(h for h in NEW_HERO_FORCE if h in heroes)
+    t0 = datetime.date.fromisoformat(today)
+    for hid, d in first.items():
+        try:
+            if d and (t0 - datetime.date.fromisoformat(d)).days <= NEW_HERO_DAYS:
+                new.add(hid)
+        except ValueError:
+            continue
+    if len(new) > max(8, len(heroes) // 4):
+        print("  [new] WARNING: %d of %d heroes read as new — that is missing site "
+              "state, not a release wave; new-hero fallback OFF this run"
+              % (len(new), len(heroes)), file=sys.stderr)
+        # and record no first-seen dates from it: stamping today on heroes
+        # that are only absent because the state was bad would make them all
+        # "new" for the next fortnight
+        return {h: ("" if d == today else d) for h, d in first.items()}, set()
+    if new:
+        print("  [new] %d new hero(es), fallback ON (within %d days of first seen): %s"
+              % (len(new), NEW_HERO_DAYS,
+                 ", ".join("%s (since %s)" % (heroes[h], first.get(h) or "forced")
+                           for h in sorted(new))), file=sys.stderr)
+    return first, new
+
+
+def new_hero_fill(new_heroes, heroes, ladder, general, stats, chosen,
+                  orbit_members, orbit_stats, home):
+    """Top up each NEW hero's pool, per region, after its own board players.
+
+    Order of preference, one build per player, unique players across regions
+    (see NEW_HERO_* above for the why):
+      1. the hero's own board players — already in `chosen`, untouched
+      2. SWEEP: accounts resolved from any board this run, NEW_HERO_MIN_GAMES+
+         games on the hero, by general-board position; players not on the
+         general board follow, by their best position on a hero board
+      3. ORBIT: orbit-1 players at the same relaxed bar, by seeds met
+
+    Fetches hero-stats for general-board ids not already known (free bucket,
+    capped at MAX_IDS_PER_ENTRY per name in native best-match-first order).
+    Returns builds added.
+    """
+    # ---- who is near the top of each region, and as which account --------
+    near = {rg: {} for rg in REGIONS}
+
+    def note(rg, aid, gp=None, lpos=None, name="", confirmed=False):
+        cur = near[rg].setdefault(aid, {"pos": None, "lpos": None, "name": name,
+                                        "confirmed": False})
+        if gp and (cur["pos"] is None or gp < cur["pos"]):
+            cur["pos"] = gp
+        if lpos and (cur["lpos"] is None or lpos < cur["lpos"]):
+            cur["lpos"] = lpos
+        cur["confirmed"] = cur["confirmed"] or confirmed
+        cur["name"] = cur["name"] or name
+
+    for (_h, rg), rows in ladder.items():
+        if rg not in near:
+            continue
+        for r in rows:
+            aid = r.get("account_id")
+            if aid is not None:
+                note(rg, aid, r.get("global_pos"), r.get("ladder_pos"),
+                     r.get("account_name") or "", aid in (r.get("confirmed_ids") or []))
+
+    gen = []
+    for rg in REGIONS:
+        for key, e in ((general.get(rg) or {}).get("by_name") or {}).items():
+            ids = list(e.get("ids") or [])[:MAX_IDS_PER_ENTRY]
+            if ids:
+                gen.append((rg, key, e.get("global_pos"), ids))
+    known = {a for (a, _h) in stats} | {a for (a, _h) in orbit_stats}
+    want = {a for (_rg, _k, _gp, ids) in gen for a in ids} - known
+    merged = dict(stats)
+    merged.update(orbit_stats)
+    if want:
+        print("  [new] hero-stats for %d general-board ids not already known"
+              % len(want), file=sys.stderr)
+        merged.update(fetch_hero_stats(want))
+    totals = account_totals(merged)
+    for rg, key, gp, ids in gen:
+        # the account this name most plausibly is: most games overall, ties to
+        # the earlier slot (the list is best-match-first; PROBES.md)
+        best = None
+        for a in ids:
+            g = totals[a][0] if a in totals else 0
+            if g and (best is None or g > best[0]):
+                best = (g, a)
+        if best:
+            note(rg, best[1], gp, None, key)
+
+    added = 0
+    for hid in sorted(new_heroes):
+        lst = chosen[hid]
+        taken = {c["account_id"] for c in lst}
+        for rg in REGIONS:
+            board = sum(1 for c in lst if c["region"] == rg)
+            need = PER_REGION - board
+            if need <= 0:
+                continue
+            sweep = []
+            for aid, m in near[rg].items():
+                if aid in taken or (EXCLUSIVITY and home.get(aid, hid) != hid):
+                    continue
+                s = merged.get((aid, hid))
+                if (not s or s["last_match_id"] is None
+                        or s["hero_games"] < NEW_HERO_MIN_GAMES
+                        or totals[aid][0] < NEW_HERO_MIN_ACCOUNT_GAMES):
+                    continue
+                rank = (0, m["pos"]) if m["pos"] else (1, m["lpos"] or 10 ** 9)
+                sweep.append((rank, -s["hero_games"], aid, m, s))
+            sweep.sort(key=lambda t: t[:3])
+            orbit = []
+            for aid, prox in (orbit_members.get(rg) or {}).items():
+                if aid in taken or prox["seeds_met"] < ORBIT_MIN_SEEDS_MET:
+                    continue
+                s = merged.get((aid, hid))
+                if not s or s["last_match_id"] is None or s["hero_games"] < NEW_HERO_MIN_GAMES:
+                    continue
+                orbit.append((prox["seeds_met"], shrunk(s["hero_wins"], s["hero_games"]),
+                              aid, s))
+            if ORBIT_SORT == "winrate":
+                orbit.sort(key=lambda t: (-t[1], -t[0], t[2]))
+            else:
+                orbit.sort(key=lambda t: (-t[0], -t[1], t[2]))
+
+            got = {"sweep": 0, "orbit": 0}
+            located = 0
+            picks = [("sweep", t[2], t[4], t[3], "") for t in sweep] + \
+                    [("orbit", t[2], t[3], None, t[0]) for t in orbit]
+            for src, aid, s, m, met in picks:
+                if got["sweep"] + got["orbit"] >= need:
+                    break
+                if aid in taken:
+                    continue
+                taken.add(aid)
+                gp = m["pos"] if m else None
+                tg, tw = totals[aid] if aid in totals else (0, 0)
+                lst.append({
+                    "hero_id": hid, "region": rg, "ladder_pos": None,
+                    "account_name": (m or {}).get("name", ""), "badge_level": None,
+                    "global_pos": gp, "located_on_general": "YES" if gp else "",
+                    "valve_top_hero": "",
+                    "id_confirmed": "YES" if (m or {}).get("confirmed") else "",
+                    "account_id": aid, "mmr": None,
+                    "ranked_rating": round(shrunk(s["hero_wins"], s["hero_games"]), 4),
+                    "last_match_id": int(s["last_match_id"]),
+                    "last_played": s["last_played"],
+                    "hero_games": s["hero_games"], "hero_wins": s["hero_wins"],
+                    # sweep players have a full record in hand, so their
+                    # off-hero baseline is real; orbit rows keep the orbit
+                    # fill's convention of none
+                    "offhero_games": max(tg - s["hero_games"], 0) if src == "sweep" else 0,
+                    "offhero_wins": max(tw - s["hero_wins"], 0) if src == "sweep" else 0,
+                    "ambiguous": False, "source": src, "orbit_seeds_met": met,
+                })
+                got[src] += 1
+                located += 1 if gp else 0
+                added += 1
+            print("  [new] %-14s %-9s %d board + %d sweep (%d on the general board) "
+                  "+ %d orbit = %d/%d   [bar %d games; %d sweep / %d orbit eligible]"
+                  % (heroes[hid][:14], rg, board, got["sweep"], located, got["orbit"],
+                     board + got["sweep"] + got["orbit"], PER_REGION,
+                     NEW_HERO_MIN_GAMES, len(sweep), len(orbit)), file=sys.stderr)
+    return added
+
+
 def query_items(pairs):
     """Chunked so no single URL exceeds MAX_URL."""
     # ~22 encoded chars per (match_id, account_id) pair; //25 leaves room for
@@ -1018,6 +1288,8 @@ def main():
     print("[1/5] assets", file=sys.stderr)
     (heroes, hero_icon, items, component_of, abilities, hero_sigs, dead_ids,
      hero_meta) = load_assets()
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    first_seen, new_heroes = load_first_seen(heroes, today)
 
     print("[2/5] ladders (%s), depth %d, target %d per region, exclusivity %s, "
           "mode %s, selection by %s"
@@ -1194,6 +1466,7 @@ def main():
     # actually play that hero. Board members are never displaced: the orbit
     # only ever appends to a pool that came up short.
     orbit_added = 0
+    orbit_members, orbit_stats = {}, {}
     if ORBIT_FILL:
         short = defaultdict(list)
         # EVERY released hero, not just the ones already in `chosen`. Looping
@@ -1204,13 +1477,22 @@ def main():
         # query is one call per region and runs whenever ANY hero-region is
         # short, and the hero-stats lookup for orbit members already returns
         # every hero they play.
+        #
+        # NEW heroes are filled below by new_hero_fill instead, sweep FIRST:
+        # left in here, the 5-game orbit would take their slots before the
+        # higher-standing sweep players got a look.
+        new_short = set()
         for hid in sorted(heroes):
             lst = chosen.get(hid, [])
             for rg in REGIONS:
                 have = [c for c in lst if c["region"] == rg]
                 if len(have) < PER_REGION:
-                    short[rg].append((hid, PER_REGION - len(have)))
-        for rg, gaps in sorted(short.items()):
+                    if hid in new_heroes:
+                        new_short.add(rg)
+                    else:
+                        short[rg].append((hid, PER_REGION - len(have)))
+        for rg in sorted(set(short) | new_short):
+            gaps = short.get(rg, [])
             seeds = [c["account_id"] for lst in chosen.values() for c in lst
                      if c["region"] == rg]
             seeds = sorted(set(seeds))[:ORBIT_SEEDS]
@@ -1221,6 +1503,8 @@ def main():
             # recent match on the hero are known. Free, batched.
             known = {a for (a, _h) in stats}
             extra = fetch_hero_stats(set(members) - known)
+            orbit_members[rg] = members
+            orbit_stats.update(extra)
             print("  [orbit] %-9s %d short hero-regions, %d orbit players, "
                   "%d (account,hero) rows" % (rg, len(gaps), len(members), len(extra)),
                   file=sys.stderr)
@@ -1262,6 +1546,14 @@ def main():
                     orbit_added += 1
         print("  [orbit] added %d builds across all short hero-regions"
               % orbit_added, file=sys.stderr)
+
+    # ---- new heroes: sweep, then the orbit at a relaxed bar ---------------
+    new_added = 0
+    if new_heroes:
+        new_added = new_hero_fill(new_heroes, heroes, ladder, general, stats, chosen,
+                                  orbit_members, orbit_stats, home)
+        print("  [new] added %d builds across %d new hero(es)"
+              % (new_added, len(new_heroes)), file=sys.stderr)
 
     # ---- pool net wins, ranked only, with recency decay -------------------
     # Attaches to every sampled player BEFORE the tier rollup, so the tier
@@ -1517,8 +1809,13 @@ def main():
     freq = []
     for (hid, rg, snap), counter in holds.items():
         n = builds_rg[(hid, rg)] or 1
+        # Items held by a single build are noise in a 20-build sample, so they
+        # are dropped — but on a NEW hero with 1-2 builds that rule hides
+        # everything (Rat King NA, 2026-10-03: one build, empty panel). Below 3
+        # builds a new hero keeps them; the site shows them as "1 of 1".
+        min_c = 1 if (hid in new_heroes and n < 3) else 2
         for iid, c in counter.items():
-            if c < 2:                      # exclude single-instance items
+            if c < min_c:                  # exclude single-instance items
                 continue
             m = items.get(iid, {})
             freq.append({"hero_id": hid, "hero": heroes.get(hid, ""), "region": rg,
@@ -1675,13 +1972,18 @@ def main():
             "board_entries": sum(len(ladder.get((hid, rg)) or []) for rg in REGIONS),
             "players": len(lst),
             "orbit_players": sum(1 for c in lst if c.get("source") == "orbit"),
+            "sweep_players": sum(1 for c in lst if c.get("source") == "sweep"),
             "builds_sampled": builds.get(hid, 0),
             "in_tierlist": "YES" if hid in in_tier else "",
+            # carried into docs/data.json by build_site_data.py, which is
+            # where the next run's load_first_seen reads it back from
+            "first_seen": first_seen.get(hid, ""),
+            "new": "YES" if hid in new_heroes else "",
         })
     write("roster.csv", roster,
           ["hero_id", "hero", "class_name", "hero_type", "development_state",
-           "icon_url", "board_entries", "players", "orbit_players",
-           "builds_sampled", "in_tierlist"])
+           "icon_url", "board_entries", "players", "orbit_players", "sweep_players",
+           "builds_sampled", "in_tierlist", "first_seen", "new"])
     missing = [r for r in roster if not r["in_tierlist"]]
     if missing:
         print("  [roster] %d released hero(es) produced no pool this run and will "
@@ -1706,7 +2008,8 @@ def main():
            "ranked_games", "ranked_wins", "net_wins", "net_wins_decayed",
            "offhero_games", "offhero_wins",
            "last_match_id", "last_played", "ambiguous",
-           # blank for board-sourced rows; "orbit" plus the breadth of contact
+           # blank for board-sourced rows; "sweep" for a new hero's top-ladder
+           # fill (new_hero_fill); "orbit" plus the breadth of contact
            # for anyone the orbit fill supplied
            "source", "orbit_seeds_met"])
     if POOL_NET_WINS:
