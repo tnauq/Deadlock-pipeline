@@ -1,74 +1,95 @@
-# Inbox drop: new-hero build fallback (2026-10-03, second drop)
+# Inbox drop: ring 2 of the orbit for new heroes (2026-10-03, third drop)
 
-    deadlock_pipeline.py   MODIFIED - new-hero sweep, a relaxed games bar, first-seen tracking
-    build_site_data.py     MODIFIED - stores first_seen, flags new heroes, single builds
-    docs/index.html        MODIFIED - single-build items, and notes that say where builds came from
-    orbit_audit.py         MODIFIED - counts sweep builds separately from board builds
+    deadlock_pipeline.py   MODIFIED - ring 2 as the last new-hero tier, and its measurement
+    orbit_audit.py         MODIFIED - counts ring-2 builds separately (orbit2_builds)
+    docs/index.html        MODIFIED - the NEW note and footer mention lobby-mates
 
-Before editing, I checked all four against live main (1da4724): their blob
-hashes matched the versions these edits started from.
+Before editing, I checked all three against live main (fa48c98): their blob
+hashes matched the drop-2 versions these edits started from.
+`build_site_data.py` is unchanged.
 
-## The goal is unchanged
+## What ring 2 is
 
-Each region's top 20 players **on the hero**, one build each: their most
-recent game on it. For a new hero, Valve's per-hero leaderboard can't supply
-that yet, so this fills the gap with the closest thing available. Established
-heroes are untouched.
+Players who shared a match with ring-1 (orbit) players in the same 3-day
+window, starting from the same 12 seeds. The seeds and their order are
+unchanged.
 
-## What a NEW hero's pool is built from now, in order
+## Rules
 
-1. **Its own leaderboard players.** The selection is the same as for every
-   other hero.
-2. **The sweep.** These are players the run already identified from any hero's
-   leaderboard, or from the region's top-1000 general ladder, who have 3 or more
-   games on the new hero. They're ordered by ladder position. Their per-hero
-   stats arrive with every run anyway, so this adds no SQL calls. The general
-   ladder costs a few extra per-hero stats calls, which aren't SQL.
-3. **The orbit, at the same 3-game bar.** These are players who shared matches
-   with top players.
+- **New heroes only, last tier.** The order is: the hero's own board, then the
+  sweep, then ring 1, then ring 2. Ring-2 players are taken only where a gap
+  is still left. Established heroes are untouched.
+- **Filter:** at least 2 ring-1 matches in the window (`ORBIT2_MIN_SHARED`).
+- **Order:** by the share of the player's own games in the window that were
+  ring-1 lobbies, not the raw count. A raw count rewards volume: 4 of 30 games
+  would beat 4 of 4. Two phantom games outside the band (`ORBIT2_SHARE_K`) keep
+  2 of 2 (0.50) from beating 18 of 20 (0.82). Ties go to the raw count, then
+  the win rate on the hero.
+- Same as the other tiers: 3 games on the hero, one build per player, and a
+  player is never used for the same hero in both regions.
 
-One build per player. A player is never used for the same hero in both regions.
+## The measurement
 
-## How "new" is decided
-
-A hero is new for **14 days** from the first time it appears. That date is
-stored as `first_seen` in `docs/data.json`. The commit step already commits that
-file, so nothing new is committed. On the first run, Rat King gets his real
-release date, 2026-10-02, so he stays new until Oct 16. A hero released later
-is marked automatically, because it won't be in the published file yet. The
-check fails closed: if `data.json` is missing, or implausibly many heroes read
-as new, the fallback is off for that run.
-
-## On the site
-
-- A new hero with 1–2 builds in a region now shows its items. The 2-builds
-  rule had been hiding NA's only Rat King build.
-- The NEW note says the builds are the most recent games of the
-  highest-ranked players who have played the hero.
-- Once a new hero is ranked but its leaderboard still can't supply 20, a note
-  says how many builds came from the fallback.
-- Ranking is unchanged. A new hero stays in NEW until its own leaderboard
-  confirms a player.
-
-## Next Daily refresh log
+While a hero is NEW, every run queries ring 2 and prints this, even when
+nothing is short (in that case nobody is taken):
 
 ```
-[new] 1 new hero(es), fallback ON (within 14 days of first seen): Rat King (since 2026-10-02)
-[new] Rat King       NAmerica  0 board + N sweep (M on the general board) + K orbit = x/20   [bar 3 games; ...]
-[new] Rat King       Europe    ...
+[orbit2] NAmerica  N ring-2 players of Rat King. On the top-1000 board:
+[orbit2]   by ring-1 matches shared:   1: x% of n  |  2: ...  |  3-5: ...  |  6+: ...
+[orbit2]   by share of their games:    <1/3: ...  |  1/3-2/3: ...  |  2/3+: ...
+[orbit2]   ring 1, for comparison:     y% of m (players of the same hero(es))
 ```
+
+If being in the leaders' lobbies tracks standing, the percentages climb from
+left to right. A bucket close to the ring-1 figure is about as near the top
+as the leaders' own lobby-mates. When ring 2 does fill a gap, a further line
+lists each pick as ring-1 lobbies / games played.
 
 ## Cost
 
-- **SQL:** while a hero is new, at most one or two extra calls per run, for
-  the extra builds' items. The orbit query already runs every run.
-- **Per-hero stats:** about 15 extra calls, which don't count toward the SQL
-  limit.
+- **SQL:** one call per region per run while a hero is new. With the API key,
+  the 20/hr IP cap doesn't apply (deadlock-api drops IP quotas for keyed
+  requests); the key's limit is 10/min. The 40 s SQL pause adds about 80 s per
+  run.
+- **Per-hero stats:** only when there's a gap, and only for the 1,000 closest
+  players who pass the filter.
+- **Non-fatal:** if the query fails, the run says so and carries on without
+  ring 2.
 
-## Not in this drop
+## Switches (env)
 
-- **The second orbit ring.** The 2026-08-08 measurement put it at the
-  population mean: 0.504 median win rate, against 0.530 for orbit-1 and 0.568
-  for the seeds. Adding it would fill the 20 with average players. It would
-  also need extra SQL, because the orbit-1 list is too long for one query URL.
-  It's held until a run shows the sweep can't fill a new hero.
+- `ORBIT2_FILL=0`: never take ring-2 players.
+- `ORBIT2_MEASURE=0`: skip the measurement-only query.
+- `ORBIT2_MIN_SHARED` and `ORBIT2_SHARE_K` tune the filter and the order.
+
+## Rat King right now
+
+The 17:07 and 19:03 UTC runs on drop 2 filled him 20/20 in both regions from
+the sweep and ring 1. Ring 2 will only measure him. It's there for the next
+releases: five heroes landing together would split the same top players five
+ways.
+
+## Verified
+
+- **The query ran on a real ClickHouse engine** (24.8, local) over synthetic
+  `match_player` data shaped like deadlock-api's table: ReplacingMergeTree,
+  duplicate rows, and both match modes. Every row and its order matched a
+  reference computation.
+  - It passes deadlock-api's own query checks.
+  - The URL is about 2 KB.
+- **Mock pipeline runs:**
+  - A gap fills closest-first: 4/4 and 3/3 come ahead of the grinders at 6/40
+    and 3/30.
+  - Ring-1 rows that leak into the result are dropped.
+  - A failed query doesn't stop the run.
+  - Both switches work.
+- **Established heroes:** identical to drop 2. When ring 2 isn't needed,
+  Rat King's pool is identical too.
+
+## Heads-up, not acted on
+
+deadlock-api now marks `/v1/sql` as **deprecated**: "Direct SQL access will
+be removed". It points to an hourly-exported public data lake at
+data.deadlock-api.com (DuckDB / DuckLake, or an MCP server at `/v1/mcp`). No
+removal date is published. Every SQL call in this pipeline (orbit, items,
+pool wins, ring 2) will eventually need to move there.

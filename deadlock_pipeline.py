@@ -178,7 +178,8 @@ SQL_429_WAIT_S = _env("SQL_429_WAIT_S", 65)
 #
 # Measured 2026-08-08 (NAmerica, 3-day window, 12 seeds): orbit 1 is 949
 # players with median win rate 0.530 and p90 0.629, against the seeds' 0.568
-# and 0.634. Orbit 2 sits at the population mean (0.504) and is NOT used.
+# and 0.634. Orbit 2 sits at the population mean (0.504); it is used only as
+# the last tier for NEW heroes, filtered and measured (see ORBIT2_* below).
 # In a 400-account sample, hero coverage was ample even for unpopular heroes:
 # Lady Geist 82, Mirage 98, Grey Talon 41, Vyper 23.
 #
@@ -236,6 +237,49 @@ SITE_DATA = os.environ.get("SITE_DATA") or os.path.join("docs", "data.json")
 # before this one first runs. Later heroes need no entry: they are absent from
 # the published data.json the first time they appear, which is what marks them.
 KNOWN_RELEASES = {84: "2026-10-02"}
+
+# ---- ring 2 of the orbit, new heroes only (2026-10-03) ---------------------
+# Players who shared a match with ring-1 players, in the same ORBIT_DAYS
+# window, from the same seeds. It was set aside on 2026-08-08 because its
+# median win rate sat at the population mean (0.504) — but that is the wrong
+# test. Matchmaking pulls everyone toward 50% AT THEIR OWN MMR, so a ~50% win
+# rate says "correctly matched", not "average player"; only the very top runs
+# out of equal opponents, which is why the seeds read 0.568.
+#
+# The real risk is DRIFT: co-play means similar MMR in that lobby, each hop
+# widens the spread, and the drift runs downward on average because the
+# leaders sit in the top tail. So:
+#   * FILTER: ORBIT2_MIN_SHARED+ ring-1 matches — players who keep landing in
+#     the leaders' lobbies, not ones who met them once.
+#   * ORDER: by the share of the player's own games in the window that were
+#     ring-1 lobbies, not by the raw count. A raw count rewards volume: 4 of
+#     30 games (a grinder brushing the band) would outrank 4 of 4. The share
+#     is discounted for small samples by ORBIT2_SHARE_K phantom games outside
+#     the band, so 2 of 2 (0.50) does not outrank 18 of 20 (0.82).
+# Each run that uses it also MEASURES it: the fraction of ring-2 players on
+# the region's top-1000 board, by shared matches and by share, against ring 1
+# — see the [orbit2] lines. If closeness predicts standing, those fractions
+# climb across the buckets.
+#
+# Last tier: players are taken only when a new hero is still short after the
+# sweep and ring 1. One SQL call per region (the query is computed server-side
+# from the 12 seeds, so the URL stays short). Non-fatal: if the query fails,
+# the run carries on without ring 2 and says so. Hero-stats (free bucket) are
+# fetched only for the ORBIT2_STATS_MAX closest players who clear the filter:
+# ~20 builds are needed, not thousands of records.
+#
+# ORBIT2_MEASURE: while any hero is NEW, run the query every run even when no
+# gap is left, to print the measurement — players are still only taken where
+# there is a gap. That is how the filter gets judged on real lobbies BEFORE a
+# release that needs it (Rat King's fallback was full by its second run). The
+# key (DEADLOCK_API_KEY) lifts the 20/hr IP cap, so this costs 2 SQL calls and
+# ~80 s per run while a hero is new, nothing otherwise.
+ORBIT2_FILL = _env("ORBIT2_FILL", 1)
+ORBIT2_MEASURE = _env("ORBIT2_MEASURE", 1)
+ORBIT2_MIN_SHARED = _env("ORBIT2_MIN_SHARED", 2)
+ORBIT2_SHARE_K = _env("ORBIT2_SHARE_K", 2)
+ORBIT2_LIMIT = _env("ORBIT2_LIMIT", 20000)
+ORBIT2_STATS_MAX = _env("ORBIT2_STATS_MAX", 1000)
 
 # Unkeyed /v1/sql allows 2 req/min AND 20 req/hr (SCHEMA.md quirk #5). The
 # hourly cap is the binding one for chunked queries — it is what killed the
@@ -866,6 +910,87 @@ def fetch_orbit1(seed_ids):
     return out
 
 
+# Ring 2, computed server-side from the seeds so the URL stays a few hundred
+# characters: ring 1 is ~950 ids, which as a literal IN list would overflow
+# MAX_URL and cost several calls. Restricted to accounts that have played one
+# of the short new heroes, so the result is small. Per account: `shared` =
+# distinct ring-1 matches it played in, `played` = distinct matches it played
+# in the same window and mode (uniqExact: match_player is a ReplacingMergeTree,
+# so a not-yet-merged duplicate row must not count twice). The hero filter
+# leads with hero_id, game_mode, which is the order of deadlock-api's
+# hero-led projection on match_player.
+Q_ORBIT2 = """
+WITH
+  seed_m AS (
+    SELECT DISTINCT match_id FROM match_player
+    WHERE account_id IN ({seeds}) AND {mode}game_mode = 'Normal'
+      AND start_time >= now() - INTERVAL {days} DAY),
+  ring1 AS (
+    SELECT DISTINCT account_id FROM match_player
+    WHERE match_id IN (SELECT match_id FROM seed_m)),
+  ring1_m AS (
+    SELECT DISTINCT match_id FROM match_player
+    WHERE account_id IN (SELECT account_id FROM ring1) AND {mode}game_mode = 'Normal'
+      AND start_time >= now() - INTERVAL {days} DAY)
+SELECT account_id,
+       uniqExactIf(match_id, in_ring1 = 1) AS shared,
+       uniqExact(match_id) AS played
+FROM (
+  SELECT account_id, match_id,
+         match_id IN (SELECT match_id FROM ring1_m) AS in_ring1
+  FROM match_player
+  WHERE {mode}game_mode = 'Normal'
+    AND start_time >= now() - INTERVAL {days} DAY
+    AND account_id NOT IN (SELECT account_id FROM ring1)
+    AND account_id IN (
+        SELECT DISTINCT account_id FROM match_player
+        WHERE hero_id IN ({heroes}) AND {mode}game_mode = 'Normal'
+          AND start_time >= now() - INTERVAL {hero_days} DAY))
+GROUP BY account_id
+HAVING shared > 0
+ORDER BY shared DESC, played ASC, account_id ASC
+LIMIT {limit}
+"""
+
+
+def fetch_orbit2(seed_ids, hero_ids, label=""):
+    """account_id -> (ring-1 matches shared, matches played), for ring-2
+    players of the heroes.
+
+    ONE SQL call. Never fatal: ring 2 is the last tier of an optional fill,
+    so a refusal (the restricted SQL user may time out on a two-hop join)
+    costs only ring 2, not the run.
+    """
+    seeds = sorted(set(int(a) for a in seed_ids if a))[:ORBIT_SEEDS]
+    if not seeds or not hero_ids:
+        return {}
+    mode_sql = "match_mode = '%s' AND " % MATCH_MODE if MATCH_MODE else ""
+    q = Q_ORBIT2.format(seeds=",".join(str(a) for a in seeds), mode=mode_sql,
+                        days=ORBIT_DAYS, heroes=",".join(str(h) for h in sorted(hero_ids)),
+                        hero_days=NEW_HERO_DAYS + 1, limit=ORBIT2_LIMIT)
+    try:
+        rows = sql(q, "orbit2 %s from %d seeds" % (label, len(seeds)))
+    except (SystemExit, Exception) as e:
+        print("  [orbit2] %s query failed (%s) — continuing without ring 2"
+              % (label, str(e).splitlines()[0][:160] if str(e) else type(e).__name__),
+              file=sys.stderr)
+        return {}
+    out = {}
+    for r in rows or []:
+        try:
+            n, p = int(float(r["shared"])), int(float(r["played"]))
+            out[int(r["account_id"])] = (n, max(p, n))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def orbit2_closeness(shared, played):
+    """Share of the player's games in the window that were ring-1 lobbies,
+    discounted for small samples (see ORBIT2_SHARE_K)."""
+    return shared / float(played + ORBIT2_SHARE_K)
+
+
 Q_POOL_WINS = """
 SELECT account_id,
        hero_id,
@@ -1066,20 +1191,23 @@ def load_first_seen(heroes, today):
 
 
 def new_hero_fill(new_heroes, heroes, ladder, general, stats, chosen,
-                  orbit_members, orbit_stats, home):
+                  orbit_members, orbit_stats, home, orbit_seeds):
     """Top up each NEW hero's pool, per region, after its own board players.
 
     Order of preference, one build per player, unique players across regions
-    (see NEW_HERO_* above for the why):
+    (see NEW_HERO_* and ORBIT2_* above for the why):
       1. the hero's own board players — already in `chosen`, untouched
       2. SWEEP: accounts resolved from any board this run, NEW_HERO_MIN_GAMES+
          games on the hero, by general-board position; players not on the
          general board follow, by their best position on a hero board
-      3. ORBIT: orbit-1 players at the same relaxed bar, by seeds met
+      3. ORBIT: ring-1 players at the same relaxed bar, by seeds met
+      4. ORBIT 2: ring-2 players with ORBIT2_MIN_SHARED+ shared ring-1
+         matches, same bar, closest first (orbit2_closeness) — only if 2 and
+         3 left a gap
 
     Fetches hero-stats for general-board ids not already known (free bucket,
-    capped at MAX_IDS_PER_ENTRY per name in native best-match-first order).
-    Returns builds added.
+    capped at MAX_IDS_PER_ENTRY per name in native best-match-first order),
+    and for ring-2 players. Returns builds added.
     """
     # ---- who is near the top of each region, and as which account --------
     near = {rg: {} for rg in REGIONS}
@@ -1104,11 +1232,13 @@ def new_hero_fill(new_heroes, heroes, ladder, general, stats, chosen,
                      r.get("account_name") or "", aid in (r.get("confirmed_ids") or []))
 
     gen = []
+    board_ids = {rg: set() for rg in REGIONS}   # every id any top-1000 name claims
     for rg in REGIONS:
         for key, e in ((general.get(rg) or {}).get("by_name") or {}).items():
             ids = list(e.get("ids") or [])[:MAX_IDS_PER_ENTRY]
             if ids:
                 gen.append((rg, key, e.get("global_pos"), ids))
+                board_ids[rg].update(ids)
     known = {a for (a, _h) in stats} | {a for (a, _h) in orbit_stats}
     want = {a for (_rg, _k, _gp, ids) in gen for a in ids} - known
     merged = dict(stats)
@@ -1130,78 +1260,187 @@ def new_hero_fill(new_heroes, heroes, ladder, general, stats, chosen,
             note(rg, best[1], gp, None, key)
 
     added = 0
+    got = defaultdict(lambda: {"sweep": 0, "orbit": 0, "orbit2": 0})
+    located = defaultdict(int)
+    eligible = {}
+    taken = {hid: {c["account_id"] for c in chosen[hid]} for hid in new_heroes}
+
+    def take(hid, rg, src, aid, s, m=None, met=""):
+        nonlocal added
+        taken[hid].add(aid)
+        gp = m["pos"] if m else None
+        tg, tw = totals[aid] if aid in totals else (0, 0)
+        chosen[hid].append({
+            "hero_id": hid, "region": rg, "ladder_pos": None,
+            "account_name": (m or {}).get("name", ""), "badge_level": None,
+            "global_pos": gp, "located_on_general": "YES" if gp else "",
+            "valve_top_hero": "",
+            "id_confirmed": "YES" if (m or {}).get("confirmed") else "",
+            "account_id": aid, "mmr": None,
+            "ranked_rating": round(shrunk(s["hero_wins"], s["hero_games"]), 4),
+            "last_match_id": int(s["last_match_id"]),
+            "last_played": s["last_played"],
+            "hero_games": s["hero_games"], "hero_wins": s["hero_wins"],
+            # sweep players have a full record in hand, so their off-hero
+            # baseline is real; orbit rows keep the orbit fill's convention
+            "offhero_games": max(tg - s["hero_games"], 0) if src == "sweep" else 0,
+            "offhero_wins": max(tw - s["hero_wins"], 0) if src == "sweep" else 0,
+            "ambiguous": False, "source": src,
+            "orbit_seeds_met": met if src == "orbit" else "",
+            "orbit2_shared": met if src == "orbit2" else "",
+        })
+        got[(hid, rg)][src] += 1
+        located[(hid, rg)] += 1 if gp else 0
+        added += 1
+
+    def need(hid, rg):
+        return PER_REGION - sum(1 for c in chosen[hid] if c["region"] == rg)
+
+    def playable(aid, hid):
+        s = merged.get((aid, hid))
+        if not s or s["last_match_id"] is None or s["hero_games"] < NEW_HERO_MIN_GAMES:
+            return None
+        return s
+
+    board = {(hid, rg): sum(1 for c in chosen[hid] if c["region"] == rg)
+             for hid in new_heroes for rg in REGIONS}
+
+    # ---- 2 + 3: the sweep, then ring 1 -----------------------------------
     for hid in sorted(new_heroes):
-        lst = chosen[hid]
-        taken = {c["account_id"] for c in lst}
         for rg in REGIONS:
-            board = sum(1 for c in lst if c["region"] == rg)
-            need = PER_REGION - board
-            if need <= 0:
+            if need(hid, rg) <= 0:
                 continue
             sweep = []
             for aid, m in near[rg].items():
-                if aid in taken or (EXCLUSIVITY and home.get(aid, hid) != hid):
+                if aid in taken[hid] or (EXCLUSIVITY and home.get(aid, hid) != hid):
                     continue
-                s = merged.get((aid, hid))
-                if (not s or s["last_match_id"] is None
-                        or s["hero_games"] < NEW_HERO_MIN_GAMES
-                        or totals[aid][0] < NEW_HERO_MIN_ACCOUNT_GAMES):
+                s = playable(aid, hid)
+                if not s or totals[aid][0] < NEW_HERO_MIN_ACCOUNT_GAMES:
                     continue
                 rank = (0, m["pos"]) if m["pos"] else (1, m["lpos"] or 10 ** 9)
                 sweep.append((rank, -s["hero_games"], aid, m, s))
             sweep.sort(key=lambda t: t[:3])
             orbit = []
             for aid, prox in (orbit_members.get(rg) or {}).items():
-                if aid in taken or prox["seeds_met"] < ORBIT_MIN_SEEDS_MET:
+                if aid in taken[hid] or prox["seeds_met"] < ORBIT_MIN_SEEDS_MET:
                     continue
-                s = merged.get((aid, hid))
-                if not s or s["last_match_id"] is None or s["hero_games"] < NEW_HERO_MIN_GAMES:
-                    continue
-                orbit.append((prox["seeds_met"], shrunk(s["hero_wins"], s["hero_games"]),
-                              aid, s))
+                s = playable(aid, hid)
+                if s:
+                    orbit.append((prox["seeds_met"],
+                                  shrunk(s["hero_wins"], s["hero_games"]), aid, s))
             if ORBIT_SORT == "winrate":
                 orbit.sort(key=lambda t: (-t[1], -t[0], t[2]))
             else:
                 orbit.sort(key=lambda t: (-t[0], -t[1], t[2]))
-
-            got = {"sweep": 0, "orbit": 0}
-            located = 0
-            picks = [("sweep", t[2], t[4], t[3], "") for t in sweep] + \
-                    [("orbit", t[2], t[3], None, t[0]) for t in orbit]
-            for src, aid, s, m, met in picks:
-                if got["sweep"] + got["orbit"] >= need:
+            eligible[(hid, rg)] = [len(sweep), len(orbit), 0]
+            for _r, _g, aid, m, s in sweep:
+                if need(hid, rg) <= 0:
                     break
-                if aid in taken:
+                if aid not in taken[hid]:
+                    take(hid, rg, "sweep", aid, s, m)
+            for met, _w, aid, s in orbit:
+                if need(hid, rg) <= 0:
+                    break
+                if aid not in taken[hid]:
+                    take(hid, rg, "orbit", aid, s, None, met)
+
+    # ---- 4: ring 2 — players taken only where a gap is left; measured on
+    # every run while a hero is new (ORBIT2_MEASURE) ------------------------
+    def frac(on, n):
+        return "%.0f%% of %d" % (100.0 * on / n, n) if n else "none"
+
+    for rg in REGIONS:
+        short = sorted(h for h in new_heroes if need(h, rg) > 0) if ORBIT2_FILL else []
+        if not (short or ORBIT2_MEASURE):
+            continue
+        target = short or sorted(new_heroes)
+        if not orbit_seeds.get(rg):
+            print("  [orbit2] %-9s no seeds this run — ring 2 skipped" % rg, file=sys.stderr)
+            continue
+        if not short:
+            print("  [orbit2] %-9s measurement only — %s, nobody is taken"
+                  % (rg, ("%s already full here" % ", ".join(heroes[h] for h in target))
+                     if ORBIT2_FILL else "ORBIT2_FILL=0"), file=sys.stderr)
+        raw = fetch_orbit2(orbit_seeds[rg], target, rg)
+        # the query already leaves out ring 1 and the seeds; this is a guard
+        ring1 = set(orbit_members.get(rg) or {})
+        inner = ring1 | set(orbit_seeds[rg])
+        ring2 = {a: v for a, v in raw.items() if a not in inner}
+        if not ring2:
+            if raw:
+                print("  [orbit2] %-9s every row returned was ring 1 or a seed — "
+                      "nothing to add" % rg, file=sys.stderr)
+            continue
+        # THE MEASUREMENT: how close does ring 2 sit to the leaders? The one
+        # standing measure trusted here is Valve's top-1000 board. Needs no
+        # hero-stats, so it covers every ring-2 player returned.
+        by_n = defaultdict(lambda: [0, 0])
+        by_share = defaultdict(lambda: [0, 0])
+        for a, (n, pl) in ring2.items():
+            on = 1 if a in board_ids[rg] else 0
+            for b in (by_n["1" if n == 1 else "2" if n == 2 else "3-5" if n <= 5 else "6+"],
+                      by_share["<1/3" if 3 * n < pl else "1/3-2/3" if 3 * n < 2 * pl
+                               else "2/3+"]):
+                b[0] += 1
+                b[1] += on
+        r1 = [a for a in ring1 if any((a, h) in merged for h in target)]
+        r1_on = sum(1 for a in r1 if a in board_ids[rg])
+        print("  [orbit2] %-9s %d ring-2 players of %s%s. On the top-1000 board:"
+              % (rg, len(ring2), ", ".join(heroes[h] for h in target),
+                 " (query cap reached)" if len(raw) >= ORBIT2_LIMIT else ""),
+              file=sys.stderr)
+        print("  [orbit2]   by ring-1 matches shared:   %s"
+              % "  |  ".join("%s: %s" % (k, frac(by_n[k][1], by_n[k][0]))
+                             for k in ("1", "2", "3-5", "6+")), file=sys.stderr)
+        print("  [orbit2]   by share of their games:    %s"
+              % "  |  ".join("%s: %s" % (k, frac(by_share[k][1], by_share[k][0]))
+                             for k in ("<1/3", "1/3-2/3", "2/3+")), file=sys.stderr)
+        print("  [orbit2]   ring 1, for comparison:     %s (players of the same hero(es))"
+              % frac(r1_on, len(r1)), file=sys.stderr)
+        if not short:
+            continue
+        # only players who clear the filter can be used, so only they need
+        # hero-stats; closest first
+        usable = sorted((a for a, (n, _p) in ring2.items() if n >= ORBIT2_MIN_SHARED),
+                        key=lambda a: (-orbit2_closeness(*ring2[a]), -ring2[a][0], a)
+                        )[:ORBIT2_STATS_MAX]
+        unknown = set(usable) - {a for (a, _h) in merged}
+        if unknown:
+            merged.update(fetch_hero_stats(unknown))
+        for hid in short:
+            cands = []
+            for aid in usable:
+                if aid in taken[hid]:
                     continue
-                taken.add(aid)
-                gp = m["pos"] if m else None
-                tg, tw = totals[aid] if aid in totals else (0, 0)
-                lst.append({
-                    "hero_id": hid, "region": rg, "ladder_pos": None,
-                    "account_name": (m or {}).get("name", ""), "badge_level": None,
-                    "global_pos": gp, "located_on_general": "YES" if gp else "",
-                    "valve_top_hero": "",
-                    "id_confirmed": "YES" if (m or {}).get("confirmed") else "",
-                    "account_id": aid, "mmr": None,
-                    "ranked_rating": round(shrunk(s["hero_wins"], s["hero_games"]), 4),
-                    "last_match_id": int(s["last_match_id"]),
-                    "last_played": s["last_played"],
-                    "hero_games": s["hero_games"], "hero_wins": s["hero_wins"],
-                    # sweep players have a full record in hand, so their
-                    # off-hero baseline is real; orbit rows keep the orbit
-                    # fill's convention of none
-                    "offhero_games": max(tg - s["hero_games"], 0) if src == "sweep" else 0,
-                    "offhero_wins": max(tw - s["hero_wins"], 0) if src == "sweep" else 0,
-                    "ambiguous": False, "source": src, "orbit_seeds_met": met,
-                })
-                got[src] += 1
-                located += 1 if gp else 0
-                added += 1
+                s = playable(aid, hid)
+                if s:
+                    n, pl = ring2[aid]
+                    cands.append((-orbit2_closeness(n, pl), -n,
+                                  -shrunk(s["hero_wins"], s["hero_games"]), aid, s, n, pl))
+            cands.sort(key=lambda t: t[:4])
+            eligible.setdefault((hid, rg), [0, 0, 0])[2] = len(cands)
+            picked = []
+            for _c, _n, _w, aid, s, n, pl in cands:
+                if need(hid, rg) <= 0:
+                    break
+                take(hid, rg, "orbit2", aid, s, None, "%d/%d" % (n, pl))
+                picked.append("%d/%d" % (n, pl))
+            if picked:
+                print("  [orbit2] %-9s %s: took %d of %d eligible; ring-1 lobbies / games "
+                      "played: %s" % (rg, heroes[hid], len(picked), len(cands),
+                                      " ".join(picked[:20])), file=sys.stderr)
+
+    for hid in sorted(new_heroes):
+        for rg in REGIONS:
+            g = got[(hid, rg)]
+            e = eligible.get((hid, rg), [0, 0, 0])
+            have = PER_REGION - need(hid, rg)
             print("  [new] %-14s %-9s %d board + %d sweep (%d on the general board) "
-                  "+ %d orbit = %d/%d   [bar %d games; %d sweep / %d orbit eligible]"
-                  % (heroes[hid][:14], rg, board, got["sweep"], located, got["orbit"],
-                     board + got["sweep"] + got["orbit"], PER_REGION,
-                     NEW_HERO_MIN_GAMES, len(sweep), len(orbit)), file=sys.stderr)
+                  "+ %d orbit + %d ring 2 = %d/%d   [bar %d games; eligible %d sweep, "
+                  "%d orbit, %d ring 2]"
+                  % (heroes[hid][:14], rg, board[(hid, rg)], g["sweep"],
+                     located[(hid, rg)], g["orbit"], g["orbit2"], have, PER_REGION,
+                     NEW_HERO_MIN_GAMES, e[0], e[1], e[2]), file=sys.stderr)
     return added
 
 
@@ -1466,7 +1705,7 @@ def main():
     # actually play that hero. Board members are never displaced: the orbit
     # only ever appends to a pool that came up short.
     orbit_added = 0
-    orbit_members, orbit_stats = {}, {}
+    orbit_members, orbit_stats, orbit_seeds = {}, {}, {}
     if ORBIT_FILL:
         short = defaultdict(list)
         # EVERY released hero, not just the ones already in `chosen`. Looping
@@ -1496,6 +1735,7 @@ def main():
             seeds = [c["account_id"] for lst in chosen.values() for c in lst
                      if c["region"] == rg]
             seeds = sorted(set(seeds))[:ORBIT_SEEDS]
+            orbit_seeds[rg] = seeds        # ring 2 starts from the same seeds
             members = fetch_orbit1(seeds)
             if not members:
                 continue
@@ -1551,7 +1791,7 @@ def main():
     new_added = 0
     if new_heroes:
         new_added = new_hero_fill(new_heroes, heroes, ladder, general, stats, chosen,
-                                  orbit_members, orbit_stats, home)
+                                  orbit_members, orbit_stats, home, orbit_seeds)
         print("  [new] added %d builds across %d new hero(es)"
               % (new_added, len(new_heroes)), file=sys.stderr)
 
@@ -1973,6 +2213,7 @@ def main():
             "players": len(lst),
             "orbit_players": sum(1 for c in lst if c.get("source") == "orbit"),
             "sweep_players": sum(1 for c in lst if c.get("source") == "sweep"),
+            "orbit2_players": sum(1 for c in lst if c.get("source") == "orbit2"),
             "builds_sampled": builds.get(hid, 0),
             "in_tierlist": "YES" if hid in in_tier else "",
             # carried into docs/data.json by build_site_data.py, which is
@@ -1983,7 +2224,7 @@ def main():
     write("roster.csv", roster,
           ["hero_id", "hero", "class_name", "hero_type", "development_state",
            "icon_url", "board_entries", "players", "orbit_players", "sweep_players",
-           "builds_sampled", "in_tierlist", "first_seen", "new"])
+           "orbit2_players", "builds_sampled", "in_tierlist", "first_seen", "new"])
     missing = [r for r in roster if not r["in_tierlist"]]
     if missing:
         print("  [roster] %d released hero(es) produced no pool this run and will "
@@ -2009,9 +2250,11 @@ def main():
            "offhero_games", "offhero_wins",
            "last_match_id", "last_played", "ambiguous",
            # blank for board-sourced rows; "sweep" for a new hero's top-ladder
-           # fill (new_hero_fill); "orbit" plus the breadth of contact
+           # fill (new_hero_fill); "orbit2" plus "shared/played" (ring-1
+           # matches / all matches in the window) for its ring-2 tier; "orbit"
+           # plus the breadth of contact
            # for anyone the orbit fill supplied
-           "source", "orbit_seeds_met"])
+           "source", "orbit_seeds_met", "orbit2_shared"])
     if POOL_NET_WINS:
         write("pool_audit.csv",
               sorted(pool_low, key=lambda r: (r["net_wins"], r["hero"])),
