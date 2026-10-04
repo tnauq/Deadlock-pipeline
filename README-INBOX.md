@@ -1,81 +1,59 @@
-# Inbox drop: orbit seeds — active, strongest, twice as many (2026-10-04)
+# Inbox drop: icon refresh (2026-10-04)
 
-    deadlock_pipeline.py   MODIFIED - seeds: the 24 strongest board players who played in the last 3 days
-    ceiling_rank.py        MODIFIED - the same rule for its orbit fallback
+    fetch_icons.py   MODIFIED - downloads every icon each run and replaces site copies whose art changed
 
-Before editing, I checked both files against live main (89c8ffa): their blob
-hashes matched the versions these edits started from.
+Before editing, I checked it against live main (a448478): its blob hash
+matched the drop-1 version this edit started from. No workflow file changes.
 
-## What the seeds were
+## Why the site kept the old art
 
-The seeds were recomputed every run, but as the **12 lowest Steam account
-ids** among that run's board players: `sorted(set(ids))[:12]`. Both scripts
-have done this since the orbit landed on 2026-08-07.
+- **The filename never changes.** Icons are saved as
+  `docs/icons/<sha1 of the URL>.png`. When Valve redraws an item, the asset
+  bucket keeps the same URL (`.../items/weapon/melee_charge.png`), so the file
+  keeps the same name.
+- **Nothing ever overwrote the old file.** `fetch_icons.py` skipped icons
+  already on disk, and the workflow copies with `cp -n`, which never
+  overwrites. 196 of the 197 files in `docs/icons` were committed on
+  2026-09-02, plus Rat King's card on 2026-10-03, and none has ever been
+  updated.
+- **The page loads that file first.** It uses `docs/icons` before the bucket,
+  so the stale copy always wins. That covers item icons (160) and hero cards
+  (39).
+- **Ability icons were never affected.** They load straight from the bucket.
 
-- **Lowest id means oldest account.** The oldest accounts on the boards barely
-  change, so the same dozen stayed the seeds for weeks, whether or not they
-  still played.
-- **`ceiling_rank.py` never got its intended order.** It orders its seeds by
-  board position ("seed from the strongest board positions"), but the sort
-  inside its `fetch_orbit1` threw that order away.
-- **The tested "received order" is a different list.** In PROBES.md,
-  best-match-first is about each leaderboard entry's `possible_account_ids`.
-  That one is still kept exactly as received.
+## Now
 
-## What they are now
+- **Every referenced icon is downloaded every run,** about 200 small files. In
+  CI `./icons/` starts empty, so that was already happening; there's no new
+  cost.
+- **A site copy whose bytes differ is replaced.** Only a complete image can
+  replace one: it must have a PNG, WebP or JPEG signature, and a PNG must end
+  in IEND. An error page, a failed download or a cut-off transfer leaves the
+  old copy in place.
+- **New art is published by the existing commit step,** which already adds
+  `docs/icons`. The `cp -n` line in the workflow now has nothing left to do.
 
-- **The strongest board players in the region.**
-  - The pipeline goes by general-board position, id-confirmed accounts first.
-  - The ceiling uses its dual-confirmed players by board position, as its
-    comment always intended.
-- **Only players who played in the last 3 days.** The check runs inside the
-  same query: it's sent the top 72 candidates, and the first 24 with at least
-  one match become seeds. No extra SQL.
-- **24 seeds instead of 12.** `ORBIT_SEEDS` sets the count and
-  `ORBIT_SEED_OVERFETCH=3` sets how many candidates are checked.
-
-## Check them in the log
-
-These lines appear in both the Run pipeline step and the Ceiling ranking step:
+## In the log (the "Fetch any new icons" step)
 
 ```
-[orbit] NAmerica seeds: 24 active of the first 27 candidates (3 with no match in the last 3 days, skipped); matches per seed: min 2, median 14, max 39
-[orbit] 251 matches, 1874 players; seeds met: {1: ..., 2: ..., ...}
-[orbit] NAmerica  seeds' general-board positions: 1-12, 14-20, 22-26
+[icons] 199 fetched, 0 failed, 0 not an image; site copies: 0 new, 41 updated (art changed upstream), 158 unchanged
+  [icons] updated: melee_charge.png, close_quarters.png, ...
 ```
 
-(Numbers illustrative.) "Skipped" counts strong players with no match in the
-window, the kind the old rule kept using.
-
-## What changes on the site
-
-- **Thin established heroes** (hero-regions the boards can't fill to 20) take
-  their orbit builds from a bigger, current ring 1. Expect those builds, and
-  the pooled win rate shown with them, to shift. Board players and the tier
-  order don't change.
-- **New heroes:** ring 1 gets bigger, so ring 2 should be needed even less.
-- **Ceiling:** only its orbit fallback uses seeds, so a ceiling backed by the
-  boards can't move.
-
-## Cost
-
-- **SQL:** still one call per region in each script.
-- **Per-hero stats:** about twice as many ring-1 players means about twice the
-  free calls for them. The pipeline fetches them once; the ceiling fetches
-  them twice, for the career and the 30-day window. Expect roughly a minute
-  more per run.
+(Numbers illustrative.) If "updated" is 0, the asset bucket hasn't
+re-exported the new art yet, and the first run after it does will pick it up.
+Browsers can hold an old image for about 10 minutes (GitHub Pages caching), so
+a reload after that shows the new art.
 
 ## Verified
 
-- **Unit test, both scripts:**
-  - candidates are sent in the given order;
-  - inactive candidates are skipped;
-  - a match containing only a passed-over candidate is dropped;
-  - a passed-over candidate who met seeds is still kept as a member;
-  - the case where nobody is active.
-- **Mock runs:**
-  - Inactive top players are skipped, and the positions are logged.
-  - With every seed active, the outputs are byte-identical to drop 3, and so
-    is the ceiling. The mock's lobbies are symmetric, so only real data will
-    show the new picks.
+- **All 197 current icons pass the completeness check,** so nothing that works
+  today would be refused.
+- **Simulated run:**
+  - New art at an unchanged URL replaced the site copy, and git shows the file
+    modified, ready to commit.
+  - Identical art was left untouched.
+  - An HTML error page and a failed download each kept the old copy.
+  - A new item's icon was added.
+  - A truncated PNG was not added.
 - **Inbox:** the drop was unpacked against a fresh clone of main.
