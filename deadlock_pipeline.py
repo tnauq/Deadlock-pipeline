@@ -176,7 +176,8 @@ SQL_429_WAIT_S = _env("SQL_429_WAIT_S", 65)
 # come straight from match_player, so identity is exact rather than resolved
 # from a display name.
 #
-# Measured 2026-08-08 (NAmerica, 3-day window, 12 seeds): orbit 1 is 949
+# Measured 2026-08-08 (NAmerica, 3-day window, 12 seeds — the 12 lowest
+# account ids, see ORBIT_SEEDS): orbit 1 is 949
 # players with median win rate 0.530 and p90 0.629, against the seeds' 0.568
 # and 0.634. Orbit 2 sits at the population mean (0.504); it is used only as
 # the last tier for NEW heroes, filtered and measured (see ORBIT2_* below).
@@ -187,7 +188,26 @@ SQL_429_WAIT_S = _env("SQL_429_WAIT_S", 65)
 # hero-region. Orbit players are appended AFTER board members, so a full pool
 # never changes.
 ORBIT_FILL = _env("ORBIT_FILL", 1)
-ORBIT_SEEDS = _env("ORBIT_SEEDS", 12)
+# SEEDS (2026-10-04). Until now the seeds were the 12 LOWEST ACCOUNT IDS among
+# this run's board players — sorted(set(ids))[:12] — which is the dozen OLDEST
+# Steam accounts on the boards, not the strongest and not necessarily active.
+# They were recomputed every run, but the oldest accounts on the boards barely
+# change, so in practice the same dozen seeded the orbit for weeks whether or
+# not they still played. That sort has been there since the orbit landed on
+# 2026-08-07 (ceiling_rank.py's caller ordered its seeds by board position and
+# the same sort inside its fetch_orbit1 threw the order away). The
+# best-match-first order in PROBES.md is a different list — each leaderboard
+# entry's possible_account_ids — and is still kept as received.
+#
+# Now: the ORBIT_SEEDS strongest board players in the region — by general-board
+# position, id-confirmed accounts first — who actually played in the
+# ORBIT_DAYS window. Activity costs nothing extra: the orbit query is sent the
+# first ORBIT_SEEDS x ORBIT_SEED_OVERFETCH candidates and any candidate with no
+# match in the window is skipped. Still one SQL call per region; the longer IN
+# list (~10 chars an id) is nowhere near MAX_URL. The `[orbit] seeds:` lines
+# print how many candidates were active and the seeds' board positions.
+ORBIT_SEEDS = _env("ORBIT_SEEDS", 24)
+ORBIT_SEED_OVERFETCH = _env("ORBIT_SEED_OVERFETCH", 3)
 ORBIT_DAYS = _env("ORBIT_DAYS", 3)
 ORBIT_MIN_HERO_GAMES = _env("ORBIT_MIN_HERO_GAMES", 5)
 ORBIT_MIN_SEEDS_MET = _env("ORBIT_MIN_SEEDS_MET", 1)
@@ -196,10 +216,10 @@ ORBIT_MIN_SEEDS_MET = _env("ORBIT_MIN_SEEDS_MET", 1)
 #   "winrate"  the reverse
 # Breadth measures STANDING — meeting several different top players in a
 # 3-day window is hard to do by accident — while hero win rate measures being
-# good AT THE HERO, which is not the same thing. Breadth is only a 1-3 valued
-# signal though, so if almost everyone sits at 1 the two orderings differ only
-# for the few who met 2+. The `[orbit] seeds met:` line prints the
-# distribution; if it is overwhelmingly {1: ...} this choice barely matters.
+# good AT THE HERO, which is not the same thing. With 12 seeds breadth was a
+# 1-3 valued signal for most players; with 24 active ones it has more room.
+# The `[orbit] seeds met:` line prints the distribution; if it is
+# overwhelmingly {1: ...} this choice barely matters.
 ORBIT_SORT = os.environ.get("ORBIT_SORT", "breadth")
 
 # ---- new-hero fallback (2026-10-03) ---------------------------------------
@@ -860,54 +880,98 @@ WHERE match_id IN (
 """
 
 
-def fetch_orbit1(seed_ids):
+def _ranges(nums):
+    """[1, 2, 3, 5, 9, 10] -> "1-3, 5, 9-10" (for log lines)."""
+    out, run = [], []
+    for n in sorted(set(nums)):
+        if run and n == run[-1] + 1:
+            run.append(n)
+            continue
+        if run:
+            out.append("%d-%d" % (run[0], run[-1]) if len(run) > 1 else "%d" % run[0])
+        run = [n]
+    if run:
+        out.append("%d-%d" % (run[0], run[-1]) if len(run) > 1 else "%d" % run[0])
+    return ", ".join(out)
+
+
+def fetch_orbit1(candidates, label=""):
     """
-    account_id -> {"seeds_met": n, "shared": n} for everyone who shared a
-    ranked match with a seed. ONE SQL call.
+    (members, seeds). members: account_id -> {"seeds_met": n, "shared": n} for
+    everyone who shared a match with a seed; seeds: the accounts used. ONE SQL
+    call.
+
+    `candidates` is in order of preference, strongest first. The query is sent
+    the first ORBIT_SEEDS x ORBIT_SEED_OVERFETCH of them, and the seeds are the
+    first ORBIT_SEEDS that played at least one match in the window. Matches
+    with no seed in them are dropped, so a candidate passed over never widens
+    the orbit — though one who shared a match with a seed is a member like
+    anyone else.
 
     Proximity is DISTINCT SEEDS met, not raw shared matches: a duo partner
     queuing with one seed all evening racks up matches without being of
     comparable standing, whereas meeting several different top players is hard
     to do by accident.
     """
-    seeds = sorted(set(int(a) for a in seed_ids if a))[:ORBIT_SEEDS]
-    if not seeds:
-        return {}
+    order = list(dict.fromkeys(int(a) for a in candidates if a))
+    pool = order[:ORBIT_SEEDS * max(1, ORBIT_SEED_OVERFETCH)]
+    if not pool:
+        return {}, []
     mode_sql = "match_mode = '%s' AND " % MATCH_MODE if MATCH_MODE else ""
-    q = Q_ORBIT.format(ids=",".join(str(a) for a in seeds),
+    q = Q_ORBIT.format(ids=",".join(str(a) for a in pool),
                        mode=mode_sql, days=ORBIT_DAYS)
-    if len(sql_url(q)) > MAX_URL:
-        seeds = seeds[:max(4, len(seeds) // 2)]
-        q = Q_ORBIT.format(ids=",".join(str(a) for a in seeds),
+    while len(sql_url(q)) > MAX_URL and len(pool) > ORBIT_SEEDS:
+        pool = pool[:max(ORBIT_SEEDS, len(pool) * 2 // 3)]
+        q = Q_ORBIT.format(ids=",".join(str(a) for a in pool),
                            mode=mode_sql, days=ORBIT_DAYS)
     try:
-        rows = sql(q, "orbit1 from %d seeds" % len(seeds))
+        rows = sql(q, "orbit1 %s from %d seed candidates" % (label, len(pool)))
     except SystemExit:
         raise
     except Exception as e:
         print("  [orbit] failed (%s) — continuing without the fill" % e,
               file=sys.stderr)
-        return {}
+        return {}, []
     by_match = defaultdict(set)
     for r in rows:
         by_match[int(r["match_id"])].add(int(r["account_id"]))
+    poolset = set(pool)
+    played = Counter()
+    for accts in by_match.values():
+        for a in accts & poolset:
+            played[a] += 1
+    seeds = [a for a in pool if played[a]][:ORBIT_SEEDS]
+    if not seeds:
+        print("  [orbit] %s seeds: none of the first %d candidates played in the "
+              "last %d days — no orbit this run" % (label, len(pool), ORBIT_DAYS),
+              file=sys.stderr)
+        return {}, []
     seedset = set(seeds)
     acc = defaultdict(lambda: {"seeds_met": set(), "shared": 0})
+    n_matches = 0
     for accts in by_match.values():
         met = accts & seedset
         if not met:
             continue
+        n_matches += 1
         for a in accts - seedset:
             acc[a]["seeds_met"] |= met
             acc[a]["shared"] += 1
     out = {a: {"seeds_met": len(v["seeds_met"]), "shared": v["shared"]}
            for a, v in acc.items()}
+    looked = pool.index(seeds[-1]) + 1
+    per = sorted(played[a] for a in seeds)
+    print("  [orbit] %s seeds: %d active of the first %d candidates (%d with no "
+          "match in the last %d days, skipped); matches per seed: min %d, "
+          "median %d, max %d"
+          % (label, len(seeds), looked, looked - len(seeds), ORBIT_DAYS,
+             per[0], per[len(per) // 2], per[-1]), file=sys.stderr)
     if out:
         breadth = Counter(v["seeds_met"] for v in out.values())
         print("  [orbit] %d matches, %d players; seeds met: %s"
-              % (len(by_match), len(out), dict(sorted(breadth.items()))),
+              % (n_matches, len(out), dict(sorted(breadth.items()))),
               file=sys.stderr)
-    return out
+    return out, seeds
 
 
 # Ring 2, computed server-side from the seeds so the URL stays a few hundred
@@ -961,7 +1025,7 @@ def fetch_orbit2(seed_ids, hero_ids, label=""):
     so a refusal (the restricted SQL user may time out on a two-hop join)
     costs only ring 2, not the run.
     """
-    seeds = sorted(set(int(a) for a in seed_ids if a))[:ORBIT_SEEDS]
+    seeds = list(dict.fromkeys(int(a) for a in seed_ids if a))[:ORBIT_SEEDS]
     if not seeds or not hero_ids:
         return {}
     mode_sql = "match_mode = '%s' AND " % MATCH_MODE if MATCH_MODE else ""
@@ -1732,11 +1796,30 @@ def main():
                         short[rg].append((hid, PER_REGION - len(have)))
         for rg in sorted(set(short) | new_short):
             gaps = short.get(rg, [])
-            seeds = [c["account_id"] for lst in chosen.values() for c in lst
-                     if c["region"] == rg]
-            seeds = sorted(set(seeds))[:ORBIT_SEEDS]
+            # seed candidates: this region's board players, strongest first —
+            # id-confirmed accounts by general-board position, then the other
+            # general-board accounts, then hero-board-only ones by their best
+            # ladder position (see ORBIT_SEEDS)
+            standing = {}
+            for lst in chosen.values():
+                for c in lst:
+                    if c["region"] != rg or c.get("source"):
+                        continue
+                    gp, lp = c.get("global_pos"), c.get("ladder_pos")
+                    key = ((0 if c.get("id_confirmed") == "YES" else 1, gp) if gp
+                           else (2, lp if lp is not None else 10 ** 9))
+                    a = c["account_id"]
+                    if a not in standing or key < standing[a]:
+                        standing[a] = key
+            members, seeds = fetch_orbit1(sorted(standing, key=lambda a: (standing[a], a)),
+                                          rg)
             orbit_seeds[rg] = seeds        # ring 2 starts from the same seeds
-            members = fetch_orbit1(seeds)
+            if seeds:
+                on_gen = [standing[a][1] for a in seeds if standing[a][0] < 2]
+                print("  [orbit] %-9s seeds' general-board positions: %s%s"
+                      % (rg, _ranges(on_gen) or "none",
+                         " (+%d off the general board)" % (len(seeds) - len(on_gen))
+                         if len(seeds) > len(on_gen) else ""), file=sys.stderr)
             if not members:
                 continue
             # hero-stats for the orbit members, so their hero record and most

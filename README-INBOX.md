@@ -1,95 +1,81 @@
-# Inbox drop: ring 2 of the orbit for new heroes (2026-10-03, third drop)
+# Inbox drop: orbit seeds — active, strongest, twice as many (2026-10-04)
 
-    deadlock_pipeline.py   MODIFIED - ring 2 as the last new-hero tier, and its measurement
-    orbit_audit.py         MODIFIED - counts ring-2 builds separately (orbit2_builds)
-    docs/index.html        MODIFIED - the NEW note and footer mention lobby-mates
+    deadlock_pipeline.py   MODIFIED - seeds: the 24 strongest board players who played in the last 3 days
+    ceiling_rank.py        MODIFIED - the same rule for its orbit fallback
 
-Before editing, I checked all three against live main (fa48c98): their blob
-hashes matched the drop-2 versions these edits started from.
-`build_site_data.py` is unchanged.
+Before editing, I checked both files against live main (89c8ffa): their blob
+hashes matched the versions these edits started from.
 
-## What ring 2 is
+## What the seeds were
 
-Players who shared a match with ring-1 (orbit) players in the same 3-day
-window, starting from the same 12 seeds. The seeds and their order are
-unchanged.
+The seeds were recomputed every run, but as the **12 lowest Steam account
+ids** among that run's board players: `sorted(set(ids))[:12]`. Both scripts
+have done this since the orbit landed on 2026-08-07.
 
-## Rules
+- **Lowest id means oldest account.** The oldest accounts on the boards barely
+  change, so the same dozen stayed the seeds for weeks, whether or not they
+  still played.
+- **`ceiling_rank.py` never got its intended order.** It orders its seeds by
+  board position ("seed from the strongest board positions"), but the sort
+  inside its `fetch_orbit1` threw that order away.
+- **The tested "received order" is a different list.** In PROBES.md,
+  best-match-first is about each leaderboard entry's `possible_account_ids`.
+  That one is still kept exactly as received.
 
-- **New heroes only, last tier.** The order is: the hero's own board, then the
-  sweep, then ring 1, then ring 2. Ring-2 players are taken only where a gap
-  is still left. Established heroes are untouched.
-- **Filter:** at least 2 ring-1 matches in the window (`ORBIT2_MIN_SHARED`).
-- **Order:** by the share of the player's own games in the window that were
-  ring-1 lobbies, not the raw count. A raw count rewards volume: 4 of 30 games
-  would beat 4 of 4. Two phantom games outside the band (`ORBIT2_SHARE_K`) keep
-  2 of 2 (0.50) from beating 18 of 20 (0.82). Ties go to the raw count, then
-  the win rate on the hero.
-- Same as the other tiers: 3 games on the hero, one build per player, and a
-  player is never used for the same hero in both regions.
+## What they are now
 
-## The measurement
+- **The strongest board players in the region.**
+  - The pipeline goes by general-board position, id-confirmed accounts first.
+  - The ceiling uses its dual-confirmed players by board position, as its
+    comment always intended.
+- **Only players who played in the last 3 days.** The check runs inside the
+  same query: it's sent the top 72 candidates, and the first 24 with at least
+  one match become seeds. No extra SQL.
+- **24 seeds instead of 12.** `ORBIT_SEEDS` sets the count and
+  `ORBIT_SEED_OVERFETCH=3` sets how many candidates are checked.
 
-While a hero is NEW, every run queries ring 2 and prints this, even when
-nothing is short (in that case nobody is taken):
+## Check them in the log
+
+These lines appear in both the Run pipeline step and the Ceiling ranking step:
 
 ```
-[orbit2] NAmerica  N ring-2 players of Rat King. On the top-1000 board:
-[orbit2]   by ring-1 matches shared:   1: x% of n  |  2: ...  |  3-5: ...  |  6+: ...
-[orbit2]   by share of their games:    <1/3: ...  |  1/3-2/3: ...  |  2/3+: ...
-[orbit2]   ring 1, for comparison:     y% of m (players of the same hero(es))
+[orbit] NAmerica seeds: 24 active of the first 27 candidates (3 with no match in the last 3 days, skipped); matches per seed: min 2, median 14, max 39
+[orbit] 251 matches, 1874 players; seeds met: {1: ..., 2: ..., ...}
+[orbit] NAmerica  seeds' general-board positions: 1-12, 14-20, 22-26
 ```
 
-If being in the leaders' lobbies tracks standing, the percentages climb from
-left to right. A bucket close to the ring-1 figure is about as near the top
-as the leaders' own lobby-mates. When ring 2 does fill a gap, a further line
-lists each pick as ring-1 lobbies / games played.
+(Numbers illustrative.) "Skipped" counts strong players with no match in the
+window, the kind the old rule kept using.
+
+## What changes on the site
+
+- **Thin established heroes** (hero-regions the boards can't fill to 20) take
+  their orbit builds from a bigger, current ring 1. Expect those builds, and
+  the pooled win rate shown with them, to shift. Board players and the tier
+  order don't change.
+- **New heroes:** ring 1 gets bigger, so ring 2 should be needed even less.
+- **Ceiling:** only its orbit fallback uses seeds, so a ceiling backed by the
+  boards can't move.
 
 ## Cost
 
-- **SQL:** one call per region per run while a hero is new. With the API key,
-  the 20/hr IP cap doesn't apply (deadlock-api drops IP quotas for keyed
-  requests); the key's limit is 10/min. The 40 s SQL pause adds about 80 s per
-  run.
-- **Per-hero stats:** only when there's a gap, and only for the 1,000 closest
-  players who pass the filter.
-- **Non-fatal:** if the query fails, the run says so and carries on without
-  ring 2.
-
-## Switches (env)
-
-- `ORBIT2_FILL=0`: never take ring-2 players.
-- `ORBIT2_MEASURE=0`: skip the measurement-only query.
-- `ORBIT2_MIN_SHARED` and `ORBIT2_SHARE_K` tune the filter and the order.
-
-## Rat King right now
-
-The 17:07 and 19:03 UTC runs on drop 2 filled him 20/20 in both regions from
-the sweep and ring 1. Ring 2 will only measure him. It's there for the next
-releases: five heroes landing together would split the same top players five
-ways.
+- **SQL:** still one call per region in each script.
+- **Per-hero stats:** about twice as many ring-1 players means about twice the
+  free calls for them. The pipeline fetches them once; the ceiling fetches
+  them twice, for the career and the 30-day window. Expect roughly a minute
+  more per run.
 
 ## Verified
 
-- **The query ran on a real ClickHouse engine** (24.8, local) over synthetic
-  `match_player` data shaped like deadlock-api's table: ReplacingMergeTree,
-  duplicate rows, and both match modes. Every row and its order matched a
-  reference computation.
-  - It passes deadlock-api's own query checks.
-  - The URL is about 2 KB.
-- **Mock pipeline runs:**
-  - A gap fills closest-first: 4/4 and 3/3 come ahead of the grinders at 6/40
-    and 3/30.
-  - Ring-1 rows that leak into the result are dropped.
-  - A failed query doesn't stop the run.
-  - Both switches work.
-- **Established heroes:** identical to drop 2. When ring 2 isn't needed,
-  Rat King's pool is identical too.
-
-## Heads-up, not acted on
-
-deadlock-api now marks `/v1/sql` as **deprecated**: "Direct SQL access will
-be removed". It points to an hourly-exported public data lake at
-data.deadlock-api.com (DuckDB / DuckLake, or an MCP server at `/v1/mcp`). No
-removal date is published. Every SQL call in this pipeline (orbit, items,
-pool wins, ring 2) will eventually need to move there.
+- **Unit test, both scripts:**
+  - candidates are sent in the given order;
+  - inactive candidates are skipped;
+  - a match containing only a passed-over candidate is dropped;
+  - a passed-over candidate who met seeds is still kept as a member;
+  - the case where nobody is active.
+- **Mock runs:**
+  - Inactive top players are skipped, and the positions are logged.
+  - With every seed active, the outputs are byte-identical to drop 3, and so
+    is the ceiling. The mock's lobbies are symmetric, so only real data will
+    show the new picks.
+- **Inbox:** the drop was unpacked against a fresh clone of main.

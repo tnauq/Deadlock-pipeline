@@ -308,7 +308,8 @@ ALLOW_HERO_BOARD_ONLY = os.environ.get("ALLOW_HERO_BOARD_ONLY", "1") == "1"
 # who shared a ranked match with a ceiling player, taken straight from
 # match_player, so identity is exact: no possible_account_ids, no name matching.
 #
-# Measured 2026-08-08 (NAmerica, 3-day window, 12 seeds):
+# Measured 2026-08-08 (NAmerica, 3-day window, 12 seeds — then the 12 lowest
+# account ids, see ORBIT_SEEDS):
 #     orbit 0    12 accounts   median winrate 0.568   p90 0.634
 #     orbit 1   949            median 0.530           p90 0.629
 #     orbit 2  6,879           median 0.504           p90 0.607
@@ -322,7 +323,15 @@ ALLOW_HERO_BOARD_ONLY = os.environ.get("ALLOW_HERO_BOARD_ONLY", "1") == "1"
 # players is hard to do by accident.
 ORBIT_FALLBACK = os.environ.get("ORBIT_FALLBACK", "1") == "1"
 ORBIT_MIN_CANDIDATES = int(os.environ.get("ORBIT_MIN_CANDIDATES") or 8)
-ORBIT_SEEDS = int(os.environ.get("ORBIT_SEEDS") or 12)
+# SEEDS (2026-10-04): the caller below orders seeds by board position, but
+# fetch_orbit1 used to re-sort them by account id and keep the 12 lowest —
+# the dozen oldest Steam accounts among the confirmed players, active or not.
+# Now it keeps the caller's order and takes the first ORBIT_SEEDS candidates
+# that played in the ORBIT_DAYS window, checking the first
+# ORBIT_SEEDS x ORBIT_SEED_OVERFETCH in the same single query. Same rule as
+# deadlock_pipeline.py, which documents it in full.
+ORBIT_SEEDS = int(os.environ.get("ORBIT_SEEDS") or 24)
+ORBIT_SEED_OVERFETCH = int(os.environ.get("ORBIT_SEED_OVERFETCH") or 3)
 ORBIT_DAYS = int(os.environ.get("ORBIT_DAYS") or 3)
 ORBIT_MIN_SEEDS_MET = int(os.environ.get("ORBIT_MIN_SEEDS_MET") or 1)
 ORBIT_MIN_GAMES = int(os.environ.get("ORBIT_MIN_GAMES") or 10)
@@ -832,43 +841,85 @@ def sql(query, label=""):
     return rows
 
 
-def fetch_orbit1(seed_ids):
+def _ranges(nums):
+    """[1, 2, 3, 5, 9, 10] -> "1-3, 5, 9-10" (for log lines)."""
+    out, run = [], []
+    for n in sorted(set(nums)):
+        if run and n == run[-1] + 1:
+            run.append(n)
+            continue
+        if run:
+            out.append("%d-%d" % (run[0], run[-1]) if len(run) > 1 else "%d" % run[0])
+        run = [n]
+    if run:
+        out.append("%d-%d" % (run[0], run[-1]) if len(run) > 1 else "%d" % run[0])
+    return ", ".join(out)
+
+
+def fetch_orbit1(candidates, label=""):
     """
-    account_id -> {"seeds_met": n, "shared": n} for everyone who shared a
-    ranked match with a seed. ONE SQL call for a dozen seeds.
+    (members, seeds). members: account_id -> {"seeds_met": n, "shared": n}
+    for everyone who shared a ranked match with a seed; seeds: the accounts
+    used. ONE SQL call.
+
+    `candidates` is in order of preference, strongest first. The query is sent
+    the first ORBIT_SEEDS x ORBIT_SEED_OVERFETCH and the seeds are the first
+    ORBIT_SEEDS of them that played in the window; matches with no seed in
+    them are dropped.
     """
-    seeds = sorted(set(int(a) for a in seed_ids if a))[:ORBIT_SEEDS]
-    if not seeds:
-        return {}
+    order = list(dict.fromkeys(int(a) for a in candidates if a))
+    pool = order[:ORBIT_SEEDS * max(1, ORBIT_SEED_OVERFETCH)]
+    if not pool:
+        return {}, []
     try:
         mode_sql = "match_mode = '%s' AND " % MATCH_MODE if MATCH_MODE else ""
-        rows = sql(Q_ORBIT.format(ids=",".join(str(a) for a in seeds),
+        rows = sql(Q_ORBIT.format(ids=",".join(str(a) for a in pool),
                                   mode=mode_sql, days=ORBIT_DAYS),
-                   "orbit1 from %d seeds" % len(seeds))
+                   "orbit1 %s from %d seed candidates" % (label, len(pool)))
     except Exception as e:
         print("  [orbit] failed (%s) — continuing without the fallback" % e,
               file=sys.stderr)
-        return {}
+        return {}, []
     by_match = defaultdict(set)
     for r in rows:
         by_match[int(r["match_id"])].add(int(r["account_id"]))
+    poolset = set(pool)
+    played = Counter()
+    for accts in by_match.values():
+        for a in accts & poolset:
+            played[a] += 1
+    seeds = [a for a in pool if played[a]][:ORBIT_SEEDS]
+    if not seeds:
+        print("  [orbit] %s seeds: none of the first %d candidates played in the "
+              "last %d days — no fallback this run" % (label, len(pool), ORBIT_DAYS),
+              file=sys.stderr)
+        return {}, []
     seedset = set(seeds)
     out = defaultdict(lambda: {"seeds_met": set(), "shared": 0})
+    n_matches = 0
     for _mid, accts in by_match.items():
         met = accts & seedset
         if not met:
             continue
+        n_matches += 1
         for a in accts - seedset:
             out[a]["seeds_met"] |= met
             out[a]["shared"] += 1
     final = {a: {"seeds_met": len(v["seeds_met"]), "shared": v["shared"]}
              for a, v in out.items()}
+    looked = pool.index(seeds[-1]) + 1
+    per = sorted(played[a] for a in seeds)
+    print("  [orbit] %s seeds: %d active of the first %d candidates (%d with no "
+          "match in the last %d days, skipped); matches per seed: min %d, "
+          "median %d, max %d"
+          % (label, len(seeds), looked, looked - len(seeds), ORBIT_DAYS,
+             per[0], per[len(per) // 2], per[-1]), file=sys.stderr)
     if final:
         breadth = Counter(v["seeds_met"] for v in final.values())
         print("  [orbit] %d matches, %d players; seeds met: %s"
-              % (len(by_match), len(final), dict(sorted(breadth.items()))),
+              % (n_matches, len(final), dict(sorted(breadth.items()))),
               file=sys.stderr)
-    return final
+    return final, seeds
 
 
 NO_BOARD_POS = 10 ** 9      # the sentinel an orbit candidate carries
@@ -1057,12 +1108,17 @@ def main():
                             for (r, _h), (cands, _n) in confirmed.items()
                             if r == rg for c in cands
                             if c["match"] == "confirmed"}.items(),
-                           key=lambda kv: kv[1])
+                           key=lambda kv: (kv[1], kv[0]))
             if not seeds:
                 print("  [orbit] %-9s no seed accounts anywhere in this region "
                       "— fallback cannot run" % rg, file=sys.stderr)
                 continue
-            orbit[rg] = fetch_orbit1([a for a, _p in seeds])
+            orbit[rg], used = fetch_orbit1([a for a, _p in seeds], rg)
+            if used:
+                pos_of = dict(seeds)
+                print("  [orbit] %-9s seeds' general-board positions: %s"
+                      % (rg, _ranges(pos_of[a] for a in used)),
+                      file=sys.stderr)
             print("  [orbit] %-9s %d thin heroes (%d of them with zero board "
                   "candidates), %d orbit-1 players"
                   % (rg, len(thin), len(empty), len(orbit[rg])), file=sys.stderr)
