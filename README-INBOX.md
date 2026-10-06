@@ -1,59 +1,64 @@
-# Inbox drop: icon refresh (2026-10-04)
+# Inbox drop: Baba, and new heroes released "in development" (2026-10-06)
 
-    fetch_icons.py   MODIFIED - downloads every icon each run and replaces site copies whose art changed
+    deadlock_pipeline.py   MODIFIED - a Release hero is in, even with in_development set; Baba's release date
+    build_calc_data.py     MODIFIED - the same rule for the build calculator
 
-Before editing, I checked it against live main (a448478): its blob hash
-matched the drop-1 version this edit started from. No workflow file changes.
+Before editing, I checked both files against live main (bcbbf69): their blob
+hashes matched the versions these edits started from.
 
-## Why the site kept the old art
+## What happened
 
-- **The filename never changes.** Icons are saved as
-  `docs/icons/<sha1 of the URL>.png`. When Valve redraws an item, the asset
-  bucket keeps the same URL (`.../items/weapon/melee_charge.png`), so the file
-  keeps the same name.
-- **Nothing ever overwrote the old file.** `fetch_icons.py` skipped icons
-  already on disk, and the workflow copies with `cp -n`, which never
-  overwrites. 196 of the 197 files in `docs/icons` were committed on
-  2026-09-02, plus Rat King's card on 2026-10-03, and none has ever been
-  updated.
-- **The page loads that file first.** It uses `docs/icons` before the bucket,
-  so the stale copy always wins. That covers item icons (160) and hero cards
-  (39).
-- **Ability icons were never affected.** They load straight from the bucket.
+Baba was released in **game build 6757 (2026-10-06, 21:03 UTC)**. In
+heroes.vdata his development state went from PreRelease to **Release**, and his
+card art shipped in the same build.
 
-## Now
+In the same build, Valve also flipped his `m_bInDevelopment` flag to
+**true**. No hero had ever been both Release and in development: Rat King went
+Release four days earlier with that flag false. deadlock-api passes the flag
+through as `in_development`, and the pipeline still treated
+`in_development` as "can't be picked". So Baba was dropped in every run after
+the patch, and the calculator dropped him too.
 
-- **Every referenced icon is downloaded every run,** about 200 small files. In
-  CI `./icons/` starts empty, so that was already happening; there's no new
-  cost.
-- **A site copy whose bytes differ is replaced.** Only a complete image can
-  replace one: it must have a PNG, WebP or JPEG signature, and a PNG must end
-  in IEND. An error page, a failed download or a cut-off transfer leaves the
-  old copy in place.
-- **New art is published by the existing commit step,** which already adds
-  `docs/icons`. The `cp -n` line in the workflow now has nothing left to do.
+## The fix
 
-## In the log (the "Fetch any new icons" step)
+- **The development state decides now.** Release means in; PreRelease and
+  DebugOnly mean out; disabled is always out. `in_development` only matters
+  for an old payload with no development state, where it keeps its old
+  meaning. Nothing needs editing per hero, so the next hero released this way
+  is picked up on the first run after it.
+- **Baba is dated from his release.** `KNOWN_RELEASES` now holds Baba
+  (2026-10-06), and a hero appearing for the first time takes its known date
+  when it has one. He's NEW until Oct 20, not counted from whenever this drop
+  first runs.
+- **The four other vote heroes stay out until they're released:** Deadman
+  Danny, Solomon, Violet and Nurse Harrow are still PreRelease.
+
+## What you'll see
+
+On the first run after unpacking, Baba appears in the NEW tier in both
+regions, with his card art and builds from the new-hero fallback:
+leaderboard sweep, then orbit. The log shows:
 
 ```
-[icons] 199 fetched, 0 failed, 0 not an image; site copies: 0 new, 41 updated (art changed upstream), 158 unchanged
-  [icons] updated: melee_charge.png, close_quarters.png, ...
+[new] 2 new hero(es), fallback ON (within 14 days of first seen): Rat King (since 2026-10-02), Baba (since 2026-10-06)
+[new] Baba           NAmerica  0 board + N sweep (...) + ...
 ```
-
-(Numbers illustrative.) If "updated" is 0, the asset bucket hasn't
-re-exported the new art yet, and the first run after it does will pick it up.
-Browsers can hold an old image for about 10 minutes (GitHub Pages caching), so
-a reload after that shows the new art.
 
 ## Verified
 
-- **All 197 current icons pass the completeness check,** so nothing that works
-  today would be refused.
-- **Simulated run:**
-  - New art at an unchanged URL replaced the site copy, and git shows the file
-    modified, ready to commit.
-  - Identical art was left untouched.
-  - An HTML error page and a failed download each kept the old copy.
-  - A new item's icon was added.
-  - A truncated PNG was not added.
+- **The game files** (GameTracking-Deadlock heroes.vdata):
+  - Build 6753: Baba is PreRelease with in_development false.
+  - Build 6757: Release with in_development true, the only hero in that state.
+  - `pak01_dir.txt` lists his card, sm and mm art in 6757.
+- **deadlock-api's source:** `player_selectable` comes from the state, and
+  `in_development` is passed through raw.
+- **Unit tests:** 10 flag combinations through the old and new rule. Only
+  Baba's changes; everything else gives the same answer as before. The
+  calculator's rule matches.
+- **Mock run with Baba flagged as he really shipped:**
+  - Old code: he's left out.
+  - New code: he's in, with `first_seen` 2026-10-06 and builds from the
+    sweep, listed as NEW on the site.
+  - Established heroes are identical. With Baba still PreRelease, every output
+    file is byte-identical to the live code.
 - **Inbox:** the drop was unpacked against a fresh clone of main.

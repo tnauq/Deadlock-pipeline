@@ -251,12 +251,13 @@ NEW_HERO_MIN_ACCOUNT_GAMES = _env("NEW_HERO_MIN_ACCOUNT_GAMES", 100)
 NEW_HERO_FORCE = {int(x) for x in (os.environ.get("NEW_HERO_IDS") or "").split(",")
                   if x.strip().isdigit()}
 SITE_DATA = os.environ.get("SITE_DATA") or os.path.join("docs", "data.json")
-# Seeds the one-time migration (load_first_seen). Rat King was released in
-# build 6736 on 2026-10-02 (GameTracking-Deadlock heroes.vdata). Listing him
-# here keeps him NEW even if a run of the previous code ranks him somewhere
-# before this one first runs. Later heroes need no entry: they are absent from
-# the published data.json the first time they appear, which is what marks them.
-KNOWN_RELEASES = {84: "2026-10-02"}
+# Real release dates (GameTracking-Deadlock heroes.vdata). Rat King: build 6736
+# on 2026-10-02; listing him seeded the one-time migration in load_first_seen.
+# Baba: build 6757 on 2026-10-06, missed until the in_development fix
+# (_hero_released), so his entry dates him from the release, not from the
+# first run that saw him. Other heroes need no entry: a hero absent from the
+# published data.json is marked the first time it appears.
+KNOWN_RELEASES = {84: "2026-10-02", 88: "2026-10-06"}
 
 # ---- ring 2 of the orbit, new heroes only (2026-10-03) ---------------------
 # Players who shared a match with ring-1 players, in the same ORBIT_DAYS
@@ -470,28 +471,34 @@ def _hero_released(h):
     disabled/in_development alone stopped being enough at that build: the six
     hero-vote candidates (Rat King, Deadman Danny, Solomon, Violet, Nurse
     Harrow, Baba) shipped as PreRelease with BOTH flags false, so they passed
-    the old filter while nobody could play them. Rat King flipped to Release
-    in build 6736 (2026-10-02); the other five are still PreRelease and join
-    the roster on their own the moment Valve flips them — nothing here needs
+    the old filter while nobody could play them.
+
+    BUILD 6757 (2026-10-06) broke the other half of the old rule: Baba was
+    released (state Release, card art in the same build) with
+    m_bInDevelopment flipped to TRUE, the first hero ever to carry both. Rat
+    King went Release with it false four days earlier. So in_development is no
+    longer a "cannot be picked" flag, and treating it as one kept Baba off the
+    site. Since 6711 the development state alone decides; in_development
+    still gates only payloads that predate the state field. Nothing here needs
     editing per hero.
     """
-    if h.get("disabled") or h.get("in_development"):
+    if h.get("disabled"):
         return False
-    ps = h.get("player_selectable")
-    if ps is not None:
-        return bool(ps)
     ds = str(h.get("development_state") or "").strip().lower()
     if ds:
         return ds == "release"
-    return True        # a payload with neither field predates both; trust the old flags
+    ps = h.get("player_selectable")
+    if ps is not None:
+        return bool(ps) and not h.get("in_development")
+    return not h.get("in_development")   # a payload with neither field: the old rule
 
 
 def load_assets():
     heroes, hero_icon, hero_meta = {}, {}, {}
     _hero_sig_classes = {}
+    # in_development is NOT filtered here any more — see _hero_released (Baba)
     hero_recs = [h for h in _get(BASE + "/v1/assets/heroes")
-                 if h.get("id") is not None
-                 and not h.get("disabled") and not h.get("in_development")]
+                 if h.get("id") is not None and not h.get("disabled")]
     released = [h for h in hero_recs if _hero_released(h)]
     # GUARD. When build 6711 first shipped, the API parsed EVERY hero as
     # non-selectable until it was patched (deadlock-api commit 3475ae2, "every
@@ -504,7 +511,7 @@ def load_assets():
               "released — treating that as an upstream flag glitch and using "
               "disabled/in_development alone this run"
               % (len(released), len(hero_recs)), file=sys.stderr)
-        released = hero_recs
+        released = [h for h in hero_recs if not h.get("in_development")]
     released_ids = {int(h["id"]) for h in released}
     held_back = sorted((h.get("name") or str(h.get("id"))) for h in hero_recs
                        if int(h["id"]) not in released_ids)
@@ -1175,7 +1182,8 @@ def load_first_seen(heroes, today):
     state lives in the committed docs/data.json, which build_site_data.py
     writes every run, so it needs no new file and no new commit step:
 
-      * a hero absent from the last publish was released since — today
+      * a hero absent from the last publish was released since — its
+        KNOWN_RELEASES date if listed, else today
       * a hero carrying first_seen keeps it
       * MIGRATION, the first run after 2026-10-03 only: no hero carries the
         field yet. A hero in KNOWN_RELEASES gets its real release date; any
@@ -1220,7 +1228,10 @@ def load_first_seen(heroes, today):
     for hid in heroes:
         h = by_id.get(hid)
         if h is None:
-            first[hid] = today
+            # released since the last publish; a known date beats the day the
+            # fix first ran (Baba: released 2026-10-06, first seen by this
+            # code a run or more later)
+            first[hid] = KNOWN_RELEASES.get(hid, today)
         elif "first_seen" in h:
             first[hid] = h.get("first_seen") or ""
         elif not tracked and hid in KNOWN_RELEASES:

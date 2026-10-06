@@ -268,21 +268,28 @@ def released_heroes(heroes):
     hero read non-selectable when 6711 first shipped, until deadlock-api was
     patched), not heroes leaving the game, so the old rule is kept for that run.
     """
-    live = [h for h in heroes if not h.get("disabled") and not h.get("in_development")]
+    # Build 6757 (2026-10-06): Baba shipped as Release with in_development
+    # TRUE, so in_development no longer means "cannot be picked" — the
+    # development state decides (deadlock_pipeline._hero_released has the
+    # full story). in_development only gates payloads without a state.
+    live = [h for h in heroes if not h.get("disabled")]
 
     def ok(h):
+        ds = str(h.get("development_state") or "").strip().lower()
+        if ds:
+            return ds == "release"
         ps = h.get("player_selectable")
         if ps is not None:
-            return bool(ps)
-        ds = str(h.get("development_state") or "").strip().lower()
-        return ds == "release" if ds else True
+            return bool(ps) and not h.get("in_development")
+        return not h.get("in_development")
 
     rel = [h for h in live if ok(h)]
     if live and len(rel) < 0.5 * len(live):
+        old_rule = [h for h in live if not h.get("in_development")]
         print("[calc] WARNING: only %d of %d live heroes read as released — "
               "treating it as an upstream flag glitch and keeping all %d"
-              % (len(rel), len(live), len(live)), file=sys.stderr)
-        return live
+              % (len(rel), len(live), len(old_rule)), file=sys.stderr)
+        return old_rule
     held = sorted(h.get("name") or str(h.get("id")) for h in live if not ok(h))
     if held:
         print("[calc] %d unreleased hero(es) left out until Valve releases them: %s"
