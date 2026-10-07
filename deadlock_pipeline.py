@@ -230,21 +230,45 @@ ORBIT_SORT = os.environ.get("ORBIT_SORT", "breadth")
 # hero is NEW, its shortfall after its own board players is filled, in order:
 #
 #   1. SWEEP — accounts this run already resolved from ANY hero's board or the
-#      region's general board, with NEW_HERO_MIN_GAMES+ games on the new hero,
-#      ordered by general-board position (the site's own definition of top).
-#      Their hero-stats come back with every hero in one row set, so this is
-#      free: no SQL, plus a few hero-stats calls for general-board ids.
-#   2. ORBIT — orbit-1 players at the same relaxed bar, by seeds met.
+#      region's general board, with the bar's worth of games on the new hero
+#      (new_hero_bar), ordered by general-board position (the site's own
+#      definition of top). Their hero-stats come back with every hero in one
+#      row set, so this is free: no SQL, plus a few hero-stats calls for
+#      general-board ids.
+#   2. ORBIT — orbit-1 players at the same bar, by seeds met.
+# Both run twice: players with NEW_HERO_EXPERIENCED_X times the bar first,
+# then everyone at the bar (see below).
 #
 # One build per player, unique players across regions, exactly as for board
 # players. Established heroes are untouched: same board selection, same
-# 5-game orbit. A hero is NEW for NEW_HERO_DAYS after it first appears; the
-# first-seen date lives in the committed docs/data.json (see
-# load_first_seen). NEW_HERO_IDS forces heroes into the set by id.
-NEW_HERO_DAYS = _env("NEW_HERO_DAYS", 14)
-# Early players sit at 2-4 games: Rat King's first 3 qualifiers had 16 games
-# between them, all just over the orbit's 5-game bar.
-NEW_HERO_MIN_GAMES = _env("NEW_HERO_MIN_GAMES", 3)
+# 5-game orbit. The first-seen date lives in the committed docs/data.json
+# (see load_first_seen). NEW_HERO_IDS forces heroes into the set by id.
+#
+# HAND-OFF (2026-10-06): the fallback only ever fills what the hero's own
+# board leaves short, per region, so as the board fills it steps aside by
+# itself, region by region. NEW_HERO_DAYS is now just the hard stop. It was 14,
+# a calendar cliff: Rat King's own board was still EMPTY in both regions every
+# day from Oct 4 to Oct 7 (ceiling archives, board_size 0), so on day 15 his
+# whole pool would have switched from top-ladder players to the 5-game orbit —
+# a different stand-in, not a stricter one.
+NEW_HERO_DAYS = _env("NEW_HERO_DAYS", 30)
+# THE BAR RISES WITH THE HERO'S AGE, into the established rule:
+# NEW_HERO_BAR_START games on release day, one more every NEW_HERO_BAR_EVERY
+# days, until it reaches the orbit's ORBIT_MIN_HERO_GAMES — the bar every
+# established hero's fill uses. Days 0-1 need 1, 2-3 need 2, 4-5 need 3, 6-7
+# need 4, and from day 8 a new hero is held to the same 5 games as any other.
+# Release day needs the low bar (Baba's first run, ~3 hours in, found nobody
+# with 3 games). Ending at 5 rather than higher keeps a slow-to-catch-on hero
+# from thinning below what an established one accepts.
+NEW_HERO_BAR_START = _env("NEW_HERO_BAR_START", 1)
+NEW_HERO_BAR_EVERY = _env("NEW_HERO_BAR_EVERY", 2)
+NEW_HERO_BAR_MAX = _env("NEW_HERO_BAR_MAX", ORBIT_MIN_HERO_GAMES)
+# EXPERIENCE FIRST: a player with at least NEW_HERO_EXPERIENCED_X times the bar
+# is taken before anyone at the bar alone — sweep, then ring 1 — so a top
+# player who has tried the hero 3 times never fills a slot ahead of one who
+# has played it 6+. Within each pass the order is unchanged (standing, then
+# seeds met). Ring 2 stays the last resort and applies the same rule inside.
+NEW_HERO_EXPERIENCED_X = _env("NEW_HERO_EXPERIENCED_X", 2)
 # Sweep ids are resolved from display names; an account with almost no games
 # cannot be the player standing on that board. Same floor ceiling_rank.py uses.
 NEW_HERO_MIN_ACCOUNT_GAMES = _env("NEW_HERO_MIN_ACCOUNT_GAMES", 100)
@@ -297,6 +321,9 @@ KNOWN_RELEASES = {84: "2026-10-02", 88: "2026-10-06"}
 # ~80 s per run while a hero is new, nothing otherwise.
 ORBIT2_FILL = _env("ORBIT2_FILL", 1)
 ORBIT2_MEASURE = _env("ORBIT2_MEASURE", 1)
+# ...for a hero's first ORBIT2_MEASURE_DAYS only, so the 30-day new-hero window
+# (NEW_HERO_DAYS) does not double what the measurement costs
+ORBIT2_MEASURE_DAYS = _env("ORBIT2_MEASURE_DAYS", 14)
 ORBIT2_MIN_SHARED = _env("ORBIT2_MIN_SHARED", 2)
 ORBIT2_SHARE_K = _env("ORBIT2_SHARE_K", 2)
 ORBIT2_LIMIT = _env("ORBIT2_LIMIT", 20000)
@@ -1265,20 +1292,37 @@ def load_first_seen(heroes, today):
     return first, new
 
 
+def new_hero_age(first_seen, today):
+    """Whole days since the hero first appeared; 0 if undated (NEW_HERO_IDS)."""
+    try:
+        return max(0, (datetime.date.fromisoformat(today)
+                       - datetime.date.fromisoformat(first_seen)).days)
+    except (TypeError, ValueError):
+        return 0
+
+
+def new_hero_bar(age):
+    """Games on the hero a fallback player needs, by the hero's age in days."""
+    return min(NEW_HERO_BAR_MAX, NEW_HERO_BAR_START + age // max(1, NEW_HERO_BAR_EVERY))
+
+
 def new_hero_fill(new_heroes, heroes, ladder, general, stats, chosen,
-                  orbit_members, orbit_stats, home, orbit_seeds):
+                  orbit_members, orbit_stats, home, orbit_seeds, ages=None):
     """Top up each NEW hero's pool, per region, after its own board players.
 
     Order of preference, one build per player, unique players across regions
     (see NEW_HERO_* and ORBIT2_* above for the why):
       1. the hero's own board players — already in `chosen`, untouched
-      2. SWEEP: accounts resolved from any board this run, NEW_HERO_MIN_GAMES+
-         games on the hero, by general-board position; players not on the
-         general board follow, by their best position on a hero board
-      3. ORBIT: ring-1 players at the same relaxed bar, by seeds met
+      2. SWEEP: accounts resolved from any board this run, with the bar's
+         worth of games on the hero (new_hero_bar of its age), by
+         general-board position; players not on the general board follow, by
+         their best position on a hero board
+      3. ORBIT: ring-1 players at the same bar, by seeds met
+         2 and 3 run as two passes: experienced players (NEW_HERO_EXPERIENCED_X
+         times the bar) from both first, then everyone else at the bar
       4. ORBIT 2: ring-2 players with ORBIT2_MIN_SHARED+ shared ring-1
-         matches, same bar, closest first (orbit2_closeness) — only if 2 and
-         3 left a gap
+         matches, same bar, experienced first, then closest first
+         (orbit2_closeness) — only if 2 and 3 left a gap
 
     Fetches hero-stats for general-board ids not already known (free bucket,
     capped at MAX_IDS_PER_ENTRY per name in native best-match-first order),
@@ -1336,6 +1380,7 @@ def new_hero_fill(new_heroes, heroes, ladder, general, stats, chosen,
 
     added = 0
     got = defaultdict(lambda: {"sweep": 0, "orbit": 0, "orbit2": 0})
+    experienced = defaultdict(int)
     located = defaultdict(int)
     eligible = {}
     taken = {hid: {c["account_id"] for c in chosen[hid]} for hid in new_heroes}
@@ -1371,9 +1416,13 @@ def new_hero_fill(new_heroes, heroes, ladder, general, stats, chosen,
     def need(hid, rg):
         return PER_REGION - sum(1 for c in chosen[hid] if c["region"] == rg)
 
+    ages = ages or {}
+    bars = {hid: new_hero_bar(ages.get(hid, 0)) for hid in new_heroes}
+    exp_bar = {hid: bars[hid] * max(1, NEW_HERO_EXPERIENCED_X) for hid in new_heroes}
+
     def playable(aid, hid):
         s = merged.get((aid, hid))
-        if not s or s["last_match_id"] is None or s["hero_games"] < NEW_HERO_MIN_GAMES:
+        if not s or s["last_match_id"] is None or s["hero_games"] < bars[hid]:
             return None
         return s
 
@@ -1408,16 +1457,21 @@ def new_hero_fill(new_heroes, heroes, ladder, general, stats, chosen,
             else:
                 orbit.sort(key=lambda t: (-t[0], -t[1], t[2]))
             eligible[(hid, rg)] = [len(sweep), len(orbit), 0]
-            for _r, _g, aid, m, s in sweep:
-                if need(hid, rg) <= 0:
-                    break
-                if aid not in taken[hid]:
-                    take(hid, rg, "sweep", aid, s, m)
-            for met, _w, aid, s in orbit:
-                if need(hid, rg) <= 0:
-                    break
-                if aid not in taken[hid]:
-                    take(hid, rg, "orbit", aid, s, None, met)
+            # experienced players from both sources first, then the rest at
+            # the bar; inside each pass the order above stands
+            for floor_ in (exp_bar[hid], bars[hid]):
+                for _r, _g, aid, m, s in sweep:
+                    if need(hid, rg) <= 0:
+                        break
+                    if aid not in taken[hid] and s["hero_games"] >= floor_:
+                        take(hid, rg, "sweep", aid, s, m)
+                        experienced[(hid, rg)] += 1 if s["hero_games"] >= exp_bar[hid] else 0
+                for met, _w, aid, s in orbit:
+                    if need(hid, rg) <= 0:
+                        break
+                    if aid not in taken[hid] and s["hero_games"] >= floor_:
+                        take(hid, rg, "orbit", aid, s, None, met)
+                        experienced[(hid, rg)] += 1 if s["hero_games"] >= exp_bar[hid] else 0
 
     # ---- 4: ring 2 — players taken only where a gap is left; measured on
     # every run while a hero is new (ORBIT2_MEASURE) ------------------------
@@ -1426,9 +1480,10 @@ def new_hero_fill(new_heroes, heroes, ladder, general, stats, chosen,
 
     for rg in REGIONS:
         short = sorted(h for h in new_heroes if need(h, rg) > 0) if ORBIT2_FILL else []
-        if not (short or ORBIT2_MEASURE):
+        young = sorted(h for h in new_heroes if ages.get(h, 0) <= ORBIT2_MEASURE_DAYS)
+        if not (short or (ORBIT2_MEASURE and young)):
             continue
-        target = short or sorted(new_heroes)
+        target = short or young
         if not orbit_seeds.get(rg):
             print("  [orbit2] %-9s no seeds this run — ring 2 skipped" % rg, file=sys.stderr)
             continue
@@ -1490,15 +1545,17 @@ def new_hero_fill(new_heroes, heroes, ladder, general, stats, chosen,
                 s = playable(aid, hid)
                 if s:
                     n, pl = ring2[aid]
-                    cands.append((-orbit2_closeness(n, pl), -n,
+                    cands.append((0 if s["hero_games"] >= exp_bar[hid] else 1,
+                                  -orbit2_closeness(n, pl), -n,
                                   -shrunk(s["hero_wins"], s["hero_games"]), aid, s, n, pl))
-            cands.sort(key=lambda t: t[:4])
+            cands.sort(key=lambda t: t[:5])
             eligible.setdefault((hid, rg), [0, 0, 0])[2] = len(cands)
             picked = []
-            for _c, _n, _w, aid, s, n, pl in cands:
+            for _x, _c, _n, _w, aid, s, n, pl in cands:
                 if need(hid, rg) <= 0:
                     break
                 take(hid, rg, "orbit2", aid, s, None, "%d/%d" % (n, pl))
+                experienced[(hid, rg)] += 1 if _x == 0 else 0
                 picked.append("%d/%d" % (n, pl))
             if picked:
                 print("  [orbit2] %-9s %s: took %d of %d eligible; ring-1 lobbies / games "
@@ -1511,11 +1568,12 @@ def new_hero_fill(new_heroes, heroes, ladder, general, stats, chosen,
             e = eligible.get((hid, rg), [0, 0, 0])
             have = PER_REGION - need(hid, rg)
             print("  [new] %-14s %-9s %d board + %d sweep (%d on the general board) "
-                  "+ %d orbit + %d ring 2 = %d/%d   [bar %d games; eligible %d sweep, "
-                  "%d orbit, %d ring 2]"
+                  "+ %d orbit + %d ring 2 = %d/%d   [day %d: bar %d games, %d of the "
+                  "fill had %d+; eligible %d sweep, %d orbit, %d ring 2]"
                   % (heroes[hid][:14], rg, board[(hid, rg)], g["sweep"],
                      located[(hid, rg)], g["orbit"], g["orbit2"], have, PER_REGION,
-                     NEW_HERO_MIN_GAMES, e[0], e[1], e[2]), file=sys.stderr)
+                     ages.get(hid, 0), bars[hid], experienced[(hid, rg)], exp_bar[hid],
+                     e[0], e[1], e[2]), file=sys.stderr)
     return added
 
 
@@ -1884,8 +1942,9 @@ def main():
     # ---- new heroes: sweep, then the orbit at a relaxed bar ---------------
     new_added = 0
     if new_heroes:
+        ages = {h: new_hero_age(first_seen.get(h), today) for h in new_heroes}
         new_added = new_hero_fill(new_heroes, heroes, ladder, general, stats, chosen,
-                                  orbit_members, orbit_stats, home, orbit_seeds)
+                                  orbit_members, orbit_stats, home, orbit_seeds, ages)
         print("  [new] added %d builds across %d new hero(es)"
               % (new_added, len(new_heroes)), file=sys.stderr)
 

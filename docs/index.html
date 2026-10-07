@@ -512,9 +512,10 @@ footer{margin-top:48px;border-top:1px solid var(--frame)}
     <dt>New</dt>
     <dd>Heroes the ladder cannot place yet — usually a fresh release whose own leaderboard
     has not filled in. They are listed with whatever builds exist, never ranked, and move
-    into the tiers once a leaderboard player is confirmed. For a hero's first two weeks,
-    any builds its leaderboard cannot supply come from the highest-ranked players who
-    have played it, then from players in the same lobbies, one game each.</dd>
+    into the tiers once a leaderboard player is confirmed. Until its own leaderboard can
+    supply them (for at most a month), its builds come from the highest-ranked players who
+    have played it, then from players in the same lobbies, one game each. Players with the
+    most games on it go first, and the games it takes to count rise as the hero ages.</dd>
 
     <dt>Calculator</dt>
     <dd>Stats are computed from Valve's own asset data. Percentages of the same kind add
@@ -678,9 +679,9 @@ function renderDetail(){
     const note = el('div','note');
     const n = entry.of_builds, rg = R().label;
     const builds = n + ' build' + (n === 1 ? '' : 's');
-    // entry.new = released within the last two weeks (deadlock_pipeline.py
-    // NEW_HERO_DAYS): its builds come from the new-hero fallback — ranked
-    // ladder players who have played it, then rings 1 and 2 of the orbit.
+    // entry.new = released within NEW_HERO_DAYS (deadlock_pipeline.py, 30):
+    // its builds come from the new-hero fallback — players with the most games
+    // on it first, ranked ladder players before rings 1 and 2 of the orbit.
     note.textContent = !n
       ? 'Not ranked yet. No ' + rg + ' leaderboard players or sampled builds for this hero so far '
         + '\u2014 new heroes start here. Builds appear as top players pick it up, and it joins '
@@ -691,8 +692,8 @@ function renderDetail(){
         + (n === 1
            ? 'the build below is the most recent game of a top ' + rg + ' player who has played it.'
            : 'the ' + builds + ' below are the most recent games of top ' + rg + ' players who have '
-             + 'played it \u2014 ranked ladder players first, then players from the same '
-             + 'lobbies \u2014 one per player.')
+             + 'played it, one per player \u2014 those with the most games on it first, ranked '
+             + 'ladder players before players from the same lobbies.')
       : 'Not ranked yet. No player has a confirmed ' + rg + ' leaderboard spot on this hero, '
         + 'so it cannot be placed against the others. The ' + builds
         + ' below come from strong players who share matches with the top of the ladder.';
