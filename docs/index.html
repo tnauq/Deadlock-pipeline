@@ -804,79 +804,6 @@ if (window.__DATA__) {
 }
 
 
-// One row per equipped imbue item: which ability is it imbued into? Nine of
-// the 156 items work this way and they do nothing at all until assigned.
-// Preselect the ability the cohort imbues this item into. Choices are highly
-// concentrated (median top-choice share 100%), so the default is usually the
-// only thing anyone does — but it stays overridable, and the split is shown so
-// a hero with no consensus reads as one.
-function imbueDefault(itemId){
-  const blk = (R().imbue || {})[build.slug] || {};
-  const rec = blk[String(itemId)];
-  return rec && rec.top ? rec.top : null;
-}
-
-// Must run BEFORE the slot tiles are drawn: the tile shows an amber "!" for an
-// unassigned imbue item, and assigning defaults inside drawImbue() left every
-// tile flagged even though a target had just been chosen.
-function applyImbueDefaults(){
-  build.imbue = build.imbue || {};
-  for (const it of equipped()){
-    if (!it.imbue || build.imbue[it.id] !== undefined) continue;
-    const d = imbueDefault(it.id);
-    if (d) build.imbue[it.id] = d;
-  }
-}
-
-function drawImbue(host){
-  const items = equipped().filter(i => i.imbue);
-  if (!items.length) return;
-  const slots = abilSlots();
-  const meta = DATA.ability_meta || {};
-  const box = el('div','fx');
-  const h4 = el('h4'); h4.textContent = 'Imbue';
-  box.appendChild(h4);
-  for (const it of items){
-    const row = el('div','imb-row');
-    const nm = el('span','nm'); nm.textContent = it.name;
-    row.appendChild(nm);
-    const rec = ((R().imbue || {})[build.slug] || {})[String(it.id)];
-    if (rec && rec.picks && rec.picks.length){
-      const note = el('span','imb-note');
-      const top = rec.picks[0];
-      note.textContent = top[1] + '/' + rec.of;
-      note.title = rec.picks
-        .map(([a, c]) => c + ' \u00d7 ' + ((meta[a] || {}).name || a)).join(', ') +
-        '  \u00b7  of ' + rec.of + ' builds holding it';
-      row.appendChild(note);
-    }
-    const grp = el('div','regions');
-    grp.style.margin = '0';
-    for (const slot of ['1','2','3','4']){
-      const a = slots[slot];
-      if (!a) continue;
-      const m = meta[a.id] || {name: 'ability ' + a.id, icon: ['','']};
-      const b = el('button');
-      b.type = 'button';
-      b.style.minWidth = '0';
-      b.style.padding = '3px 6px';
-      b.title = m.name;
-      b.appendChild(icon(m.icon, m.name));
-      const on = String((build.imbue || {})[it.id] || '') === String(a.id);
-      b.setAttribute('aria-pressed', String(on));
-      b.onclick = () => {
-        build.imbue = build.imbue || {};
-        if (on) delete build.imbue[it.id];
-        else build.imbue[it.id] = a.id;
-        drawCalc(host);
-      };
-      grp.appendChild(b);
-    }
-    row.appendChild(grp);
-    box.appendChild(row);
-  }
-  host.appendChild(box);
-}
 
 /* ---------- ability points ----------------------------------------------
    Four columns in signature order, four rows each: the unlock, then the 1, 2
@@ -905,7 +832,6 @@ function renderAbilities(hostSlug){
   const blk = (R().abilities || {})[hostSlug];
   const orders = blk && blk.orders;
   if (!orders || !orders.length) return null;
-  const meta = DATA.ability_meta || {};
   const which = Math.min(abilOrder, orders.length - 1);
   const seq = orders[which];
 
@@ -944,7 +870,7 @@ function renderAbilities(hostSlug){
 
   const strip = el('div','seq');
   seq.forEach(([aid, tier], k) => {
-    const m = meta[aid] || {name: 'ability ' + aid, icon: ['','']};
+    const m = abilMeta(aid);
     const chip = el('span','s');
     chip.title = m.name + (tier ? '  \u00b7  ' + [0,1,2,5][tier] + ' point upgrade'
                                 : '  \u00b7  unlock');
@@ -1210,7 +1136,6 @@ function drawImbue(host){
   const items = equipped().filter(i => i.imbue);
   if (!items.length) return;
   const slots = abilSlots();
-  const meta = DATA.ability_meta || {};
   const box = el('div','fx');
   const h4 = el('h4'); h4.textContent = 'Imbue';
   box.appendChild(h4);
@@ -1224,7 +1149,7 @@ function drawImbue(host){
       const top = rec.picks[0];
       note.textContent = top[1] + '/' + rec.of;
       note.title = rec.picks
-        .map(([a, c]) => c + ' \u00d7 ' + ((meta[a] || {}).name || a)).join(', ') +
+        .map(([a, c]) => c + ' \u00d7 ' + abilMeta(a).name).join(', ') +
         '  \u00b7  of ' + rec.of + ' builds holding it';
       row.appendChild(note);
     }
@@ -1233,7 +1158,7 @@ function drawImbue(host){
     for (const slot of ['1','2','3','4']){
       const a = slots[slot];
       if (!a) continue;
-      const m = meta[a.id] || {name: 'ability ' + a.id, icon: ['','']};
+      const m = abilMeta(a.id);
       const b = el('button');
       b.type = 'button';
       b.style.minWidth = '0';
@@ -1270,7 +1195,28 @@ const PIP_COST = [0, 1, 2, 5];           // by step index beyond the unlock
 
 function abilSlots(){
   const blk = (R().abilities || {})[build.slug];
-  return (blk && blk.slots) || {};
+  if (blk && blk.slots && Object.keys(blk.slots).length) return blk.slots;
+  // No sampled builds for this hero in this region yet (a release from hours
+  // ago has none), so data.json has no ability block for it. The calculator
+  // bundle knows every released hero's kit, so points can still be spent by
+  // hand; the order and counts arrive with the first builds.
+  const kit = ((CALC.heroes || {})[build.slug] || {}).abilities || {};
+  const out = {};
+  for (const [slot, id] of Object.entries(kit)) if (id != null) out[slot] = {id: String(id)};
+  return out;
+}
+
+// Name and icon for an ability id: the site data first, then the calculator
+// bundle, which covers heroes that have no sampled builds yet.
+function abilMeta(id){
+  const m = (DATA.ability_meta || {})[id];
+  if (m) return m;
+  let c = null;
+  // CALC is declared further down; the inline-data preview boots before that
+  // line runs, and touching it then would throw
+  try { c = (CALC.abil || {})[id]; } catch (e) { c = null; }
+  if (c) return {name: c.name, icon: c.icon || ['','']};
+  return {name: 'ability ' + id, icon: ['','']};
 }
 
 function abilBudget(){
@@ -1293,10 +1239,12 @@ function abilBudget(){
 
 let abilOpen = null;      // ability id whose detail panel is showing
 
-function drawAbilities(host, out){
+// `calcWrap` is the whole calculator, redrawn by a pip or ability click; `host`
+// is where this panel goes, which the level slider redraws on its own.
+function drawAbilities(host, out, calcWrap){
+  const redraw = calcWrap || host;
   const slots = abilSlots();
   if (!Object.keys(slots).length) return;
-  const meta = DATA.ability_meta || {};
   const b = abilBudget();
 
   const box = el('div','apts');
@@ -1316,7 +1264,7 @@ function drawAbilities(host, out){
   for (const slot of ['1','2','3','4']){
     const a = slots[slot];
     if (!a) continue;
-    const m = meta[a.id] || {name: 'ability ' + a.id, icon: ['','']};
+    const m = abilMeta(a.id);
     const taken = (build.abil || {})[a.id] || 0;
     const col = el('div','apc');
     const pick = el('button','apick');
@@ -1326,7 +1274,7 @@ function drawAbilities(host, out){
     pick.appendChild(icon(m.icon, m.name));
     const nm = el('div','nm'); nm.textContent = m.name;
     pick.appendChild(nm);
-    pick.onclick = () => { abilOpen = (abilOpen === a.id) ? null : a.id; drawCalc(host); };
+    pick.onclick = () => { abilOpen = (abilOpen === a.id) ? null : a.id; drawCalc(redraw); };
     col.appendChild(pick);
 
     const pips = el('div','pips');
@@ -1348,7 +1296,7 @@ function drawAbilities(host, out){
         build.abil = build.abil || {};
         build.abil[a.id] = (taken === step) ? step - 1 : step;
         if (!build.abil[a.id]) delete build.abil[a.id];
-        drawCalc(host);
+        drawCalc(redraw);
       };
       pips.appendChild(p);
     }
@@ -1612,6 +1560,9 @@ function drawCalc(wrap){
     val.textContent = rng.value;
     scheduleStats(wrap);
   };
+  // once the slider settles (released, or a key press), the ability panel
+  // catches up; only those few buttons are rebuilt, and focus stays here
+  rng.onchange = () => { if (wrap._redrawAbilities) wrap._redrawAbilities(); };
   lvl.append(l1, rng, val);
   wrap.appendChild(lvl);
 
@@ -1642,7 +1593,7 @@ function drawCalc(wrap){
         mk.textContent = target ? '\u25c6' : '!';
         mk.classList.add(target ? 'set' : 'unset');
         mk.title = target
-          ? 'Imbued into ' + ((DATA.ability_meta || {})[target] || {}).name
+          ? 'Imbued into ' + abilMeta(target).name
           : 'Imbue item \u2014 pick an ability below';
         cell.appendChild(mk);
       }
@@ -1685,7 +1636,17 @@ function drawCalc(wrap){
   wrap.appendChild(bar);
 
   drawImbue(wrap);
-  drawAbilities(wrap, out);
+  const abilHost = el('div');
+  wrap.appendChild(abilHost);
+  drawAbilities(abilHost, out, wrap);
+  // While the level slider moves only the stat panels follow it (see
+  // rng.oninput). The ability budget and which pips are affordable depend on
+  // the level too: they used to stay at whatever level the calculator was
+  // drawn at, so from level 1 nothing past one unlock could ever be bought.
+  wrap._redrawAbilities = () => {
+    abilHost.replaceChildren();
+    drawAbilities(abilHost, resolve(), wrap);
+  };
 
   // effects — one box per equipped item that has a conditional property
   const condItems = equipped().filter(hasToggle);

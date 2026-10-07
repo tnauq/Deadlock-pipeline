@@ -1,64 +1,57 @@
-# Inbox drop: Baba, and new heroes released "in development" (2026-10-06)
+# Inbox drop: calculator ability points (2026-10-06)
 
-    deadlock_pipeline.py   MODIFIED - a Release hero is in, even with in_development set; Baba's release date
-    build_calc_data.py     MODIFIED - the same rule for the build calculator
+    docs/index.html        MODIFIED - ability points for heroes with no builds yet; the level slider updates them
+    build_calc_data.py     MODIFIED - the calculator bundle lists every hero's four abilities
 
-Before editing, I checked both files against live main (bcbbf69): their blob
+Before editing, I checked both files against live main (aeaa000): their blob
 hashes matched the versions these edits started from.
 
-## What happened
+## Two bugs, one panel
 
-Baba was released in **game build 6757 (2026-10-06, 21:03 UTC)**. In
-heroes.vdata his development state went from PreRelease to **Release**, and his
-card art shipped in the same build.
+1. **A hero with no builds got no ability panel.** The calculator read a
+   hero's four ability slots only from the site's build data, and a hero with
+   no sampled builds (Baba, hours after release) has none. The panel silently
+   didn't draw.
+   - Now `heroes.json` in the calculator bundle carries every hero's slots
+     (`"abilities": {"1": id, ... "4": id}`, from the assets' signature1-4).
+   - The page falls back to them when there's no build data.
+   - Names and icons fall back to the bundle's ability records.
+   - The imbue picker uses the same fallback.
+2. **The level slider never updated the ability budget, for any hero.** While
+   the slider moves, only the stat panels follow it, and the ability panel
+   kept the level it was drawn at. From level 1, one unlock could be bought;
+   at level 36, "Unlocks 0/1 · Points 0/0" still showed and 12 of 16 buttons
+   stayed disabled.
+   - Now the ability panel redraws when the slider settles (release or key
+     press).
+   - Only its own buttons are rebuilt, so the slider keeps focus and dragging
+     stays smooth.
 
-In the same build, Valve also flipped his `m_bInDevelopment` flag to
-**true**. No hero had ever been both Release and in development: Rat King went
-Release four days earlier with that flag false. deadlock-api passes the flag
-through as `in_development`, and the pipeline still treated
-`in_development` as "can't be picked". So Baba was dropped in every run after
-the patch, and the calculator dropped him too.
+Also removed: a second, identical copy of the imbue helpers (`imbueDefault`,
+`applyImbueDefaults`, `drawImbue`). The later copy was the one in effect, and
+the fix would otherwise have to be made twice.
 
-## The fix
+## When it shows
 
-- **The development state decides now.** Release means in; PreRelease and
-  DebugOnly mean out; disabled is always out. `in_development` only matters
-  for an old payload with no development state, where it keeps its old
-  meaning. Nothing needs editing per hero, so the next hero released this way
-  is picked up on the first run after it.
-- **Baba is dated from his release.** `KNOWN_RELEASES` now holds Baba
-  (2026-10-06), and a hero appearing for the first time takes its known date
-  when it has one. He's NEW until Oct 20, not counted from whenever this drop
-  first runs.
-- **The four other vote heroes stay out until they're released:** Deadman
-  Danny, Solomon, Violet and Nurse Harrow are still PreRelease.
+- **The slider fix** works as soon as the page is published.
+- **Baba's ability panel** needs the next refresh, because the Build
+  calculator data step has to write the new `heroes.json`.
 
-## What you'll see
+## Verified (headless Chromium on the live data.json and calculator bundle)
 
-On the first run after unpacking, Baba appears in the NEW tier in both
-regions, with his card art and builds from the new-hero fallback:
-leaderboard sweep, then orbit. The log shows:
-
-```
-[new] 2 new hero(es), fallback ON (within 14 days of first seen): Rat King (since 2026-10-02), Baba (since 2026-10-06)
-[new] Baba           NAmerica  0 board + N sweep (...) + ...
-```
-
-## Verified
-
-- **The game files** (GameTracking-Deadlock heroes.vdata):
-  - Build 6753: Baba is PreRelease with in_development false.
-  - Build 6757: Release with in_development true, the only hero in that state.
-  - `pak01_dir.txt` lists his card, sm and mm art in 6757.
-- **deadlock-api's source:** `player_selectable` comes from the state, and
-  `in_development` is passed through raw.
-- **Unit tests:** 10 flag combinations through the old and new rule. Only
-  Baba's changes; everything else gives the same answer as before. The
-  calculator's rule matches.
-- **Mock run with Baba flagged as he really shipped:**
-  - Old code: he's left out.
-  - New code: he's in, with `first_seen` 2026-10-06 and builds from the
-    sweep, listed as NEW on the site.
-  - Established heroes are identical. With Baba still PreRelease, every output
-    file is byte-identical to the live code.
+- **Baba, with the new `heroes.json`:**
+  - The panel shows Threadsap, Granny Long Legs, Baba's Brew and Feed The
+    Birds; his slots are taken from heroes.vdata, build 6757.
+  - At level 1 the budget is 0/1 · 0/0. Sliding to 36 gives 1/4 · 0/32.
+  - All four abilities upgrade fully to 4/4 · 32/32.
+  - The imbue picker offers his four abilities.
+  - The ability detail opens.
+- **Abrams:** the slots still come from the region's build data (checked
+  equal), and the ability order strip is unchanged.
+- **The slider:** after sliding to 36, Abrams goes from 12 disabled buttons
+  (live page) to 0.
+- **`build_calc_data.py`** on mock assets writes four slots for every
+  released hero, all present in `abilities.json`. A hero whose slots don't
+  resolve is named in a warning.
+- **The page script passes a syntax check,** and no page errors occurred.
 - **Inbox:** the drop was unpacked against a fresh clone of main.

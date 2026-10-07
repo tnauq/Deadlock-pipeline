@@ -458,7 +458,13 @@ def build_abilities(items, keep_classes):
     return out
 
 
-def build_heroes(heroes, weapons):
+def build_heroes(heroes, weapons, ability_ids=None):
+    """`abilities` maps signature slot "1".."4" to the ability's item id — the
+    same ids as abilities.json and the site's ability blocks. The page needs
+    it to offer ability points for a hero with no sampled builds yet (a
+    release from hours ago): until builds exist, data.json has no ability
+    block for that hero, and the calculator had nowhere else to read the kit."""
+    ability_ids = ability_ids or {}
     out = []
     for h in heroes:
         if h.get("disabled"):
@@ -485,6 +491,9 @@ def build_heroes(heroes, weapons):
             "shop_stat_display": h.get("shop_stat_display") or {},
             "weapon_primary": prim,
             "weapon_info": winfo,
+            "abilities": {str(k): ability_ids[c] for k in (1, 2, 3, 4)
+                          for c in [(h.get("items") or {}).get("signature%d" % k)]
+                          if c in ability_ids},
         })
     out.sort(key=lambda d: d["name"] or "")
     return out
@@ -576,7 +585,16 @@ def main():
                              for k in (1, 2, 3, 4)] if c}
     ability_recs = build_abilities(items_raw, sig_classes)
     weapons = weapon_index(items_raw)
-    heroes = build_heroes(heroes_raw, weapons)
+    ability_ids = {it["class_name"]: int(it["id"]) for it in items_raw
+                   if it.get("type") == "ability" and it.get("id") is not None
+                   and it.get("class_name")}
+    heroes = build_heroes(heroes_raw, weapons, ability_ids)
+    short_kit = sorted("%s (%d of 4)" % (h["name"], len(h["abilities"]))
+                       for h in heroes if len(h["abilities"]) < 4)
+    if short_kit:
+        print("[calc] WARNING: ability slots unresolved for %s — the calculator "
+              "offers ability points only for the slots it can name"
+              % ", ".join(short_kit), file=sys.stderr)
 
     os.makedirs(a.out_dir, exist_ok=True)
     atext = json.dumps(ability_recs, separators=(",", ":"))
