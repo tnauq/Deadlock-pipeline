@@ -842,7 +842,12 @@ function renderAbilities(hostSlug){
   lab.style.margin = '0';
   // With one order published, the two agreed on a path and there is nothing to
   // toggle between — the heading still says which build it is.
-  lab.textContent = which === 0 && blk.seq_from === 'ceiling'
+  // 'pool_top' (2026-10-07) is the top player when the ceiling player's own
+  // game isn't among the sampled builds (always, for a new hero with no
+  // ceiling yet): build_site_data.py takes the sampled player who stands
+  // highest on the leaderboards.
+  const topPlayer = blk.seq_from === 'ceiling' || blk.seq_from === 'pool_top';
+  lab.textContent = which === 0 && topPlayer
     ? 'Ability order \u00b7 top player'
     : 'Ability order \u00b7 most common';
   head.appendChild(lab);
@@ -859,8 +864,9 @@ function renderAbilities(hostSlug){
       b.style.minWidth = '38px';
       b.title = k === 0
         ? (blk.seq_from === 'ceiling' ? 'The top player\u2019s build'
-                                      : 'The most common')
-        : 'The next most common';
+           : blk.seq_from === 'pool_top' ? 'The top player\u2019s build: the sampled player highest on the leaderboard'
+           : 'The most common')
+        : (topPlayer ? 'The most common' : 'The next most common');
       b.setAttribute('aria-pressed', String(k === which));
       b.onclick = () => { abilOrder = k; renderDetail(); };
       grp.appendChild(b);

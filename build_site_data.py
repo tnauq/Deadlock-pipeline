@@ -274,7 +274,8 @@ def main():
         return seq
 
     # Two orders per hero-region, shown one at a time behind a 1/2 toggle:
-    #   1  the ceiling player's own build
+    #   1  the ceiling player's own build, or, when that game wasn't sampled,
+    #      the build of the sampled player who stands highest (pool_top below)
     #   2  the most REPRESENTATIVE cohort build
     #
     # "Most common" cannot mean an exact duplicate: a sequence is ~16 steps, so
@@ -319,19 +320,73 @@ def main():
                 best = (score, seq)
         return best[1] if best else None
 
-    orders, seq_source = {}, {}
-    for r in ceil_rows:
-        key = (r["region"], slug(r["hero"]))
-        entries = by_hr.get(key) or []
-        if not entries:
+    # EVERY HERO-REGION WITH SAMPLED BUILDS GETS ITS ORDERS (2026-10-07). This
+    # loop used to walk ceiling.csv, so a hero with no ceiling row got no
+    # order at all, not even the cohort one: Baba on his release day, with 20
+    # sampled builds per region and an empty ability-order panel. Same bug
+    # class as the orbit fill's chosen.items() loop (2026-10-03). It now walks
+    # the sampled builds, and the ceiling row is looked up when there is one.
+    ceil_by_key = {(r["region"], slug(r["hero"])): r for r in ceil_rows}
+
+    # THE TOP PLAYER WHEN THE CEILING PLAYER WASN'T SAMPLED (2026-10-07). The
+    # ceiling player's own game is sometimes not among the 20 sampled builds:
+    #   * a NEW hero has no board-confirmed ceiling yet, and its ceiling row,
+    #     when it has one at all, is an orbit player who is often not in the
+    #     pool (Rat King NA; Baba has no row at all);
+    #   * an established hero's ceiling player is not always among the sampled
+    #     builds: the ceiling ranks board players on their career record, while
+    #     the pool has its own qualifiers. The Doorman NA and Drifter EU showed
+    #     only "most common" on Oct 7 because of this.
+    # The top player is then the sampled player who stands highest, ranked the
+    # way that hero's pool and ceiling already rank players:
+    #   * established hero: the orbit seeds' order, which is also the
+    #     ceiling's preference for confirmed identities. Id-confirmed accounts
+    #     come first by general-board position, then the other general-board
+    #     accounts, then hero-board-only ones by ladder position;
+    #   * NEW hero: general-board position alone, the order new_hero_fill's
+    #     sweep fills its pool in (there is no hero board to confirm against).
+    # Orbit-filled players have no standing and are never picked. candidates.csv
+    # carries the positions; like ability_order.csv it stays on the runner, and
+    # only the ordered picks are published.
+    standing = {}                           # (region, slug, account_id) -> rank
+    for c in read("candidates.csv", required=False):
+        s = slug(c.get("hero") or "")
+        gp = (c.get("global_pos") or "").strip()
+        lp = (c.get("ladder_pos") or "").strip()
+        if gp.isdigit():
+            confirmed = (c.get("id_confirmed") or "").strip() == "YES"
+            rank = (0 if (confirmed or s in new_slugs) else 1, int(gp))
+        elif lp.isdigit():
+            rank = (2, int(lp))
+        else:
             continue
+        k = (c.get("region"), s, (c.get("account_id") or "").strip())
+        if k not in standing or rank < standing[k]:
+            standing[k] = rank
+
+    def pool_top(key, entries):
+        best = None
+        for i, (o, seq) in enumerate(entries):
+            st = standing.get((key[0], key[1], (o.get("account_id") or "").strip()))
+            if st is not None and (best is None or (st, i) < best[:2]):
+                best = (st, i, seq)
+        return best[2] if best else None
+
+    orders, seq_source = {}, {}
+    for key in sorted(by_hr):
+        entries = by_hr[key]
+        r = ceil_by_key.get(key) or {}
         acct = (r.get("account_id") or "").strip()
-        ceil = None
+        top, src = None, "cohort"
         for o, seq in entries:
             if acct and (o.get("account_id") or "").strip() == acct:
-                ceil = seq
+                top, src = seq, "ceiling"
                 break
-        first = ceil if ceil else representative(entries)
+        if top is None:
+            top = pool_top(key, entries)
+            if top is not None:
+                src = "pool_top"
+        first = top if top else representative(entries)
         second = representative(entries, exclude=first)
         got = [first] if first else []
         # only publish a second order if it actually diverges
@@ -339,15 +394,23 @@ def main():
             got.append(second)
         if got:
             orders[key] = got
-            seq_source[key] = "ceiling" if ceil else "cohort"
+            seq_source[key] = src
 
     if abil_rows:
-        n_ceil = sum(1 for v in seq_source.values() if v == "ceiling")
+        n_src = Counter(seq_source.values())
         n_two = sum(1 for v in orders.values() if len(v) > 1)
         print("  [abilities] %d rows, %d hero-regions with an order "
-              "(%d ceiling player, %d cohort only), %d with both"
-              % (len(abil_rows), len(orders), n_ceil,
-                 len(orders) - n_ceil, n_two), file=sys.stderr)
+              "(%d ceiling player, %d top sampled player because the ceiling "
+              "player wasn't sampled, %d cohort only), %d with both"
+              % (len(abil_rows), len(orders), n_src["ceiling"], n_src["pool_top"],
+                 n_src["cohort"], n_two), file=sys.stderr)
+        no_order = sorted("%s %s" % (REGION_LABEL.get(rg, rg), s)
+                          for (rg, s) in {(r["region"], slug(r["hero"])) for r in abil_rows
+                                          if r["region"] in REGIONS}
+                          if (rg, s) not in orders)
+        if no_order:
+            print("  [abilities] ability points but no order (no sampled sequence): %s"
+                  % ", ".join(no_order), file=sys.stderr)
 
     # ---- imbue targets ----------------------------------------------------
     # Which ability the cohort imbues each item into, so the calculator can
