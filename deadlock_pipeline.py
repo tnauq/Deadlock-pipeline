@@ -9,6 +9,12 @@ standing that orders selection (global_pos) and a second, independent
 constraint on identity, since Valve publishes no account ids and both boards
 carry only deadlock-api's fuzzy name-to-id guesses. Item data comes from SQL.
 
+SQL SOURCE. 2026-10-14: every query now runs on deadlock-api's public data
+lake, read directly with DuckDB (lake.py), not through /v1/sql. That endpoint
+moved onto the same lake that day, with a 45 s timeout, and the 21:08 UTC run
+died on it. The queries are DuckDB SQL now; lake.py's docstring lists what
+the lake does differently from the old ClickHouse tables.
+
 MODE. 2026-09-02: reverted from the ranked-only cohort back to standard play.
 Ranked volume never grew into what the ranked-native selector assumed and the
 ladder feeding it has been degrading, so ordering on ranked win rate or ranked
@@ -28,6 +34,9 @@ Outputs (./output/):
     roster.csv           every RELEASED hero, with or without data this run —
                          how a new hero reaches the site before it has a pool,
                          plus first_seen / new for the new-hero fallback
+    pool_players.csv     the players behind the sampled builds, by display
+                         name, with their record on the hero. For analysis;
+                         carries no account ids (see write_pool_players)
 
 NAMING NOTE. hero_games / hero_wins count a player's games and wins ON THE HERO
 named in the same row, across the whole lookback. They were called games_all /
@@ -37,7 +46,8 @@ exist so hero strength can be separated from the general skill of whoever mains
 the hero. hero_matches is a different quantity again: games on the hero within
 the player's last RECENCY_WINDOW matches, so it caps at that value.
 
-Stdlib only.  Run:  python3 deadlock_pipeline.py
+Stdlib only, plus duckdb, which lake.py installs on first use.
+Run:  python3 deadlock_pipeline.py
 """
 
 import csv
@@ -51,6 +61,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
+
+import lake
 
 BASE = "https://api.deadlock-api.com"
 API_KEY = os.environ.get("DEADLOCK_API_KEY")
@@ -149,24 +161,29 @@ EXCLUSIVITY = (os.environ.get("EXCLUSIVITY") or "0") == "1"
 # to switch — every filter below reads this one variable.
 MATCH_MODE = os.environ.get("MATCH_MODE") or ""
 GAME_MODE = os.environ.get("GAME_MODE") or "Normal"
-MODE_SQL = ("match_mode = '%s' AND " % MATCH_MODE if MATCH_MODE else "") + \
-           ("game_mode = '%s' AND " % GAME_MODE if GAME_MODE else "")
+
+
+def mode_filter(match_mode=None, game_mode=True):
+    """The match_mode / game_mode filter as a SQL predicate on the lake, which
+    may store either enum by name or by code (lake.enum_is). `match_mode`
+    defaults to MATCH_MODE; "" means no match_mode filter. Never empty: "TRUE"
+    when there is nothing to filter."""
+    mm = MATCH_MODE if match_mode is None else match_mode
+    parts = []
+    if mm:
+        parts.append(lake.enum_is("match_mode", mm))
+    if game_mode and GAME_MODE:
+        parts.append(lake.enum_is("game_mode", GAME_MODE))
+    return " AND ".join(parts) or "TRUE"
 
 SNAPSHOTS = [int(x) for x in
              (os.environ.get("SNAPSHOTS") or "4800,9600,14400,20800").split(",")]
 
-MAX_URL = _env("MAX_URL", 9000)   # ~9KB is documented as working (SCHEMA.md quirk #4)
-# The SQL quota is 2 requests per 60s and the window SLIDES. A 429 response
-# still counts as a request, so retrying inside the window burns another slot
-# and pushes the window forward instead of clearing it — a 2026-08-07 run died
-# after retries at 9s, 17s and 35s, each of which made things worse.
-#
-# 35s spacing puts two calls inside one 60s window by construction: #1 at
-# t=0 and #2 at t=35 leaves 2 requests in the trailing minute, so #2 is at the
-# limit and any retry is refused. Spacing must exceed HALF the window with
-# margin; 32s is the theoretical floor and 40s is the safe one.
-SQL_PAUSE_S = _env("SQL_PAUSE_S", 40)
-# On a 429 the only reliable recovery is to let the whole window drain.
+MAX_URL = _env("MAX_URL", 9000)   # REST URLs (hero-stats); ~9KB works (SCHEMA.md quirk #4)
+# SQL no longer goes through the API (lake.py), so the old /v1/sql pacing is
+# gone: no 40 s pause between queries, no 2/min or 20/hr quota to stay under.
+# A REST 429 still waits for the whole window to drain: a 429 counts as a
+# request, so retrying inside the window only pushes it forward.
 SQL_429_WAIT_S = _env("SQL_429_WAIT_S", 65)
 
 # ---- orbit fill -----------------------------------------------------------
@@ -316,9 +333,9 @@ KNOWN_RELEASES = {84: "2026-10-02", 88: "2026-10-06"}
 # ORBIT2_MEASURE: while any hero is NEW, run the query every run even when no
 # gap is left, to print the measurement — players are still only taken where
 # there is a gap. That is how the filter gets judged on real lobbies BEFORE a
-# release that needs it (Rat King's fallback was full by its second run). The
-# key (DEADLOCK_API_KEY) lifts the 20/hr IP cap, so this costs 2 SQL calls and
-# ~80 s per run while a hero is new, nothing otherwise.
+# release that needs it (Rat King's fallback was full by its second run). It
+# costs one lake query per region while a hero is new, nothing otherwise
+# (2026-10-14: no SQL quota any more, see lake.py).
 ORBIT2_FILL = _env("ORBIT2_FILL", 1)
 ORBIT2_MEASURE = _env("ORBIT2_MEASURE", 1)
 # ...for a hero's first ORBIT2_MEASURE_DAYS only, so the 30-day new-hero window
@@ -329,9 +346,6 @@ ORBIT2_SHARE_K = _env("ORBIT2_SHARE_K", 2)
 ORBIT2_LIMIT = _env("ORBIT2_LIMIT", 20000)
 ORBIT2_STATS_MAX = _env("ORBIT2_STATS_MAX", 1000)
 
-# Unkeyed /v1/sql allows 2 req/min AND 20 req/hr (SCHEMA.md quirk #5). The
-# hourly cap is the binding one for chunked queries — it is what killed the
-# 2026-07-31 runs at chunk 21 both times. An X-API-Key raises this.
 # ---- recency decay + pool net wins ---------------------------------------
 # net wins = wins - losses = games x (2p - 1). It is CUMULATIVE, so a nerfed
 # hero keeps every win already banked and only stops adding to the pile; it
@@ -364,14 +378,17 @@ DECAY_HALFLIFE_DAYS = float(os.environ.get("DECAY_HALFLIFE_DAYS") or 0)
 DECAY_MATCH_MODE = os.environ.get("DECAY_MATCH_MODE")
 if DECAY_MATCH_MODE is None:
     DECAY_MATCH_MODE = MATCH_MODE
-# Costs 1-3 SQL calls against the 20/hr cap. Set 0 to skip; tierlist then
-# keeps elite_winrate as the primary sort.
+# One lake query over LOOKBACK_DAYS. Set 0 to skip; tierlist then keeps
+# elite_winrate as the primary sort.
 POOL_NET_WINS = _env("POOL_NET_WINS", 1)
 # Pool players at or below this net-wins figure are listed in pool_audit.csv.
 # 0 means "has lost at least as often as won on the hero", which is the case
 # worth eyeballing: an elite pool should not contain break-even players.
 POOL_LOW_NET_WINS = _env("POOL_LOW_NET_WINS", 0)
-HOURLY_SQL_BUDGET = _env("HOURLY_SQL_BUDGET", 20)
+# pool_players.csv fills the display name of players who came from no board
+# (orbit, ring 2) from the lake's Steam profiles: one small query. 0 skips it
+# and leaves those names blank.
+POOL_PLAYER_NAMES = _env("POOL_PLAYER_NAMES", 1)
 OUT_DIR = "output"
 
 
@@ -441,34 +458,20 @@ def _get(url, tries=_env("HTTP_TRIES", 4)):
 _sql_calls = [0]
 
 
-# The exact string sql() measures, so callers can size a chunk against the same
-# number instead of guessing at the prefix. query_items() measured quote(q)
-# alone, which is ~50 chars short of the real URL — a chunk could clear its own
-# check at 8,997 and then die inside sql() at 9,007.
-def sql_url(query):
-    return BASE + "/v1/sql?format=json&query=" + urllib.parse.quote(query)
-
-
 def sql(query, label=""):
-    url = sql_url(query)
-    if len(url) > MAX_URL:
-        raise SystemExit("Query URL is %d chars (limit %d) — %s would 414. "
-                         "Reduce the batch size." % (len(url), MAX_URL, label or "query"))
-    if _sql_calls[0]:
-        print("  [sql] pausing %ds for the rate limit" % SQL_PAUSE_S, file=sys.stderr)
-        time.sleep(SQL_PAUSE_S)
+    """One query on the public data lake (lake.py). Returns a list of dicts.
+
+    Fatal on failure, as /v1/sql errors were: callers that can do without a
+    result (ring 2) catch SystemExit. lake.query has already retried network
+    errors on a fresh catalog; what reaches here is a bug, a schema change or
+    a lake that is down, and the site keeps its last good data.
+    """
     _sql_calls[0] += 1
-    print("  [sql] #%d %s (%d char url)" % (_sql_calls[0], label, len(url)), file=sys.stderr)
     try:
-        rows = _get(url)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "replace")[:800]
-        raise SystemExit("SQL failed (%s) on %s:\n%s\n\nQuery:\n%s"
-                         % (e.code, label, body, query[:2000]))
-    if isinstance(rows, dict):
-        rows = rows.get("data", rows.get("rows", []))
-    print("  [sql] -> %d rows" % len(rows), file=sys.stderr)
-    return rows
+        return lake.query(query, label)
+    except Exception as e:
+        raise SystemExit("SQL failed on %s: %s\n\nQuery:\n%s"
+                         % (label, lake.first_line(e), query[:2000]))
 
 
 # --------------------------------------------------------------------------
@@ -850,22 +853,36 @@ def fetch_ladders(heroes, general=None):
 # /v1/players/hero-stats (batched, no SQL). See fetch_hero_stats().
 
 
-# imbued_ability_id rides along in the SAME array join, so it costs no extra
-# SQL call. Nine of the 156 items are imbue items whose effect applies to one
-# chosen ability; this is the only place the game records which one was picked.
+# imbued_ability_id rides along in the same row, so it costs nothing extra.
+# Nine of the 156 items are imbue items whose effect applies to one chosen
+# ability; this is the only place the game records which one was picked.
+#
+# PORTED TO THE LAKE 2026-10-14. ClickHouse's ARRAY JOIN does not exist in
+# DuckDB, and the lake does not publish the MATERIALIZED items.net_worth_at_buy.
+# So the query returns ONE row per player-match with the purchase arrays and
+# the stats timeline, and query_items() expands it in Python, rebuilding net
+# worth at buy exactly as deadlock-api does (lake.net_worth_at_buy). The rows it
+# hands back have the same fields as before.
+#
+# The match_id list makes the lake skip every file outside those ids. QUALIFY
+# keeps the newest copy of a player-match: a duplicate (an hourly delta
+# re-exporting a row already in a base file) would otherwise double that
+# build's purchases and ability upgrades.
 Q_ITEMS = """
-SELECT account_id, hero_id, match_id,
-       item_id, nwb AS net_worth_at_buy, bought AS game_time_s, sold AS sold_time_s,
-       imbued AS imbued_ability_id
+SELECT match_id, account_id, hero_id, net_worth,
+       {items_item_id}           AS item_ids,
+       {items_game_time_s}       AS bought,
+       {items_sold_time_s}       AS sold,
+       {items_imbued_ability_id} AS imbued,
+       {stats_time_stamp_s}      AS stat_ts,
+       {stats_net_worth}         AS stat_nw
 FROM match_player
-ARRAY JOIN
-    items.item_id           AS item_id,
-    items.net_worth_at_buy  AS nwb,
-    items.game_time_s       AS bought,
-    items.sold_time_s       AS sold,
-    items.imbued_ability_id AS imbued
 WHERE match_id IN ({mids}) AND account_id IN ({aids})
+QUALIFY row_number() OVER (PARTITION BY match_id, account_id
+                           ORDER BY created_at DESC) = 1
 """
+ITEM_COLUMNS = ("items.item_id", "items.game_time_s", "items.sold_time_s",
+                "items.imbued_ability_id", "stats.time_stamp_s", "stats.net_worth")
 
 
 # --------------------------------------------------------------------------
@@ -902,14 +919,22 @@ def shrunk(wins, games, k=None):
     return (wins + k * 0.5) / (games + k) if (games + k) else 0.5
 
 
+# Everyone in a match with one of the seed candidates, in the window.
+#
+# 2026-10-14: the OUTER scan is now bounded on start_time too. On the lake only
+# match_id and start_time filters skip files, and `match_id IN (subquery)`
+# skips none, so the old outer scan read every match_player file there is.
+# That is what timed out on /v1/sql (504 at 45 s) and killed the 21:08 UTC run.
+# The rows are the same: every player of a match shares its start_time.
 Q_ORBIT = """
-SELECT match_id, account_id
+SELECT DISTINCT match_id, account_id
 FROM match_player
-WHERE match_id IN (
+WHERE {since}
+  AND match_id IN (
     SELECT match_id FROM match_player
-    WHERE account_id IN ({ids})
-      AND {mode}game_mode = 'Normal'
-      AND start_time >= now() - INTERVAL {days} DAY
+    WHERE {since}
+      AND account_id IN ({ids})
+      AND {filt}
 )
 """
 
@@ -951,13 +976,8 @@ def fetch_orbit1(candidates, label=""):
     pool = order[:ORBIT_SEEDS * max(1, ORBIT_SEED_OVERFETCH)]
     if not pool:
         return {}, []
-    mode_sql = "match_mode = '%s' AND " % MATCH_MODE if MATCH_MODE else ""
     q = Q_ORBIT.format(ids=",".join(str(a) for a in pool),
-                       mode=mode_sql, days=ORBIT_DAYS)
-    while len(sql_url(q)) > MAX_URL and len(pool) > ORBIT_SEEDS:
-        pool = pool[:max(ORBIT_SEEDS, len(pool) * 2 // 3)]
-        q = Q_ORBIT.format(ids=",".join(str(a) for a in pool),
-                           mode=mode_sql, days=ORBIT_DAYS)
+                       since=lake.since(ORBIT_DAYS), filt=mode_filter())
     try:
         rows = sql(q, "orbit1 %s from %d seed candidates" % (label, len(pool)))
     except SystemExit:
@@ -1008,44 +1028,44 @@ def fetch_orbit1(candidates, label=""):
     return out, seeds
 
 
-# Ring 2, computed server-side from the seeds so the URL stays a few hundred
-# characters: ring 1 is ~950 ids, which as a literal IN list would overflow
-# MAX_URL and cost several calls. Restricted to accounts that have played one
-# of the short new heroes, so the result is small. Per account: `shared` =
+# Ring 2, computed in one query from the seeds, so ring 1 (~950 ids) never has
+# to travel as a literal list. Restricted to accounts that have played one of
+# the short new heroes, so the result is small. Per account: `shared` =
 # distinct ring-1 matches it played in, `played` = distinct matches it played
-# in the same window and mode (uniqExact: match_player is a ReplacingMergeTree,
-# so a not-yet-merged duplicate row must not count twice). The hero filter
-# leads with hero_id, game_mode, which is the order of deadlock-api's
-# hero-led projection on match_player.
+# in the same window and mode. Both count DISTINCT matches, so a duplicate row
+# (the lake re-exports some rows; ClickHouse had unmerged parts) never counts
+# twice.
+#
+# 2026-10-14, ported to DuckDB on the lake: uniqExact/uniqExactIf became
+# count(DISTINCT ...) [FILTER], and EVERY scan is bounded on start_time,
+# ring 1's too. Unbounded, it read the whole table. Same rows: ring 1 comes
+# from seed matches, all inside the window.
 Q_ORBIT2 = """
 WITH
   seed_m AS (
     SELECT DISTINCT match_id FROM match_player
-    WHERE account_id IN ({seeds}) AND {mode}game_mode = 'Normal'
-      AND start_time >= now() - INTERVAL {days} DAY),
+    WHERE {since} AND account_id IN ({seeds}) AND {filt}),
   ring1 AS (
     SELECT DISTINCT account_id FROM match_player
-    WHERE match_id IN (SELECT match_id FROM seed_m)),
+    WHERE {since} AND match_id IN (SELECT match_id FROM seed_m)),
   ring1_m AS (
     SELECT DISTINCT match_id FROM match_player
-    WHERE account_id IN (SELECT account_id FROM ring1) AND {mode}game_mode = 'Normal'
-      AND start_time >= now() - INTERVAL {days} DAY)
+    WHERE {since} AND account_id IN (SELECT account_id FROM ring1) AND {filt}),
+  hero_players AS (
+    SELECT DISTINCT account_id FROM match_player
+    WHERE {since_hero} AND hero_id IN ({heroes}) AND {filt})
 SELECT account_id,
-       uniqExactIf(match_id, in_ring1 = 1) AS shared,
-       uniqExact(match_id) AS played
+       count(DISTINCT match_id) FILTER (WHERE in_ring1) AS shared,
+       count(DISTINCT match_id) AS played
 FROM (
   SELECT account_id, match_id,
          match_id IN (SELECT match_id FROM ring1_m) AS in_ring1
   FROM match_player
-  WHERE {mode}game_mode = 'Normal'
-    AND start_time >= now() - INTERVAL {days} DAY
+  WHERE {since} AND {filt}
     AND account_id NOT IN (SELECT account_id FROM ring1)
-    AND account_id IN (
-        SELECT DISTINCT account_id FROM match_player
-        WHERE hero_id IN ({heroes}) AND {mode}game_mode = 'Normal'
-          AND start_time >= now() - INTERVAL {hero_days} DAY))
+    AND account_id IN (SELECT account_id FROM hero_players))
 GROUP BY account_id
-HAVING shared > 0
+HAVING count(DISTINCT match_id) FILTER (WHERE in_ring1) > 0
 ORDER BY shared DESC, played ASC, account_id ASC
 LIMIT {limit}
 """
@@ -1056,17 +1076,17 @@ def fetch_orbit2(seed_ids, hero_ids, label=""):
     players of the heroes.
 
     ONE SQL call. Never fatal: ring 2 is the last tier of an optional fill,
-    so a refusal (the restricted SQL user may time out on a two-hop join)
-    costs only ring 2, not the run.
+    so a failed query costs only ring 2, not the run.
     """
     seeds = list(dict.fromkeys(int(a) for a in seed_ids if a))[:ORBIT_SEEDS]
     if not seeds or not hero_ids:
         return {}
-    mode_sql = "match_mode = '%s' AND " % MATCH_MODE if MATCH_MODE else ""
-    q = Q_ORBIT2.format(seeds=",".join(str(a) for a in seeds), mode=mode_sql,
-                        days=ORBIT_DAYS, heroes=",".join(str(h) for h in sorted(hero_ids)),
-                        hero_days=NEW_HERO_DAYS + 1, limit=ORBIT2_LIMIT)
     try:
+        q = Q_ORBIT2.format(seeds=",".join(str(a) for a in seeds),
+                            since=lake.since(ORBIT_DAYS), filt=mode_filter(),
+                            since_hero=lake.since(NEW_HERO_DAYS + 1),
+                            heroes=",".join(str(h) for h in sorted(hero_ids)),
+                            limit=ORBIT2_LIMIT)
         rows = sql(q, "orbit2 %s from %d seeds" % (label, len(seeds)))
     except (SystemExit, Exception) as e:
         print("  [orbit2] %s query failed (%s) — continuing without ring 2"
@@ -1089,16 +1109,26 @@ def orbit2_closeness(shared, played):
     return shared / float(played + ORBIT2_SHARE_K)
 
 
+# 2026-10-14, ported to DuckDB on the lake. The inner GROUP BY keeps one row
+# per player-match (the newest created_at): the lake re-exports some rows, and
+# counting them twice would inflate games and wins. No game_mode filter, as
+# before; only DECAY_MATCH_MODE's match_mode filter.
 Q_POOL_WINS = """
 SELECT account_id,
        hero_id,
-       count()    AS g,
-       sum(won)   AS w,
-       sum(pow(0.5, dateDiff('day', start_time, now()) / {hl}))       AS wg,
-       sum(won * pow(0.5, dateDiff('day', start_time, now()) / {hl})) AS ww
-FROM match_player
-WHERE {mode}start_time >= now() - INTERVAL {days} DAY
-  AND (account_id, hero_id) IN ({pairs})
+       CAST(count(*) AS BIGINT)                     AS g,
+       CAST(count(*) FILTER (WHERE won) AS BIGINT)  AS w,
+       sum(pow(0.5, {age} / {hl}))                       AS wg,
+       sum(CASE WHEN won THEN pow(0.5, {age} / {hl}) ELSE 0 END) AS ww
+FROM (
+    SELECT match_id, account_id,
+           arg_max(hero_id, created_at)    AS hero_id,
+           arg_max(won, created_at)        AS won,
+           arg_max(start_time, created_at) AS start_time
+    FROM match_player
+    WHERE {since} AND {filt}
+      AND (account_id, hero_id) IN ({pairs})
+    GROUP BY match_id, account_id)
 GROUP BY account_id, hero_id
 """
 
@@ -1106,41 +1136,27 @@ GROUP BY account_id, hero_id
 def fetch_pool_wins(pairs):
     """Ranked games/wins per sampled (account, hero), raw and decay-weighted.
 
-    Chunked under MAX_URL exactly like query_items. Returns
-    (account_id, hero_id) -> {"g","w","wg","ww"}. hero_stats already gives a
-    raw record, but it is unweighted and its match_mode handling is the API's
-    rather than ours, so the ranked-only guarantee is asserted here in SQL.
+    One lake query over LOOKBACK_DAYS (no URL limit to chunk under any more).
+    Returns (account_id, hero_id) -> {"g","w","wg","ww"}. hero_stats already
+    gives a raw record, but it is unweighted and its match_mode handling is
+    the API's rather than ours, so the mode guarantee is asserted here in SQL.
     """
     hl = DECAY_HALFLIFE_DAYS if DECAY_HALFLIFE_DAYS > 0 else 1e9
+    pairs = sorted(set((int(a), int(h)) for a, h in pairs))
+    if not pairs:
+        return {}
     # "" means no match_mode filter at all — standard play, the same games the
     # general board is built from. A bare "match_mode = ''" would match nothing.
-    mode_sql = "match_mode = '%s' AND " % DECAY_MATCH_MODE if DECAY_MATCH_MODE else ""
-
-    out, chunk, i = {}, max(20, MAX_URL // 22), 0
-    pairs = sorted(set(pairs))
-    while i < len(pairs):
-        part = pairs[i:i + chunk]
-        body = ",".join("(%d,%d)" % (a, h) for a, h in part)
-        q = Q_POOL_WINS.format(hl=hl, mode=mode_sql,
-                               days=LOOKBACK_DAYS, pairs=body)
-        n = len(sql_url(q))
-        if n > MAX_URL:
-            if chunk <= 20:
-                raise SystemExit(
-                    "pool-wins chunk of %d pairs is %d chars, over the %d limit."
-                    % (len(part), n, MAX_URL))
-            fixed = len(sql_url(Q_POOL_WINS.format(hl=hl, mode=mode_sql,
-                                                   days=LOOKBACK_DAYS, pairs="")))
-            per = max((n - fixed) / len(part), 1.0)
-            chunk = max(20, min(chunk - 1, int((MAX_URL - fixed) / per * 0.97)))
-            continue
-        rows = sql(q, "pool wins %d-%d of %d" % (i + 1, i + len(part), len(pairs)))
-        for r in rows:
-            out[(int(r["account_id"]), int(r["hero_id"]))] = {
-                "g": int(float(r["g"])), "w": int(float(r["w"])),
-                "wg": float(r["wg"]), "ww": float(r["ww"]),
-            }
-        i += len(part)
+    q = Q_POOL_WINS.format(hl=float(hl), age=lake.age_days(),
+                           since=lake.since(LOOKBACK_DAYS),
+                           filt=mode_filter(match_mode=DECAY_MATCH_MODE, game_mode=False),
+                           pairs=",".join("(%d, %d)" % (a, h) for a, h in pairs))
+    out = {}
+    for r in sql(q, "pool wins for %d players" % len(pairs)):
+        out[(int(r["account_id"]), int(r["hero_id"]))] = {
+            "g": int(float(r["g"])), "w": int(float(r["w"])),
+            "wg": float(r["wg"]), "ww": float(r["ww"]),
+        }
     return out
 
 
@@ -1578,33 +1594,139 @@ def new_hero_fill(new_heroes, heroes, ladder, general, stats, chosen,
 
 
 def query_items(pairs):
-    """Chunked so no single URL exceeds MAX_URL."""
-    # ~22 encoded chars per (match_id, account_id) pair; //25 leaves room for
-    # the query body. The old //40 was undersized and cost 3 extra requests —
-    # which matters against the 20 req/HR unkeyed cap, not the 2/min one.
-    # Halving on overflow wasted requests: a 360-pair chunk that missed by ten
-    # characters dropped to 180 and left the URL half empty, turning 4 calls
-    # into 8 against a 20/HOUR cap. Measure the real URL and resize in
-    # proportion instead, so a chunk lands just under the limit.
-    rows, chunk, i = [], max(20, MAX_URL // 25), 0
-    while i < len(pairs):
-        part = pairs[i:i + chunk]
-        q = Q_ITEMS.format(mids=",".join(str(m) for m, _ in part),
-                           aids=",".join(str(a) for _, a in part))
-        n = len(sql_url(q))
-        if n > MAX_URL:
-            if chunk <= 20:
-                raise SystemExit(
-                    "items chunk of %d pairs is %d chars, over the %d limit, and "
-                    "cannot be shrunk further. Raise MAX_URL or shorten Q_ITEMS."
-                    % (len(part), n, MAX_URL))
-            fixed = len(sql_url(Q_ITEMS.format(mids="", aids="")))
-            per = max((n - fixed) / len(part), 1.0)
-            chunk = max(20, min(chunk - 1, int((MAX_URL - fixed) / per * 0.97)))
+    """One row per acquisition for each (match_id, account_id) in `pairs`,
+    with the fields the ClickHouse ARRAY JOIN returned: account_id, hero_id,
+    match_id, item_id, net_worth_at_buy, game_time_s, sold_time_s,
+    imbued_ability_id. Hero abilities ride along in items.item_id, as before.
+
+    One lake query: the URL limit that used to chunk this into ~5 calls is
+    gone. A player-match the lake doesn't have returns nothing, as an unparsed
+    match always did; resolve_on_lake() has already stepped those back.
+    """
+    pairs = sorted({(int(m), int(a)) for m, a in pairs})
+    if not pairs:
+        return []
+    missing = lake.missing_columns(ITEM_COLUMNS)
+    if missing:
+        raise SystemExit("The lake's match_player has no %s column, which the item "
+                         "query reads. Its schema changed; see the [lake] "
+                         "match_player line above." % ", ".join(missing))
+    q = Q_ITEMS.format(
+        mids=",".join(str(m) for m in sorted({m for m, _ in pairs})),
+        aids=",".join(str(a) for a in sorted({a for _, a in pairs})),
+        **{c.replace(".", "_"): lake.ident(c) for c in ITEM_COLUMNS})
+    want = set(pairs)
+    rows, found = [], 0
+    for r in sql(q, "items for %d player-matches" % len(pairs)):
+        key = (int(r["match_id"]), int(r["account_id"]))
+        if key not in want:          # match_id IN x account_id IN is a superset
             continue
-        rows.extend(sql(q, "items %d-%d of %d" % (i + 1, i + len(part), len(pairs))))
-        i += len(part)
+        found += 1
+        ids = r["item_ids"] or []
+        bought = r["bought"] or []
+        sold = r["sold"] or []
+        imbued = r["imbued"] or []
+        final = int(r["net_worth"] or 0)
+        for i, iid in enumerate(ids):
+            if iid is None:
+                continue
+            bt = int(bought[i] or 0) if i < len(bought) else 0
+            rows.append({
+                "account_id": key[1], "hero_id": int(r["hero_id"]), "match_id": key[0],
+                "item_id": int(iid),
+                "net_worth_at_buy": lake.net_worth_at_buy(bt, r["stat_ts"], r["stat_nw"],
+                                                          final),
+                "game_time_s": bt,
+                "sold_time_s": (sold[i] if i < len(sold) else 0) or 0,
+                "imbued_ability_id": (imbued[i] if i < len(imbued) else 0) or 0,
+            })
+    print("  [items] %d of %d player-matches found, %d acquisitions"
+          % (found, len(pairs), len(rows)), file=sys.stderr)
     return rows
+
+
+# Does the lake have these player-matches yet? Two narrow columns, and the
+# match_id list skips every other file.
+Q_ON_LAKE = """
+SELECT DISTINCT match_id, account_id
+FROM match_player
+WHERE match_id IN ({mids}) AND account_id IN ({aids})
+"""
+
+# Each missing build's newest game ON THE SAME HERO that the lake has, before
+# the one it doesn't, in the same modes hero-stats was asked for.
+Q_STEP_BACK = """
+WITH want(account_id, hero_id, before) AS (VALUES {rows})
+SELECT p.account_id AS account_id, p.hero_id AS hero_id,
+       max(p.match_id) AS match_id,
+       {played} AS played
+FROM match_player AS p
+JOIN want AS w
+  ON p.account_id = w.account_id AND p.hero_id = w.hero_id
+ AND p.match_id < w.before
+WHERE {since} AND {filt}
+GROUP BY p.account_id, p.hero_id
+"""
+# How far back a missing build may step. The lake trails the live database by
+# 10-70 minutes, so the step is normally one game; a week covers players who
+# took a break from the hero, without scanning the whole lookback.
+LAKE_STEP_BACK_DAYS = _env("LAKE_STEP_BACK_DAYS", 7)
+
+
+def resolve_on_lake(chosen):
+    """Point every sampled build at a game the lake has.
+
+    WHY. hero-stats reads deadlock-api's live database, but the lake is an
+    hourly export with a 10-minute lag, so it trails by 10-70 minutes. A player
+    who finished a game on the hero in that gap has a last_match_id the lake
+    doesn't have yet, and querying it would quietly drop the build. Such a
+    build steps back to the player's newest game on the hero that the lake
+    does have, which is the game the site would have shown an hour earlier.
+    One with no such game in LAKE_STEP_BACK_DAYS keeps its match and returns
+    no items, as an unparsed match always did.
+
+    Changes last_match_id / last_played in place and sets lake_step_back to the
+    match it replaced. Returns (stepped back, still missing).
+    """
+    builds = [(hid, c) for hid, lst in chosen.items() for c in lst
+              if c.get("last_match_id") is not None and c.get("account_id") is not None]
+    if not builds:
+        return 0, 0
+    mids = sorted({int(c["last_match_id"]) for _h, c in builds})
+    aids = sorted({int(c["account_id"]) for _h, c in builds})
+    have = {(int(r["match_id"]), int(r["account_id"]))
+            for r in sql(Q_ON_LAKE.format(mids=",".join(map(str, mids)),
+                                          aids=",".join(map(str, aids))),
+                         "which of %d sampled games the lake has" % len(builds))}
+    miss = [(hid, c) for hid, c in builds
+            if (int(c["last_match_id"]), int(c["account_id"])) not in have]
+    if not miss:
+        print("  [lake] all %d sampled games are on the lake" % len(builds),
+              file=sys.stderr)
+        return 0, 0
+    rows = ",".join("(%d, %d, %d)" % (int(c["account_id"]), hid, int(c["last_match_id"]))
+                    for hid, c in miss)
+    got = {}
+    for r in sql(Q_STEP_BACK.format(rows=rows, since=lake.since(LAKE_STEP_BACK_DAYS),
+                                    filt=mode_filter(),
+                                    played=lake.to_epoch("arg_max(p.start_time, p.match_id)")),
+                 "previous game on the hero for %d builds the lake lacks" % len(miss)):
+        got[(int(r["account_id"]), int(r["hero_id"]))] = (int(r["match_id"]),
+                                                         int(r["played"] or 0))
+    stepped = 0
+    for hid, c in miss:
+        new = got.get((int(c["account_id"]), hid))
+        if not new:
+            continue
+        c["lake_step_back"] = c["last_match_id"]
+        c["last_match_id"], c["last_played"] = new
+        stepped += 1
+    print("  [lake] %d of %d sampled games are on the lake; %d stepped back to the "
+          "player's previous game on the hero (the lake trails the live data by "
+          "10-70 min), %d have none in %d days"
+          % (len(builds) - len(miss), len(builds), stepped, len(miss) - stepped,
+             LAKE_STEP_BACK_DAYS), file=sys.stderr)
+    return stepped, len(miss) - stepped
 
 
 # --------------------------------------------------------------------------
@@ -1662,6 +1784,13 @@ def main():
      hero_meta) = load_assets()
     today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
     first_seen, new_heroes = load_first_seen(heroes, today)
+    # Open the data lake now, before a minute of ladder calls: if it can't be
+    # reached the run stops here, with the site still on its last good data.
+    try:
+        lake.connect()
+    except Exception as e:
+        raise SystemExit("Could not open deadlock-api's data lake (%s), which every "
+                         "SQL step reads. Not writing CSVs." % lake.first_line(e))
 
     print("[2/5] ladders (%s), depth %d, target %d per region, exclusivity %s, "
           "mode %s, selection by %s"
@@ -1694,13 +1823,9 @@ def main():
         raise SystemExit("No account ids resolved from any leaderboard entry. Not writing "
                          "CSVs — leaving yesterday's output/data.json in place.")
 
-    # Candidate stats now come from /v1/players/hero-stats (batched, 100 req/s,
-    # NOT /v1/sql), so the only SQL left in the run is the item query. That took
-    # a run from ~16 SQL calls to ~4 and is why both regions can share one run
-    # again instead of alternating.
-    est_items = -(-(TARGET_BUILDS * len(heroes)) // max(20, MAX_URL // 25))
-    print("  [lb] 0 pool + ~%d item = ~%d SQL requests this run (hourly cap %d)"
-          % (est_items, est_items, HOURLY_SQL_BUDGET), file=sys.stderr)
+    # Candidate stats come from /v1/players/hero-stats (batched, 100 req/s).
+    # SQL (orbit, pool net wins, items) runs on the data lake, where there is
+    # no per-query budget to plan around any more.
 
     print("[3/5] ranked hero stats for %d ladder-sourced ids (no SQL)"
           % len(ladder_ids), file=sys.stderr)
@@ -2006,6 +2131,11 @@ def main():
                   "heroes: %s" % (len(pool_low), POOL_LOW_NET_WINS,
                                   dict(bysrc), dict(byhero.most_common(5))),
                   file=sys.stderr)
+
+    # The lake trails hero-stats by up to ~70 minutes: a build whose newest
+    # game hasn't reached it yet steps back one game. Before `wanted` and the
+    # maps keyed on the match, so all of them see the game actually sampled.
+    resolve_on_lake(chosen)
 
     wanted = [(c["last_match_id"], c["account_id"])
               for lst in chosen.values() for c in lst]
@@ -2407,13 +2537,22 @@ def main():
            # matches / all matches in the window) for its ring-2 tier; "orbit"
            # plus the breadth of contact
            # for anyone the orbit fill supplied
-           "source", "orbit_seeds_met", "orbit2_shared"])
+           "source", "orbit_seeds_met", "orbit2_shared",
+           # the match the build was SUPPOSED to come from, when the lake
+           # didn't have it yet and the build stepped back (resolve_on_lake)
+           "lake_step_back"])
     if POOL_NET_WINS:
         write("pool_audit.csv",
               sorted(pool_low, key=lambda r: (r["net_wins"], r["hero"])),
               ["hero", "hero_id", "region", "account_id", "account_name",
                "source", "orbit_seeds_met", "ranked_games", "ranked_wins",
                "net_wins", "net_wins_decayed", "ranked_rating"])
+
+    # An extra for analysis, never fatal: nothing downstream reads it.
+    try:
+        write_pool_players(chosen, heroes, {(m, a) for (_h, m, a) in per_build})
+    except (SystemExit, Exception) as e:
+        print("  [pool_players] not written: %s" % lake.first_line(e), file=sys.stderr)
 
     # A disabled id reaching this point means the filter in load_assets() has
     # been bypassed or the asset dump changed shape. Fail loudly: shipping a
@@ -2496,9 +2635,114 @@ def main():
               % ", ".join("%s %d->%d" % (t["hero"], t["rank"], t["delta_rank"])
                           for t in moved[:10]), file=sys.stderr)
 
-    print("\nDone. %d heroes, %d builds, %d item rows, %d ability rows, %d SQL calls."
+    print("\nDone. %d heroes, %d builds, %d item rows, %d ability rows, %d lake queries."
           % (len(tier), sum(builds.values()), len(freq), len(abil_freq),
              _sql_calls[0]), file=sys.stderr)
+
+
+Q_NAMES = """
+SELECT account_id, arg_max(personaname, last_updated) AS name
+FROM steam_profiles
+WHERE account_id IN ({ids})
+GROUP BY account_id
+"""
+
+
+def lookup_names(account_ids):
+    """account_id -> Steam persona name, from the lake's steam_profiles.
+
+    Only for pool_players.csv, and only for players who came from no board
+    (orbit, ring 2), so they have no leaderboard display name. deadlock-api
+    keeps protected accounts out of the lake, so those simply stay blank.
+    Never fatal: a name is there to read the file by, nothing is computed
+    from it.
+    """
+    ids = sorted({int(a) for a in account_ids if a})
+    if not ids or not POOL_PLAYER_NAMES:
+        return {}
+    gone = lake.missing_columns(("account_id", "personaname", "last_updated"),
+                                table="steam_profiles")
+    if gone:
+        print("  [names] the lake's steam_profiles has no %s; names left blank"
+              % ", ".join(gone), file=sys.stderr)
+        return {}
+    try:
+        rows = sql(Q_NAMES.format(ids=",".join(map(str, ids))),
+                   "Steam names for %d players with no board name" % len(ids))
+    except (SystemExit, Exception) as e:
+        print("  [names] lookup failed (%s); names left blank"
+              % lake.first_line(e), file=sys.stderr)
+        return {}
+    return {int(r["account_id"]): str(r["name"]).strip()
+            for r in rows if r.get("name") and str(r["name"]).strip()}
+
+
+_SOURCE_ORDER = {"board": 0, "sweep": 1, "orbit": 2, "orbit2": 3}
+
+
+def write_pool_players(chosen, heroes, sampled):
+    """pool_players.csv: the players behind the sampled builds, for analysis.
+
+    One row per player per hero-region pool: display name and where it came
+    from, how the player got into the pool, standing, and the record on the
+    hero. `sampled` is the (match_id, account_id) set whose items made it into
+    item_frequency.csv.
+
+    The run's artifact carries this file, and on a public repo anyone can
+    download that artifact. So it holds NO account ids and no match ids: the
+    display name is the identifier, as it is on Valve's own boards.
+    """
+    steam = lookup_names(c["account_id"] for lst in chosen.values() for c in lst
+                         if not (c.get("account_name") or "").strip())
+    win = "%dd" % LOOKBACK_DAYS
+    rows = []
+    for hid, lst in chosen.items():
+        for c in lst:
+            name = (c.get("account_name") or "").strip()
+            name_from = "board" if name else ""
+            if not name and steam.get(c["account_id"]):
+                name, name_from = steam[c["account_id"]], "steam"
+            g, w = int(c.get("hero_games") or 0), int(c.get("hero_wins") or 0)
+            rg, rw = c.get("ranked_games"), c.get("ranked_wins")
+            have_window = isinstance(rg, int) and isinstance(rw, int)
+            lp = c.get("last_played")
+            try:
+                played = datetime.datetime.fromtimestamp(
+                    int(lp), datetime.timezone.utc).strftime("%Y-%m-%d") if lp else ""
+            except (TypeError, ValueError, OverflowError, OSError):
+                played = ""
+            rows.append({
+                "hero": heroes.get(hid, ""), "hero_id": hid, "region": c["region"],
+                "player": name, "name_from": name_from,
+                "source": c.get("source") or "board",
+                "general_pos": c.get("global_pos") or "",
+                "ladder_pos": c.get("ladder_pos") or "",
+                "id_confirmed": c.get("id_confirmed") or "",
+                "hero_games": g, "hero_wins": w,
+                "winrate": round(w / g, 4) if g else "",
+                "shrunk_winrate": c.get("ranked_rating", ""),
+                "games_" + win: rg if have_window else "",
+                "wins_" + win: rw if have_window else "",
+                "winrate_" + win: round(rw / rg, 4) if have_window and rg else "",
+                "net_wins_" + win: c.get("net_wins", "") if have_window else "",
+                "build_sampled": "YES" if (c.get("last_match_id"), c.get("account_id"))
+                                 in sampled else "NO",
+                "last_played": played,
+            })
+    rows.sort(key=lambda r: (r["hero"], r["region"], _SOURCE_ORDER.get(r["source"], 9),
+                             r["general_pos"] if r["general_pos"] != "" else 10 ** 9,
+                             r["ladder_pos"] if r["ladder_pos"] != "" else 10 ** 9,
+                             -r["hero_games"]))
+    named = sum(1 for r in rows if r["player"])
+    print("  [pool_players] %d players, %d named (%d from Steam profiles)"
+          % (len(rows), named, sum(1 for r in rows if r["name_from"] == "steam")),
+          file=sys.stderr)
+    write("pool_players.csv", rows,
+          ["hero", "hero_id", "region", "player", "name_from", "source",
+           "general_pos", "ladder_pos", "id_confirmed",
+           "hero_games", "hero_wins", "winrate", "shrunk_winrate",
+           "games_" + win, "wins_" + win, "winrate_" + win, "net_wins_" + win,
+           "build_sampled", "last_played"])
 
 
 def write(name, rows, cols):

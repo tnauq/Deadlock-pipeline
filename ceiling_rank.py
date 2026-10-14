@@ -156,6 +156,8 @@ import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
 
+import lake    # the orbit query runs on deadlock-api's data lake (2026-10-14)
+
 BASE = "https://api.deadlock-api.com"
 API_KEY = os.environ.get("DEADLOCK_API_KEY")
 REGIONS = [r.strip() for r in
@@ -804,41 +806,36 @@ def fetch_ranked_records(account_ids, since=None, label="career"):
     return out, per_hero
 
 
+# Same query as deadlock_pipeline.py's Q_ORBIT, ported to DuckDB on the lake on
+# 2026-10-14: the OUTER scan is bounded on start_time too, because on the lake
+# only match_id and start_time filters skip files. Unbounded, it read every
+# match_player file and timed out on /v1/sql (504 at 45 s). Same rows: every
+# player of a seed's match shares that match's start_time.
 Q_ORBIT = """
-SELECT match_id, account_id
+SELECT DISTINCT match_id, account_id
 FROM match_player
-WHERE match_id IN (
+WHERE {since}
+  AND match_id IN (
     SELECT match_id FROM match_player
-    WHERE account_id IN ({ids})
-      AND {mode}game_mode = 'Normal'
-      AND start_time >= now() - INTERVAL {days} DAY
+    WHERE {since}
+      AND account_id IN ({ids})
+      AND {filt}
 )
 """
 
 
+def orbit_filter():
+    """match_mode (when MATCH_MODE is set) and game_mode = 'Normal', in
+    whichever form the lake stores those enums (lake.enum_is)."""
+    parts = [lake.enum_is("match_mode", MATCH_MODE)] if MATCH_MODE else []
+    parts.append(lake.enum_is("game_mode", "Normal"))
+    return " AND ".join(parts)
+
+
 def sql(query, label=""):
-    """One /v1/sql call. The quota is 2 per 60s on a SLIDING window and a 429
-    still consumes a slot, so a refusal is waited out in full rather than
-    retried immediately."""
-    url = BASE + "/v1/sql?format=json&query=" + urllib.parse.quote(query)
-    if len(url) > MAX_URL:
-        raise RuntimeError("orbit query %d chars, over %d" % (len(url), MAX_URL))
-    print("  [sql] %s (%d char url)" % (label, len(url)), file=sys.stderr)
-    for attempt in range(3):
-        try:
-            rows = get(url)
-            break
-        except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < 2:
-                print("  [sql] 429, waiting 65s", file=sys.stderr)
-                time.sleep(65)
-                continue
-            raise
-    else:
-        raise RuntimeError("rate limited")
-    if isinstance(rows, dict):
-        rows = rows.get("data", rows.get("rows", []))
-    return rows
+    """One query on deadlock-api's public data lake (lake.py), which retries
+    network errors on a fresh catalog itself. No quota to pace any more."""
+    return lake.query(query, label)
 
 
 def _ranges(nums):
@@ -872,9 +869,8 @@ def fetch_orbit1(candidates, label=""):
     if not pool:
         return {}, []
     try:
-        mode_sql = "match_mode = '%s' AND " % MATCH_MODE if MATCH_MODE else ""
         rows = sql(Q_ORBIT.format(ids=",".join(str(a) for a in pool),
-                                  mode=mode_sql, days=ORBIT_DAYS),
+                                  since=lake.since(ORBIT_DAYS), filt=orbit_filter()),
                    "orbit1 %s from %d seed candidates" % (label, len(pool)))
     except Exception as e:
         print("  [orbit] failed (%s) — continuing without the fallback" % e,
@@ -1270,6 +1266,9 @@ def main():
             "net_wins": net,
             "ranked_games": rec["games"],
             "ranked_wins": rec["wins"],
+            # the plain win rate on the hero over the same record, 0-1, for
+            # analysis (2026-10-14); shrunk_winrate pulls it toward 0.5
+            "winrate": round(rec["wins"] / rec["games"], 4) if rec["games"] else "",
             "shrunk_winrate": round(shrunk(rec), 4),
             # Under CEILING_METRIC=board this IS the ordering; under net_wins
             # it is the reference column. Either way both are always written.
@@ -1386,7 +1385,7 @@ def main():
 
     cols = ["region", "ceiling_rank", "ceiling_metric", "hero", "hero_id",
             "ceiling_player",
-            "account_id", "net_wins", "ranked_games", "ranked_wins",
+            "account_id", "net_wins", "ranked_games", "ranked_wins", "winrate",
             "shrunk_winrate", "global_pos", "general_pos_censored", "hero_pct",
             "region_depth", "pct", "badge_level",
             "ranked_rank", "rank_name",
