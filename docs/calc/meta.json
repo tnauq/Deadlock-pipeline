@@ -1,6 +1,6 @@
 {
  "n_items": 156,
- "n_heroes": 43,
+ "n_heroes": 44,
  "n_props": 445,
  "n_unresolved_conditionals": 116,
  "n_toggled": 12,
@@ -258,8 +258,8 @@
  },
  "items_kb": 157.1,
  "items_gz_kb": 16.0,
- "heroes_kb": 456.5,
- "heroes_gz_kb": 16.6,
+ "heroes_kb": 467.1,
+ "heroes_gz_kb": 16.9,
  "slot_model": {
   "total": 12,
   "unlocked_at_start": 9,
@@ -288,9 +288,9 @@
  "n_slot_or_cost_mismatch": 0,
  "n_self_penalties": 12,
  "n_effect_only": 4,
- "n_abilities": 172,
- "abilities_kb": 421.8,
- "abilities_gz_kb": 59.8,
- "dps_checked": 43,
+ "n_abilities": 176,
+ "abilities_kb": 437.0,
+ "abilities_gz_kb": 62.1,
+ "dps_checked": 44,
  "dps_failed": 0
 }
