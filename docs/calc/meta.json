@@ -289,8 +289,8 @@
  "n_self_penalties": 12,
  "n_effect_only": 4,
  "n_abilities": 176,
- "abilities_kb": 437.0,
- "abilities_gz_kb": 62.1,
+ "abilities_kb": 437.1,
+ "abilities_gz_kb": 62.2,
  "dps_checked": 44,
  "dps_failed": 0
 }
