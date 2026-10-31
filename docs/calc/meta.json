@@ -1,7 +1,7 @@
 {
  "n_items": 156,
  "n_heroes": 44,
- "n_props": 445,
+ "n_props": 444,
  "n_unresolved_conditionals": 116,
  "n_toggled": 12,
  "toggles": {
@@ -10,7 +10,7 @@
   "long_range": 2,
   "after_proc": 3
  },
- "property_types": 59,
+ "property_types": 60,
  "property_type_counts": [
   [
    "MODIFIER_VALUE_HEALTH_MAX",
@@ -18,7 +18,7 @@
   ],
   [
    "MODIFIER_VALUE_WEAPON_DAMAGE_INCREASE",
-   33
+   34
   ],
   [
    "MODIFIER_VALUE_TECH_POWER",
@@ -38,7 +38,7 @@
   ],
   [
    "MODIFIER_VALUE_FIRE_RATE",
-   24
+   23
   ],
   [
    "MODIFIER_VALUE_BULLET_ARMOR_DAMAGE_RESIST",
@@ -81,15 +81,15 @@
    7
   ],
   [
-   "MODIFIER_VALUE_MELEE_DAMAGE_INCREASE",
-   7
-  ],
-  [
    "MODIFIER_VALUE_COOLDOWN_REDUCTION_PERCENTAGE",
    7
   ],
   [
    "MODIFIER_VALUE_BONUS_BULLET_SPEED_PERCENT",
+   6
+  ],
+  [
+   "MODIFIER_VALUE_MELEE_DAMAGE_INCREASE",
    6
   ],
   [
@@ -117,10 +117,6 @@
    4
   ],
   [
-   "MODIFIER_VALUE_HEALTH_REGEN_PER_SECOND",
-   4
-  ],
-  [
    "MODIFIER_VALUE_WEAPON_DAMAGE_TO_NPC_INCREASE",
    3
   ],
@@ -138,6 +134,10 @@
   ],
   [
    "MODIFIER_VALUE_AIR_CONTROL_PERCENT",
+   3
+  ],
+  [
+   "MODIFIER_VALUE_HEALTH_REGEN_PER_SECOND",
    3
   ],
   [
@@ -233,6 +233,10 @@
    1
   ],
   [
+   "MODIFIER_VALUE_GRAVITY_SCALE",
+   1
+  ],
+  [
    "MODIFIER_VALUE_AIR_MOVE_DISTANCE_INCREASE_PERCENT",
    1
   ],
@@ -252,13 +256,13 @@
  "units": {
   "%": 262,
   "m": 47,
-  "null": 134,
+  "null": 133,
   "m/s": 1,
   "s": 1
  },
- "items_kb": 157.1,
+ "items_kb": 156.8,
  "items_gz_kb": 16.0,
- "heroes_kb": 467.1,
+ "heroes_kb": 467.2,
  "heroes_gz_kb": 16.9,
  "slot_model": {
   "total": 12,
@@ -289,8 +293,8 @@
  "n_self_penalties": 12,
  "n_effect_only": 4,
  "n_abilities": 176,
- "abilities_kb": 437.1,
- "abilities_gz_kb": 62.2,
+ "abilities_kb": 437.9,
+ "abilities_gz_kb": 62.4,
  "dps_checked": 44,
  "dps_failed": 0
 }
