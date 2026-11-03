@@ -458,7 +458,7 @@ def _get(url, tries=_env("HTTP_TRIES", 4)):
 _sql_calls = [0]
 
 
-def sql(query, label=""):
+def sql(query, label="", threads=None):
     """One query on the public data lake (lake.py). Returns a list of dicts.
 
     Fatal on failure, as /v1/sql errors were: callers that can do without a
@@ -468,7 +468,7 @@ def sql(query, label=""):
     """
     _sql_calls[0] += 1
     try:
-        return lake.query(query, label)
+        return lake.query(query, label, threads=threads)
     except Exception as e:
         raise SystemExit("SQL failed on %s: %s\n\nQuery:\n%s"
                          % (label, lake.first_line(e), query[:2000]))
@@ -877,7 +877,7 @@ SELECT match_id, account_id, hero_id, net_worth,
        {stats_time_stamp_s}      AS stat_ts,
        {stats_net_worth}         AS stat_nw
 FROM match_player
-WHERE match_id IN ({mids}) AND account_id IN ({aids})
+WHERE match_id IN ({mids}) AND account_id IN ({aids}){bound}
 QUALIFY row_number() OVER (PARTITION BY match_id, account_id
                            ORDER BY created_at DESC) = 1
 """
@@ -1626,15 +1626,55 @@ def new_hero_fill(new_heroes, heroes, ladder, general, stats, chosen,
     return added
 
 
-def query_items(pairs):
+# 2026-11-03: on DuckDB 2.0.0 the lake's OLDER files need single blocks of
+# 4-10 GiB to read, and a query touching many of them ran out of memory even at
+# 1 thread (run of 10:59 UTC: the items query failed after 90 minutes). The
+# builds are the player's newest game on the hero, and ~5% of them are older
+# than 90 days, from board players who have not played the hero since. So:
+#   * builds played in the last ITEMS_RECENT_DAYS: one query, bounded on
+#     start_time, so the scan never opens an old file. Fatal on failure, as
+#     before.
+#   * older builds: one query per match_id partition (the lake's file layout,
+#     intDiv(match_id, 1000000)), at ITEMS_OLD_THREADS, within
+#     ITEMS_OLD_BUDGET_S seconds. A partition that fails, or is not reached in
+#     the budget, leaves its builds without items: the same as an unparsed
+#     match, which the pipeline always tolerated. Logged as [items] ... old.
+ITEMS_RECENT_DAYS = _env("ITEMS_RECENT_DAYS", 90)
+ITEMS_OLD_THREADS = _env("ITEMS_OLD_THREADS", 2)
+ITEMS_OLD_BUDGET_S = _env("ITEMS_OLD_BUDGET_S", 1500)
+LAKE_PARTITION = 1000000
+
+
+def played_days_ago(epoch):
+    """Days from a unix time to the run's clock; None if unknown."""
+    try:
+        v = int(epoch)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0:
+        return None
+    return (lake.now().timestamp() - v) / 86400.0
+
+
+def _items_sql(pairs, bound=""):
+    return Q_ITEMS.format(
+        mids=",".join(str(m) for m in sorted({m for m, _ in pairs})),
+        aids=",".join(str(a) for a in sorted({a for _, a in pairs})),
+        bound=(" AND " + bound) if bound else "",
+        **{c.replace(".", "_"): lake.ident(c) for c in ITEM_COLUMNS})
+
+
+def query_items(pairs, played=None):
     """One row per acquisition for each (match_id, account_id) in `pairs`,
     with the fields the ClickHouse ARRAY JOIN returned: account_id, hero_id,
     match_id, item_id, net_worth_at_buy, game_time_s, sold_time_s,
     imbued_ability_id. Hero abilities ride along in items.item_id, as before.
 
-    One lake query: the URL limit that used to chunk this into ~5 calls is
-    gone. A player-match the lake doesn't have returns nothing, as an unparsed
-    match always did; resolve_on_lake() has already stepped those back.
+    `played` maps each pair to its unix start time (hero-stats' last_played),
+    which splits recent builds from old ones (see ITEMS_RECENT_DAYS). A pair
+    with no known time counts as old. A player-match the lake doesn't have
+    returns nothing, as an unparsed match always did; resolve_on_lake() has
+    already stepped those back.
     """
     pairs = sorted({(int(m), int(a)) for m, a in pairs})
     if not pairs:
@@ -1644,13 +1684,46 @@ def query_items(pairs):
         raise SystemExit("The lake's match_player has no %s column, which the item "
                          "query reads. Its schema changed; see the [lake] "
                          "match_player line above." % ", ".join(missing))
-    q = Q_ITEMS.format(
-        mids=",".join(str(m) for m in sorted({m for m, _ in pairs})),
-        aids=",".join(str(a) for a in sorted({a for _, a in pairs})),
-        **{c.replace(".", "_"): lake.ident(c) for c in ITEM_COLUMNS})
+    played = played or {}
+    recent, old = [], []
+    for k in pairs:
+        age = played_days_ago(played.get(k))
+        (recent if age is not None and age <= ITEMS_RECENT_DAYS else old).append(k)
     want = set(pairs)
+    raw = []
+    if recent:
+        # +2 days: last_played is the match's start, give or take the clock
+        raw += sql(_items_sql(recent, lake.since(ITEMS_RECENT_DAYS + 2)),
+                   "items for %d player-matches played in the last %d days"
+                   % (len(recent), ITEMS_RECENT_DAYS))
+    skipped = []
+    if old:
+        parts = {}
+        for m, a in old:
+            parts.setdefault(m // LAKE_PARTITION, []).append((m, a))
+        print("  [items] %d older builds in %d lake partitions, one query each "
+              "(%d threads, %ds budget)" % (len(old), len(parts), ITEMS_OLD_THREADS,
+                                            ITEMS_OLD_BUDGET_S), file=sys.stderr)
+        t0 = time.time()
+        for n, part in enumerate(sorted(parts, reverse=True)):
+            grp = parts[part]
+            if time.time() - t0 > ITEMS_OLD_BUDGET_S:
+                for p_ in sorted(parts, reverse=True)[n:]:
+                    skipped += parts[p_]
+                print("  [items] old: budget spent, %d partitions not read"
+                      % (len(parts) - n), file=sys.stderr)
+                break
+            try:
+                raw += sql(_items_sql(grp),
+                           "items for %d older player-matches, partition %d"
+                           % (len(grp), part), threads=ITEMS_OLD_THREADS)
+            except SystemExit as e:
+                skipped += grp
+                print("  [items] old: partition %d failed (%s); its %d builds get "
+                      "no items" % (part, str(e).splitlines()[0][:200], len(grp)),
+                      file=sys.stderr)
     rows, found = [], 0
-    for r in sql(q, "items for %d player-matches" % len(pairs)):
+    for r in raw:
         key = (int(r["match_id"]), int(r["account_id"]))
         if key not in want:          # match_id IN x account_id IN is a superset
             continue
@@ -1673,8 +1746,10 @@ def query_items(pairs):
                 "sold_time_s": (sold[i] if i < len(sold) else 0) or 0,
                 "imbued_ability_id": (imbued[i] if i < len(imbued) else 0) or 0,
             })
-    print("  [items] %d of %d player-matches found, %d acquisitions"
-          % (found, len(pairs), len(rows)), file=sys.stderr)
+    print("  [items] %d of %d player-matches found, %d acquisitions (%d recent, "
+          "%d older; %d older skipped)"
+          % (found, len(pairs), len(rows), len(recent), len(old), len(skipped)),
+          file=sys.stderr)
     return rows
 
 
@@ -1683,8 +1758,9 @@ def query_items(pairs):
 Q_ON_LAKE = """
 SELECT DISTINCT match_id, account_id
 FROM match_player
-WHERE match_id IN ({mids}) AND account_id IN ({aids})
+WHERE match_id IN ({mids}) AND account_id IN ({aids}){bound}
 """
+LAKE_CHECK_DAYS = _env("LAKE_CHECK_DAYS", 2)
 
 # Each missing build's newest game ON THE SAME HERO that the lake has, before
 # the one it doesn't, in the same modes hero-stats was asked for.
@@ -1725,13 +1801,28 @@ def resolve_on_lake(chosen):
               if c.get("last_match_id") is not None and c.get("account_id") is not None]
     if not builds:
         return 0, 0
-    mids = sorted({int(c["last_match_id"]) for _h, c in builds})
-    aids = sorted({int(c["account_id"]) for _h, c in builds})
-    have = {(int(r["match_id"]), int(r["account_id"]))
-            for r in sql(Q_ON_LAKE.format(mids=",".join(map(str, mids)),
-                                          aids=",".join(map(str, aids))),
-                         "which of %d sampled games the lake has" % len(builds))}
-    miss = [(hid, c) for hid, c in builds
+    # 2026-11-03: only a game from the last LAKE_CHECK_DAYS can be missing (the
+    # lake trails by 10-70 min), so only those are checked, in a query bounded
+    # on start_time. Checking every build opened the lake's old files, which
+    # DuckDB 2.0.0 needed 1,054 s and four out-of-memory retries to read
+    # (run of 10:59 UTC). A build with no known play time is checked too.
+    check = []
+    for hid, c in builds:
+        age = played_days_ago(c.get("last_played"))
+        if age is None or age <= LAKE_CHECK_DAYS:
+            check.append((hid, c))
+    unknown = any(played_days_ago(c.get("last_played")) is None for _h, c in check)
+    have = set()
+    if check:
+        mids = sorted({int(c["last_match_id"]) for _h, c in check})
+        aids = sorted({int(c["account_id"]) for _h, c in check})
+        have = {(int(r["match_id"]), int(r["account_id"]))
+                for r in sql(Q_ON_LAKE.format(
+                    mids=",".join(map(str, mids)), aids=",".join(map(str, aids)),
+                    bound="" if unknown else " AND " + lake.since(LAKE_CHECK_DAYS + 1)),
+                    "which of %d recent sampled games the lake has (%d older ones "
+                    "assumed present)" % (len(check), len(builds) - len(check)))}
+    miss = [(hid, c) for hid, c in check
             if (int(c["last_match_id"]), int(c["account_id"])) not in have]
     if not miss:
         print("  [lake] all %d sampled games are on the lake" % len(builds),
@@ -2183,7 +2274,9 @@ def main():
     build_rating = {(c["last_match_id"], c["account_id"]): c["ranked_rating"]
                     for lst in chosen.values() for c in lst}
     print("[4/5] item query (%d player-matches)" % len(wanted), file=sys.stderr)
-    item_rows = query_items(wanted) if wanted else []
+    played_at = {(c["last_match_id"], c["account_id"]): c.get("last_played")
+                 for lst in chosen.values() for c in lst}
+    item_rows = query_items(wanted, played_at) if wanted else []
 
     print("[5/5] aggregating", file=sys.stderr)
     keep = {(m, a) for m, a in wanted}

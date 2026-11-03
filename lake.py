@@ -92,7 +92,7 @@ def _auto_memory(share=0.80):
 
 MEMORY = os.environ.get("LAKE_MEMORY") or _auto_memory()
 # 2026-11-03: an out-of-memory error is retried with half the threads, down to
-# this floor (16, 8, 4, 2, 1). Each thread holds its own parquet buffers and aggregate state,
+# this floor (16, 8, 4, 2, 1), for that query only. Each thread holds its own parquet buffers and aggregate state,
 # and the first run on DuckDB 2.0.0 ran out of memory twice (ring 2, then pool
 # wins at 13.3 GiB against the 7.4 GiB limit) with 16 threads.
 MIN_THREADS = int(os.environ.get("LAKE_MIN_THREADS") or 1)
@@ -372,7 +372,7 @@ def calls():
     return _state["calls"]
 
 
-def query(sql, label=""):
+def query(sql, label="", threads=None):
     """Run one statement and return its rows as dicts.
 
     A network error (a dropped connection, or a file the lake swept after a
@@ -385,7 +385,10 @@ def query(sql, label=""):
     REOPEN_ABOVE_MB is reopened on the same catalog. An out-of-memory error is
     retried on a fresh instance at the same threads, then with half the
     threads each time, down to MIN_THREADS; the lower count stays for the rest
-    of the run. None of this uses up a network retry.
+    of the query. None of this uses up a network retry.
+
+    Every query starts at `threads` (default THREADS): a lower count forced by
+    one heavy query does not slow down the rest of the run.
     """
     con = connect()
     duckdb = sys.modules["duckdb"]
@@ -394,6 +397,10 @@ def query(sql, label=""):
     oom = getattr(duckdb, "OutOfMemoryException", None)
     _state["calls"] += 1
     log("#%d %s" % (_state["calls"], label))
+    start = max(MIN_THREADS, min(int(threads or THREADS), THREADS))
+    if _state["threads"] != start:
+        _state["threads"] = start
+        con.execute("SET threads = %d" % start)
     fresh = not _state.get("dirty")      # nothing has run on this instance yet
     held = memory_in_use()
     if REOPEN_ABOVE_MB and held is not None and held > REOPEN_ABOVE_MB * 2 ** 20:
