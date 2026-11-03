@@ -67,6 +67,11 @@ DUCKDB_VERSION = (os.environ.get("DUCKDB_VERSION") or "").lstrip("v")
 # flight. deadlock-api runs its own lake queries with the same 16.
 THREADS = int(os.environ.get("LAKE_THREADS") or 16)
 MEMORY = os.environ.get("LAKE_MEMORY") or "8GB"
+# 2026-11-03: an out-of-memory error is retried with half the threads, down to
+# this floor. Each thread holds its own parquet buffers and aggregate state,
+# and the first run on DuckDB 2.0.0 ran out of memory twice (ring 2, then pool
+# wins at 13.3 GiB against the 7.4 GiB limit) with 16 threads.
+MIN_THREADS = int(os.environ.get("LAKE_MIN_THREADS") or 2)
 # A query that fails on a network error is retried on a freshly attached
 # catalog: superseded lake files are swept within the hour, so a run that
 # outlives its catalog gets a 404 rather than stale data.
@@ -82,7 +87,8 @@ ENUMS = {
                    "Calibration": 8},
 }
 
-_state = {"con": None, "types": {}, "calls": 0, "now": None, "tmp": None}
+_state = {"con": None, "types": {}, "calls": 0, "now": None, "tmp": None,
+          "threads": THREADS}
 
 
 def log(msg):
@@ -168,7 +174,7 @@ def _ensure_duckdb(want):
     return duckdb
 
 
-def _setup(con, remote):
+def _setup(con, remote, tmp=None):
     stmts = []
     if remote:
         stmts += ["INSTALL httpfs", "LOAD httpfs", "INSTALL ducklake", "LOAD ducklake"]
@@ -184,9 +190,17 @@ def _setup(con, remote):
             con.execute("LOAD icu")
         except Exception as e:
             log("icu unavailable (%s); time zones fall back to UTC" % first_line(e))
-    for s in ("SET TimeZone = 'UTC'",
-              "SET threads = %d" % THREADS,
-              "SET memory_limit = '%s'" % MEMORY):
+    # preserve_insertion_order = false: no query here relies on scan order
+    # (every one aggregates or sorts explicitly), and keeping it lets DuckDB
+    # buffer whole scans to restore the order. temp_directory: somewhere to
+    # spill aggregates and joins rather than fail.
+    settings = ["SET TimeZone = 'UTC'",
+                "SET threads = %d" % _state["threads"],
+                "SET memory_limit = '%s'" % MEMORY,
+                "SET preserve_insertion_order = false"]
+    if tmp:
+        settings.append("SET temp_directory = %s" % _sql_str(os.path.join(tmp, "spill")))
+    for s in settings:
         try:
             con.execute(s)
         except Exception as e:
@@ -254,7 +268,7 @@ def connect():
             f.write(blob)
         _state["tmp"] = tmp
         con = duckdb.connect()
-        _setup(con, remote=True)
+        _setup(con, remote=True, tmp=tmp)
         con.execute("ATTACH %s AS lake (READ_ONLY)" % _sql_str("ducklake:" + path))
         what = ("manifest v%s, generated %s, catalog %s (%.1f MB, written by DuckDB %s)"
                 % (manifest.get("version", "?"), manifest.get("generated_at", "?"),
@@ -289,14 +303,20 @@ def query(sql, label=""):
     newer catalog replaced the one attached) is retried on a fresh attach.
     Anything else (a syntax, binder or conversion error) raises at once:
     those are bugs or schema changes, and retrying cannot fix them.
+
+    An out-of-memory error is retried with half the threads, down to
+    MIN_THREADS, and the lower count stays for the rest of the run. It does
+    not use up a network retry.
     """
     con = connect()
     duckdb = sys.modules["duckdb"]
     transient = tuple(c for c in (getattr(duckdb, "IOException", None),
                                   getattr(duckdb, "HTTPException", None)) if c) or (OSError,)
+    oom = getattr(duckdb, "OutOfMemoryException", None)
     _state["calls"] += 1
     log("#%d %s" % (_state["calls"], label))
-    for attempt in range(TRIES):
+    attempt = 0
+    while True:
         t0 = time.time()
         try:
             cur = con.execute(sql)
@@ -305,15 +325,24 @@ def query(sql, label=""):
             log("-> %d rows in %.1fs" % (len(rows), time.time() - t0))
             return rows
         except transient as e:
-            if attempt == TRIES - 1:
+            attempt += 1
+            if attempt >= TRIES:
                 raise
-            wait = 15 * (attempt + 1)
+            wait = 15 * attempt
             log("%s; reattaching and retrying in %ds (%d/%d)"
-                % (first_line(e), wait, attempt + 1, TRIES - 1))
+                % (first_line(e), wait, attempt, TRIES - 1))
             time.sleep(wait)
             close()
             con = connect()
-    raise RuntimeError("unreachable")
+        except Exception as e:
+            is_oom = (oom is not None and isinstance(e, oom)) or \
+                "out of memory" in str(e).lower()
+            if not is_oom or _state["threads"] <= MIN_THREADS:
+                raise
+            _state["threads"] = max(MIN_THREADS, _state["threads"] // 2)
+            log("%s after %.0fs; retrying with %d threads"
+                % (first_line(e), time.time() - t0, _state["threads"]))
+            con.execute("SET threads = %d" % _state["threads"])
 
 
 # --------------------------------------------------------------------------
@@ -346,6 +375,20 @@ def since(days, column="start_time", table="match_player"):
     if t.startswith("TIMESTAMP"):
         return "%s >= CAST(%s AS %s)" % (column, lit, t)
     return "%s >= %s" % (column, lit)
+
+
+def before(days, column="start_time", table="match_player"):
+    """`column < now - days`: the upper end of a window, as since() writes
+    the lower one, so it prunes files too. before(d) and since(d) split the
+    table with no gap and no overlap."""
+    cut = now() - datetime.timedelta(days=days)
+    t = _type(column, table)
+    if t and "INT" in t and "INTERVAL" not in t:
+        return "%s < %d" % (column, int(cut.timestamp()))
+    lit = "TIMESTAMP '%s'" % cut.strftime("%Y-%m-%d %H:%M:%S")
+    if t.startswith("TIMESTAMP"):
+        return "%s < CAST(%s AS %s)" % (column, lit, t)
+    return "%s < %s" % (column, lit)
 
 
 def enum_is(column, name, table="match_player"):

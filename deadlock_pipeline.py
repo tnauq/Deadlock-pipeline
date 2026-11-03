@@ -1113,7 +1113,18 @@ def orbit2_closeness(shared, played):
 # per player-match (the newest created_at): the lake re-exports some rows, and
 # counting them twice would inflate games and wins. No game_mode filter, as
 # before; only DECAY_MATCH_MODE's match_mode filter.
+#
+# 2026-11-03: the single 90-day query ran out of memory on DuckDB 2.0.0
+# (13.3 GiB against the 7.4 GiB limit; run of 04:14 UTC). It now runs in
+# POOL_WINS_SLICE_DAYS slices of start_time, and the pair test is a join
+# against a VALUES list, with plain account_id / hero_id IN lists that the
+# parquet scan can apply as it reads. A row and its re-exported copy belong to
+# the same match, so share its start_time and land in the same slice: per-slice
+# dedup is the same as whole-window dedup, and the slices simply add up.
+POOL_WINS_SLICE_DAYS = _env("POOL_WINS_SLICE_DAYS", 15)
+
 Q_POOL_WINS = """
+WITH want(account_id, hero_id) AS (VALUES {pairs})
 SELECT account_id,
        hero_id,
        CAST(count(*) AS BIGINT)                     AS g,
@@ -1121,25 +1132,41 @@ SELECT account_id,
        sum(pow(0.5, {age} / {hl}))                       AS wg,
        sum(CASE WHEN won THEN pow(0.5, {age} / {hl}) ELSE 0 END) AS ww
 FROM (
-    SELECT match_id, account_id,
-           arg_max(hero_id, created_at)    AS hero_id,
-           arg_max(won, created_at)        AS won,
-           arg_max(start_time, created_at) AS start_time
-    FROM match_player
-    WHERE {since} AND {filt}
-      AND (account_id, hero_id) IN ({pairs})
-    GROUP BY match_id, account_id)
+    SELECT m.match_id, m.account_id,
+           arg_max(m.hero_id, m.created_at)    AS hero_id,
+           arg_max(m.won, m.created_at)        AS won,
+           arg_max(m.start_time, m.created_at) AS start_time
+    FROM match_player AS m
+    JOIN want AS p ON p.account_id = m.account_id AND p.hero_id = m.hero_id
+    WHERE {window} AND {filt}
+      AND m.account_id IN ({accounts}) AND m.hero_id IN ({heroes})
+    GROUP BY m.match_id, m.account_id)
 GROUP BY account_id, hero_id
 """
+
+
+def pool_wins_windows(days, step):
+    """[(label, SQL bound)] covering the last `days` days, newest first, in
+    slices of `step` days. The newest has no upper bound, as the one-query
+    version had none."""
+    step = max(1, int(step))
+    out, hi = [], 0
+    while hi < days:
+        lo = min(days, hi + step)
+        parts = [lake.since(lo)] + ([lake.before(hi)] if hi else [])
+        out.append(("days %d-%d" % (hi, lo), " AND ".join(parts)))
+        hi = lo
+    return out
 
 
 def fetch_pool_wins(pairs):
     """Ranked games/wins per sampled (account, hero), raw and decay-weighted.
 
-    One lake query over LOOKBACK_DAYS (no URL limit to chunk under any more).
-    Returns (account_id, hero_id) -> {"g","w","wg","ww"}. hero_stats already
-    gives a raw record, but it is unweighted and its match_mode handling is
-    the API's rather than ours, so the mode guarantee is asserted here in SQL.
+    Lake queries over LOOKBACK_DAYS, one per POOL_WINS_SLICE_DAYS slice,
+    summed. Returns (account_id, hero_id) -> {"g","w","wg","ww"}. hero_stats
+    already gives a raw record, but it is unweighted and its match_mode
+    handling is the API's rather than ours, so the mode guarantee is asserted
+    here in SQL.
     """
     hl = DECAY_HALFLIFE_DAYS if DECAY_HALFLIFE_DAYS > 0 else 1e9
     pairs = sorted(set((int(a), int(h)) for a, h in pairs))
@@ -1147,16 +1174,22 @@ def fetch_pool_wins(pairs):
         return {}
     # "" means no match_mode filter at all — standard play, the same games the
     # general board is built from. A bare "match_mode = ''" would match nothing.
-    q = Q_POOL_WINS.format(hl=float(hl), age=lake.age_days(),
-                           since=lake.since(LOOKBACK_DAYS),
-                           filt=mode_filter(match_mode=DECAY_MATCH_MODE, game_mode=False),
-                           pairs=",".join("(%d, %d)" % (a, h) for a, h in pairs))
+    # match_mode and start_time stay unqualified: only match_player has them
+    filt = mode_filter(match_mode=DECAY_MATCH_MODE, game_mode=False)
+    common = dict(hl=float(hl), age=lake.age_days(), filt=filt,
+                  pairs=",".join("(%d, %d)" % (a, h) for a, h in pairs),
+                  accounts=",".join(str(a) for a in sorted({a for a, _ in pairs})),
+                  heroes=",".join(str(h) for h in sorted({h for _, h in pairs})))
     out = {}
-    for r in sql(q, "pool wins for %d players" % len(pairs)):
-        out[(int(r["account_id"]), int(r["hero_id"]))] = {
-            "g": int(float(r["g"])), "w": int(float(r["w"])),
-            "wg": float(r["wg"]), "ww": float(r["ww"]),
-        }
+    for what, window in pool_wins_windows(LOOKBACK_DAYS, POOL_WINS_SLICE_DAYS):
+        q = Q_POOL_WINS.format(window=window, **common)
+        for r in sql(q, "pool wins for %d players, %s" % (len(pairs), what)):
+            k = (int(r["account_id"]), int(r["hero_id"]))
+            v = out.setdefault(k, {"g": 0, "w": 0, "wg": 0.0, "ww": 0.0})
+            v["g"] += int(float(r["g"]))
+            v["w"] += int(float(r["w"]))
+            v["wg"] += float(r["wg"] or 0)
+            v["ww"] += float(r["ww"] or 0)
     return out
 
 
