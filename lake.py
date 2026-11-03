@@ -68,7 +68,7 @@ DUCKDB_VERSION = (os.environ.get("DUCKDB_VERSION") or "").lstrip("v")
 THREADS = int(os.environ.get("LAKE_THREADS") or 16)
 
 
-def _auto_memory(share=0.75):
+def _auto_memory(share=0.80):
     """DuckDB's memory limit: `share` of the machine's RAM, in MB, and never
     less than 8GB (the old fixed value). 8GB when the RAM can't be read.
 
@@ -100,6 +100,9 @@ MIN_THREADS = int(os.environ.get("LAKE_MIN_THREADS") or 1)
 # catalog: superseded lake files are swept within the hour, so a run that
 # outlives its catalog gets a 404 rather than stale data.
 TRIES = int(os.environ.get("LAKE_TRIES") or 3)
+# Before each query, a DuckDB holding more than this (MB) from earlier queries
+# is reopened on the same catalog (reopen()). 0 = never.
+REOPEN_ABOVE_MB = int(os.environ.get("LAKE_REOPEN_ABOVE_MB") or 1024)
 
 # The ClickHouse enums, from deadlock-api's migrations. Used only when the lake
 # carries the integer code instead of the name.
@@ -271,6 +274,7 @@ def connect():
         con = duckdb.connect()
         _setup(con, remote=False)
         con.execute("ATTACH %s AS lake (READ_ONLY)" % _sql_str(LAKE_DB))
+        _state["attach"] = (LAKE_DB, False, None)
         what = "local database %s" % LAKE_DB
     else:
         manifest = json.loads(_http(MANIFEST_URL).decode("utf-8"))
@@ -294,19 +298,66 @@ def connect():
         con = duckdb.connect()
         _setup(con, remote=True, tmp=tmp)
         con.execute("ATTACH %s AS lake (READ_ONLY)" % _sql_str("ducklake:" + path))
+        _state["attach"] = ("ducklake:" + path, True, tmp)
         what = ("manifest v%s, generated %s, catalog %s (%.1f MB, written by DuckDB %s)"
                 % (manifest.get("version", "?"), manifest.get("generated_at", "?"),
                    key, len(blob) / 1e6, writer or "?"))
     con.execute("USE lake")
     _state["con"] = con
+    _state["dirty"] = False
     log("%s; DuckDB %s, memory limit %s, %d threads; ready in %.0fs"
         % (what, _installed() or "?", MEMORY, _state["threads"], time.time() - t0))
     _detect_types()
     return con
 
 
+def reopen(why=""):
+    """A fresh DuckDB instance on the SAME catalog file, so the same snapshot.
+
+    2026-11-03: DuckDB 2.0.0 keeps memory between queries. In the 10:01 UTC
+    run, a 1-thread query found 9.6 of 11.1 GiB already in use, then needed
+    one 5.0 GiB block. Closing the instance gives all of it back; reattaching a
+    local 6 MB catalog takes well under a second. The cost: the next query
+    re-reads the parquet footers it needs.
+    """
+    att = _state.get("attach")
+    if _state["con"] is None or not att:
+        return connect()
+    target, remote, tmp = att
+    old, _state["con"] = _state["con"], None
+    try:
+        old.close()
+    except Exception:
+        pass
+    t0 = time.time()
+    duckdb = sys.modules["duckdb"]
+    con = duckdb.connect()
+    _setup(con, remote=remote, tmp=tmp)
+    con.execute("ATTACH %s AS lake (READ_ONLY)" % _sql_str(target))
+    con.execute("USE lake")
+    _state["con"] = con
+    _state["dirty"] = False
+    _state["reopens"] = _state.get("reopens", 0) + 1
+    log("reopened DuckDB%s (%d threads) in %.1fs"
+        % ((" (%s)" % why) if why else "", _state["threads"], time.time() - t0))
+    return con
+
+
+def memory_in_use():
+    """Bytes DuckDB holds right now, or None if it can't say."""
+    con = _state["con"]
+    if con is None:
+        return None
+    try:
+        row = con.execute("SELECT sum(memory_usage_bytes) FROM duckdb_memory()").fetchone()
+        return int(row[0] or 0) if row else None
+    except Exception:
+        return None
+
+
 def close():
     con, _state["con"] = _state["con"], None
+    _state["attach"] = None
     if con is not None:
         try:
             con.close()
@@ -329,9 +380,12 @@ def query(sql, label=""):
     Anything else (a syntax, binder or conversion error) raises at once:
     those are bugs or schema changes, and retrying cannot fix them.
 
-    An out-of-memory error is retried with half the threads, down to
-    MIN_THREADS, and the lower count stays for the rest of the run. It does
-    not use up a network retry.
+    Memory (DuckDB 2.0.0 keeps it between queries, and needs single blocks of
+    ~5 GiB for some lake files): before the query, a DuckDB holding more than
+    REOPEN_ABOVE_MB is reopened on the same catalog. An out-of-memory error is
+    retried on a fresh instance at the same threads, then with half the
+    threads each time, down to MIN_THREADS; the lower count stays for the rest
+    of the run. None of this uses up a network retry.
     """
     con = connect()
     duckdb = sys.modules["duckdb"]
@@ -340,9 +394,15 @@ def query(sql, label=""):
     oom = getattr(duckdb, "OutOfMemoryException", None)
     _state["calls"] += 1
     log("#%d %s" % (_state["calls"], label))
+    fresh = not _state.get("dirty")      # nothing has run on this instance yet
+    held = memory_in_use()
+    if REOPEN_ABOVE_MB and held is not None and held > REOPEN_ABOVE_MB * 2 ** 20:
+        con = reopen("%.1f GiB held from earlier queries" % (held / 2 ** 30))
+        fresh = True
     attempt = 0
     while True:
         t0 = time.time()
+        _state["dirty"] = True
         try:
             cur = con.execute(sql)
             cols = [d[0] for d in (cur.description or [])]
@@ -359,15 +419,23 @@ def query(sql, label=""):
             time.sleep(wait)
             close()
             con = connect()
+            fresh = True
         except Exception as e:
             is_oom = (oom is not None and isinstance(e, oom)) or \
                 "out of memory" in str(e).lower()
-            if not is_oom or _state["threads"] <= MIN_THREADS:
+            if not is_oom:
                 raise
-            _state["threads"] = max(MIN_THREADS, _state["threads"] // 2)
-            log("%s after %.0fs; retrying with %d threads"
-                % (first_line(e), time.time() - t0, _state["threads"]))
-            con.execute("SET threads = %d" % _state["threads"])
+            if not fresh:
+                log("%s after %.0fs; retrying on a fresh instance"
+                    % (first_line(e), time.time() - t0))
+            elif _state["threads"] > MIN_THREADS:
+                _state["threads"] = max(MIN_THREADS, _state["threads"] // 2)
+                log("%s after %.0fs; retrying with %d threads"
+                    % (first_line(e), time.time() - t0, _state["threads"]))
+            else:
+                raise
+            con = reopen()
+            fresh = True
 
 
 # --------------------------------------------------------------------------

@@ -1,22 +1,26 @@
-# Inbox drop: memory limit sized to the runner (2026-11-03, second)
+# Inbox drop: give memory back between lake queries (2026-11-03, third)
 
-    lake.py   MODIFIED - memory limit 75% of RAM (never under 8GB); thread floor 1
+    lake.py   MODIFIED - reopens DuckDB on the same catalog to free memory; limit 80% of RAM
 
-Built against main e5b3be3 (lake-oom-drop applied).
+Built against main 9734a98 (lake-memory-drop applied).
 
-## What broke
+## What happened at 10:01 UTC
 
-- The 05:58 UTC run still ran out of memory in pool net wins (days 45-60).
-- Each failure was ONE allocation of 3.8-4.9 GiB, with 4-5 GiB already in
-  use. Fewer threads did not shrink it, so it can't fit under 7.4 GiB (8GB).
-- DuckDB 2.0.0 needs far more memory than 1.5.x to read some Parquet files:
-  duckdb/duckdb#28082, open, reproduced Oct 30, no fix yet. The lake's
-  catalog is written by 2.0.0, so the runner has to use 2.0.0.
+- Pool net wins completed for the first time on DuckDB 2.0.0, at 1 thread.
+  Pool stats were logged.
+- The next query ("which of 1760 sampled games the lake has") failed at
+  1 thread. 9.6 of 11.1 GiB was already in use and it needed one 5.0 GiB block.
+  A 1-thread scan doesn't use 9.6 GiB, so DuckDB was holding memory from
+  earlier queries.
 
 ## What changes
 
-- `LAKE_MEMORY` unset: 75% of the machine's RAM, never below 8GB. On
-  ubuntu-latest (16 GB, public repo) that is about 12 GB. The connect log
-  line now shows the limit and threads.
-- The out-of-memory retry goes down to 1 thread (was 2).
-- Setting `LAKE_MEMORY` still overrides it.
+- `reopen()`: closes the DuckDB instance and attaches the SAME downloaded
+  catalog file, so the run still reads one snapshot. It frees everything and
+  takes under a second.
+- Before each query: if DuckDB holds more than `LAKE_REOPEN_ABOVE_MB` (1024)
+  it is reopened first. Log line: `[lake] reopened DuckDB (N GiB held ...)`.
+- On out-of-memory: retry on a fresh instance at the same threads, then halve
+  the threads (fresh instance each time) down to 1.
+- Memory limit 80% of RAM (DuckDB's own default), never below 8GB: about
+  12.8 GB on the runner.
