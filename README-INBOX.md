@@ -1,36 +1,22 @@
-# Inbox drop: lake queries ran out of memory on DuckDB 2.0.0 (2026-11-03)
+# Inbox drop: memory limit sized to the runner (2026-11-03, second)
 
-    lake.py               MODIFIED - retries out-of-memory with fewer threads; spills to disk
-    deadlock_pipeline.py  MODIFIED - pool net wins runs in 15-day slices
+    lake.py   MODIFIED - memory limit 75% of RAM (never under 8GB); thread floor 1
 
-Built against main 1b2c326 (lake.py b4c7ec7, deadlock_pipeline.py 059803c).
+Built against main e5b3be3 (lake-oom-drop applied).
 
 ## What broke
 
-- The 04:14 UTC run (Nov 3) was the first to install duckdb 2.0.0: the lake's
-  catalog (manifest v1266) is now written by DuckDB 2.0.0.
-- Ring 2 NAmerica ran out of memory (non-fatal, as designed).
-- Pool net wins, one query over 90 days, ran out of memory at 13.3 GiB against
-  the 7.4 GiB (8 GB) limit. That one is fatal, so the run exited 1.
-- No refresh has been committed since 1b2c326 (03:49 UTC Nov 2).
+- The 05:58 UTC run still ran out of memory in pool net wins (days 45-60).
+- Each failure was ONE allocation of 3.8-4.9 GiB, with 4-5 GiB already in
+  use. Fewer threads did not shrink it, so it can't fit under 7.4 GiB (8GB).
+- DuckDB 2.0.0 needs far more memory than 1.5.x to read some Parquet files:
+  duckdb/duckdb#28082, open, reproduced Oct 30, no fix yet. The lake's
+  catalog is written by 2.0.0, so the runner has to use 2.0.0.
 
 ## What changes
 
-1. lake.py
-   - An out-of-memory error retries the same query with half the threads
-     (16, 8, 4, 2). The lower count stays for the rest of the run. The log
-     line is `[lake] Out of Memory Error ... retrying with N threads`.
-   - `preserve_insertion_order = false` (no query relies on scan order).
-   - `temp_directory` in the run's temp folder, so aggregates can spill.
-   - New `before(days)`, the upper bound matching `since(days)`.
-2. Pool net wins
-   - Six queries of 15 days each (`POOL_WINS_SLICE_DAYS`), summed in Python.
-     A row and its re-exported copy share a match, so a start_time, so dedup
-     per slice equals dedup over the window. The numbers are unchanged.
-   - The pair test is a join against a VALUES list, plus plain
-     `account_id IN` / `hero_id IN` lists the scan can apply while reading.
-
-## Settings
-
-`LAKE_MIN_THREADS` (2), `POOL_WINS_SLICE_DAYS` (15). If it still fails:
-`LAKE_THREADS: "4"` in daily.yml's env.
+- `LAKE_MEMORY` unset: 75% of the machine's RAM, never below 8GB. On
+  ubuntu-latest (16 GB, public repo) that is about 12 GB. The connect log
+  line now shows the limit and threads.
+- The out-of-memory retry goes down to 1 thread (was 2).
+- Setting `LAKE_MEMORY` still overrides it.

@@ -66,12 +66,36 @@ DUCKDB_VERSION = (os.environ.get("DUCKDB_VERSION") or "").lstrip("v")
 # Remote parquet reads wait on R2, not the CPU: more threads, more requests in
 # flight. deadlock-api runs its own lake queries with the same 16.
 THREADS = int(os.environ.get("LAKE_THREADS") or 16)
-MEMORY = os.environ.get("LAKE_MEMORY") or "8GB"
+
+
+def _auto_memory(share=0.75):
+    """DuckDB's memory limit: `share` of the machine's RAM, in MB, and never
+    less than 8GB (the old fixed value). 8GB when the RAM can't be read.
+
+    2026-11-03: was a fixed 8GB. DuckDB 2.0.0 reads the lake's older parquet
+    files with single allocations of 3.8-4.9 GiB (duckdb/duckdb#28082, open,
+    a regression from 1.5.x), and one of those on top of the 4-5 GiB already in
+    use does not fit under 7.4 GiB at any thread count. GitHub's ubuntu-latest
+    runner for a public repo has 16 GB.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    kib = int(line.split()[1])
+                    # never below the old fixed 8GB
+                    return "%dMB" % max(8000, int(kib / 1024 * share))
+    except (OSError, ValueError, IndexError):
+        pass
+    return "8GB"
+
+
+MEMORY = os.environ.get("LAKE_MEMORY") or _auto_memory()
 # 2026-11-03: an out-of-memory error is retried with half the threads, down to
-# this floor. Each thread holds its own parquet buffers and aggregate state,
+# this floor (16, 8, 4, 2, 1). Each thread holds its own parquet buffers and aggregate state,
 # and the first run on DuckDB 2.0.0 ran out of memory twice (ring 2, then pool
 # wins at 13.3 GiB against the 7.4 GiB limit) with 16 threads.
-MIN_THREADS = int(os.environ.get("LAKE_MIN_THREADS") or 2)
+MIN_THREADS = int(os.environ.get("LAKE_MIN_THREADS") or 1)
 # A query that fails on a network error is retried on a freshly attached
 # catalog: superseded lake files are swept within the hour, so a run that
 # outlives its catalog gets a 404 rather than stale data.
@@ -275,7 +299,8 @@ def connect():
                    key, len(blob) / 1e6, writer or "?"))
     con.execute("USE lake")
     _state["con"] = con
-    log("%s; DuckDB %s; ready in %.0fs" % (what, _installed() or "?", time.time() - t0))
+    log("%s; DuckDB %s, memory limit %s, %d threads; ready in %.0fs"
+        % (what, _installed() or "?", MEMORY, _state["threads"], time.time() - t0))
     _detect_types()
     return con
 
