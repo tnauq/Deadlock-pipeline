@@ -1,35 +1,28 @@
-# Inbox drop: keep the lake's old files out of the main queries (2026-11-03, fourth)
+# Inbox drop: tier race on the site (2026-11-06)
 
-    lake.py               MODIFIED - each query starts at full threads again
-    deadlock_pipeline.py  MODIFIED - items split recent/older; lake check only for recent games
+    build_race_data.py    NEW      - builds docs/archive/race.json from archive/*.gz
+    archive_snapshot.py   MODIFIED - calls build_race_data at the end of every run
+    docs/index.html       MODIFIED - "Tier race" button + bar chart race, hidden until opened
+    docs/archive/race.json NEW     - first build (98 days, Aug 1 - Nov 6), so the race works before the next refresh
 
-Built against main b817d73 (lake-reopen-drop applied).
+Built against main 83bd662.
 
-## What happened at 10:59 UTC
+## What it adds
 
-- Pool net wins: all six slices at 16 threads, 2.5 minutes in total. The
-  pre-query reopen fired three times.
-- "Which sampled games the lake has": 1,054 s and four OOM retries, then passed.
-- Items: OOM at 2 threads and then at 1 thread after an hour, at "54.7 GiB used" of
-  11.9. Exit 1, about 2h10m into the run.
-- Both slow queries name games by match_id, and the list starts at 23M. ~5%
-  of builds are a board player's newest game on the hero from months ago, and
-  every such game makes DuckDB 2.0.0 read an old lake file. Those reads need
-  single blocks of 4-10 GiB (duckdb/duckdb#28082).
+- A **Tier race** button next to the NA/EU switch. The race panel stays hidden,
+  and race.json (~175 KB, gzipped in transit) is only fetched, the first time
+  it is opened. Pressing the button again hides it and stops playback.
+- Measures, in button order: **Win rate** (default), **Net wins**, **Rank score**,
+  **Points**. Top 15 or All, play/pause, ½x-4x, a day slider, tooltips.
+- Follows the page's region switch. Bars are coloured by that day's site tier.
+- Notes under the date flag the method changes: the ceiling ordered by ranked
+  net wins Aug 8 - Sep 2, and the ranked-only player sample through Sep 2.
 
-## What changes
+## How it stays current
 
-1. **Lake check:** only builds played in the last `LAKE_CHECK_DAYS` (2) are
-   checked, in a query bounded on start_time. Older games are on the lake by
-   definition (it trails by 10-70 min). Builds with no play time are still
-   checked.
-2. **Items:**
-   - Builds played in the last `ITEMS_RECENT_DAYS` (90): one query bounded on
-     start_time, so old files are never opened. Fatal on failure, as before.
-   - Older builds: one query per lake partition (match_id / 1,000,000), at
-     `ITEMS_OLD_THREADS` (2), within `ITEMS_OLD_BUDGET_S` (1500 s). A partition
-     that fails, or isn't reached in the budget, leaves its builds without items,
-     like an unparsed match.
-   - Log: `[items] N of M player-matches found ... (R recent, O older; S older skipped)`.
-3. **lake.py:** each query starts at 16 threads. A lower count forced by
-   an OOM applies only to that query.
+archive_snapshot.py already runs every refresh and docs/archive is already in
+the commit step, so no workflow edit is needed. The race rebuild is wrapped so a
+failure only logs `[race] not rebuilt: ...` and never fails the refresh.
+
+Tiers are rebuilt with build_site_data.py's own rules; the 2026-11-06 rebuild
+matches the published data.json in both regions.

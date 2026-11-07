@@ -477,6 +477,36 @@ h1 .muted{color:var(--dim)}
 footer{margin-top:48px;border-top:1px solid var(--frame)}
 .method dt{letter-spacing:.24em;font-size:9.5px;color:var(--accent)}
 /* === design-theme: end === */
+/* ---------- tier race (hidden until opened) ---------- */
+.race-toggle{margin:14px 0 0 8px;padding:6px 16px;border:1px solid var(--frame);border-radius:99px;cursor:pointer;
+  background:var(--panel);color:var(--text);font:700 12px/1 var(--sans);letter-spacing:.12em;text-transform:uppercase;vertical-align:top}
+.race-toggle[aria-expanded=true]{border-color:var(--accent);color:var(--accent)}
+.race-toggle:focus-visible{outline:2px solid var(--text);outline-offset:2px}
+.race{position:relative;background:var(--panel);border:1px solid var(--frame);border-radius:12px;padding:14px;margin-bottom:16px}
+.race h2{font-size:13px;letter-spacing:.2em;color:var(--dim);margin-bottom:10px}
+.race .rc-bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:8px}
+.race .rc-seg{display:inline-flex;gap:2px;padding:2px;background:var(--panel-2);border:1px solid var(--frame);border-radius:99px;flex-wrap:wrap}
+.race .rc-seg button,.race .rc-btn{border:0;border-radius:99px;padding:6px 12px;cursor:pointer;background:transparent;color:var(--dim);
+  font:700 11px/1 var(--sans);letter-spacing:.08em}
+.race .rc-seg button[aria-pressed=true]{background:var(--frame);color:var(--text)}
+.race .rc-btn{border:1px solid var(--frame);color:var(--text);min-width:44px}
+.race .rc-play{min-width:84px}
+.race input[type=range]{flex:1 1 160px;accent-color:var(--accent)}
+.race .rc-date{font-family:var(--mono);font-weight:700;font-size:15px;min-width:4.6em;color:var(--text)}
+.race .rc-note{font-family:var(--mono);font-size:11px;color:var(--dim);min-height:1.5em;margin:2px 0 8px}
+.race .rc-note.warn{color:var(--accent)}
+.race svg{display:block;width:100%;overflow:visible}
+.race svg text{font-family:var(--sans);font-size:12px;fill:var(--text)}
+.race svg .tick text{fill:var(--dim);font-family:var(--mono);font-size:10px}
+.race svg .tick line{stroke:var(--frame)}
+.race svg .vl{font-family:var(--mono);font-size:11px}
+.race .rc-tip{position:absolute;pointer-events:none;background:var(--panel-2);border:1px solid var(--frame);border-radius:8px;
+  padding:6px 9px;font-size:12px;white-space:nowrap;z-index:5;box-shadow:0 6px 18px rgba(0,0,0,.45)}
+.race .rc-tip b{display:block;margin-bottom:2px}
+.race .rc-tip span{display:block;color:var(--dim);font-family:var(--mono);font-size:11px}
+.race .rc-legend{display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;font-size:11px;color:var(--dim)}
+.race .rc-legend i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+.race .rc-msg{color:var(--dim);font-size:13px;padding:24px 0}
 </style>
 </head>
 <body>
@@ -490,10 +520,12 @@ footer{margin-top:48px;border-top:1px solid var(--frame)}
   ladder — not a pool average. Pick a hero to see what the top 20 actually buy.</p>
   <p class="sub" id="sub">Loading…</p>
   <div class="regions" id="regions" role="group" aria-label="Region"></div>
+  <button type="button" class="race-toggle" id="raceToggle" aria-expanded="false" aria-controls="race" hidden>▶ Tier race</button>
 </header>
 <!-- design-theme header: end -->
 
 <main>
+  <section class="race" id="race" aria-label="Tier race" hidden></section>
   <section id="tiers" class="loading">Loading tier list…</section>
   <section class="detail" id="detail" hidden></section>
 </main>
@@ -599,6 +631,7 @@ function renderRegions(){
       renderRegions();
       renderTiers();
       renderDetail();
+      raceRegion();
     };
     root.appendChild(b);
   }
@@ -790,6 +823,8 @@ function boot(data){
   renderRegions();
   renderTiers();
   renderDetail();
+  const rt = document.getElementById('raceToggle');
+  rt.hidden = false; rt.onclick = raceToggle;
 }
 
 if (window.__DATA__) {
@@ -2065,6 +2100,287 @@ function openPicker(slotIndex, wrap){
   draw();
   document.body.appendChild(back);
   search.focus();
+}
+
+/* ---------- tier race ------------------------------------------------------
+   Hidden until the header's "Tier race" button opens it; archive/race.json is
+   fetched on first open only. Built by build_race_data.py from the daily raw
+   archive on every run. Follows the page's region switch.
+
+   Measures (button order): win rate, net wins, rank score, cumulative points.
+   Win rate and net wins are pooled across regions, so the region switch
+   changes only the order, the tier colours and the two rank measures.
+   ------------------------------------------------------------------------ */
+
+const RACE = {open:false, data:null, loading:false, metric:'winrate', top:15, t:Infinity,
+  playing:false, raf:0, last:0, speed:1, hover:null, ui:null, order:new Map()};
+const RACE_METRICS = [['winrate','Win rate'], ['net_wins','Net wins'], ['score','Rank score'], ['points','Points']];
+const RACE_COHORT_END = '2026-09-02';     // ranked-only player sample through this day
+const RACE_TIER_VAR = {S:'--s', A:'--a', B:'--b', C:'--c', D:'--d', N:'--panel-2'};
+const SVGNS = 'http://www.w3.org/2000/svg';
+const svgEl = (t, attrs) => { const n = document.createElementNS(SVGNS, t); for (const k in attrs || {}) n.setAttribute(k, attrs[k]); return n; };
+let _measure = null;
+function textW(s, font){
+  _measure = _measure || document.createElement('canvas').getContext('2d');
+  _measure.font = font; return _measure.measureText(s).width;
+}
+function raceFmt(v){
+  switch (RACE.metric){
+    case 'winrate': return v.toFixed(1) + '%';
+    case 'net_wins': { const r = Math.round(v); return (r > 0 ? '+' : '') + r.toLocaleString('en-US'); }
+    case 'points': return Math.round(v).toLocaleString('en-US');
+    default: return Math.round(v).toString();
+  }
+}
+function niceTicks(lo, hi, count){
+  const span = hi - lo, raw = span / Math.max(1, count);
+  const mag = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / mag;
+  const step = (f >= 7.07 ? 10 : f >= 3.16 ? 5 : f >= 1.41 ? 2 : 1) * mag;
+  const out = []; for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(6));
+  return out;
+}
+
+function raceToggle(){
+  RACE.open = !RACE.open;
+  const sec = document.getElementById('race'), btn = document.getElementById('raceToggle');
+  sec.hidden = !RACE.open;
+  btn.setAttribute('aria-expanded', String(RACE.open));
+  btn.textContent = RACE.open ? '✕ Hide race' : '▶ Tier race';
+  if (!RACE.open){ raceStop(); return; }
+  if (RACE.data){ raceDraw(); return; }
+  if (RACE.loading) return;
+  RACE.loading = true;
+  sec.replaceChildren(Object.assign(el('div','rc-msg'), {textContent:'Loading the archive…'}));
+  fetch('archive/race.json?v=' + Date.now())
+    .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
+    .then(d => { RACE.data = d; RACE.loading = false; raceIndex(); raceBuild(); raceDraw(); })
+    .catch(err => { RACE.loading = false;
+      sec.replaceChildren(Object.assign(el('div','rc-msg'), {textContent:'Could not load the race data (' + err.message + ').'})); });
+}
+
+function raceIndex(){
+  const d = RACE.data;
+  d.pooledAt = Object.fromEntries(d.pooled.dates.map((x, k) => [x, k]));
+  const byName = {};
+  for (const h of Object.values(DATA.heroes)) byName[h.name] = h;
+  d.icon = d.heroes.map(n => { const h = byName[n]; return h && h.icon ? (h.icon[0] ? 'icons/' + h.icon[0] : h.icon[1]) : ''; });
+}
+
+function raceRegion(){ if (RACE.open && RACE.data){ raceClamp(); raceDraw(); } }
+// a day's finishing order for the current measure: hero index -> place (0 = top)
+function raceOrder(i){
+  const key = region + '|' + RACE.metric + '|' + i;
+  let o = RACE.order.get(key);
+  if (!o){
+    const vals = [];
+    RACE.data.heroes.forEach((h, j) => { const v = raceVal(i, j); if (v != null) vals.push([j, v, h]); });
+    vals.sort((p, q) => q[1] - p[1] || p[2].localeCompare(q[2]));
+    o = new Map(vals.map((x, k) => [x[0], k]));
+    RACE.order.set(key, o);
+  }
+  return o;
+}
+function raceR(){ return RACE.data.regions[region] || RACE.data.regions[Object.keys(RACE.data.regions)[0]]; }
+function raceVal(i, j){
+  const R = raceR(), t = R.tier[i][j];
+  if (t === '-') return null;
+  if (RACE.metric === 'winrate' || RACE.metric === 'net_wins'){
+    const k = RACE.data.pooledAt[R.dates[i]];
+    return k == null ? null : RACE.data.pooled[RACE.metric][k][j];
+  }
+  return R[RACE.metric][i][j];
+}
+function raceFirst(){
+  const R = raceR(), n = R.dates.length;
+  for (let i = 0; i < n; i++) for (let j = 0; j < RACE.data.heroes.length; j++) if (raceVal(i, j) != null) return i;
+  return 0;
+}
+function raceClamp(){ const n = raceR().dates.length - 1; RACE.t = Math.min(Math.max(RACE.t === Infinity ? n : RACE.t, raceFirst()), n); }
+
+function raceBuild(){
+  const sec = document.getElementById('race');
+  sec.replaceChildren();
+  const ui = RACE.ui = {};
+  const h2 = el('h2'); h2.textContent = 'Tier race'; sec.appendChild(h2);
+  const bar1 = el('div','rc-bar'); sec.appendChild(bar1);
+  const segM = el('div','rc-seg'); bar1.appendChild(segM);
+  ui.mBtns = RACE_METRICS.map(([v, t]) => { const b = el('button'); b.type = 'button'; b.textContent = t; b.dataset.v = v;
+    b.onclick = () => { RACE.metric = v; raceClamp(); raceDraw(); }; segM.appendChild(b); return b; });
+  const segN = el('div','rc-seg'); bar1.appendChild(segN);
+  ui.nBtns = [[15,'Top 15'], [99,'All']].map(([v, t]) => { const b = el('button'); b.type = 'button'; b.textContent = t; b.dataset.v = v;
+    b.onclick = () => { RACE.top = v; raceDraw(); }; segN.appendChild(b); return b; });
+  const bar2 = el('div','rc-bar'); sec.appendChild(bar2);
+  ui.play = el('button','rc-btn rc-play'); ui.play.type = 'button'; ui.play.onclick = () => RACE.playing ? raceStop() : raceStart();
+  ui.speed = el('button','rc-btn'); ui.speed.type = 'button';
+  ui.speed.onclick = () => { RACE.speed = RACE.speed === 1 ? 2 : RACE.speed === 2 ? 4 : RACE.speed === 4 ? 0.5 : 1; raceCtl(); };
+  ui.range = el('input'); ui.range.type = 'range'; ui.range.min = 0; ui.range.step = 'any'; ui.range.setAttribute('aria-label', 'Day');
+  ui.range.oninput = () => { raceStop(); RACE.t = +ui.range.value; raceDraw(); };
+  ui.date = el('span','rc-date');
+  bar2.append(ui.play, ui.speed, ui.range, ui.date);
+  ui.note = el('div','rc-note'); sec.appendChild(ui.note);
+  ui.svg = svgEl('svg'); sec.appendChild(ui.svg);
+  ui.axis = svgEl('g'); ui.bars = svgEl('g'); ui.svg.append(ui.axis, ui.bars);
+  ui.rows = {};
+  ui.tip = el('div','rc-tip'); ui.tip.hidden = true; sec.appendChild(ui.tip);
+  const lg = el('div','rc-legend');
+  for (const t of ['S','A','B','C','D','N']){
+    const s = el('span'), i = el('i'); i.style.background = 'var(' + RACE_TIER_VAR[t] + ')';
+    if (t === 'N') i.style.border = '1px dashed var(--accent)';
+    s.append(i, t === 'N' ? 'New' : 'Tier ' + t); lg.appendChild(s);
+  }
+  sec.appendChild(lg);
+  window.addEventListener('resize', () => { if (RACE.open && RACE.data) raceDraw(); });
+}
+
+function raceCtl(){
+  const ui = RACE.ui;
+  ui.play.textContent = RACE.playing ? '❚❚ Pause' : '▶ Play';
+  ui.speed.textContent = RACE.speed + '×';
+  ui.mBtns.forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === RACE.metric)));
+  ui.nBtns.forEach(b => b.setAttribute('aria-pressed', String(+b.dataset.v === RACE.top)));
+}
+function raceStop(){ RACE.playing = false; cancelAnimationFrame(RACE.raf); if (RACE.ui) raceCtl(); }
+function raceStart(){
+  const n = raceR().dates.length - 1;
+  if (RACE.t >= n) RACE.t = raceFirst();
+  RACE.playing = true; RACE.last = performance.now(); raceCtl();
+  const step = now => {
+    if (!RACE.playing || !RACE.open) return;
+    const dt = Math.min(100, now - RACE.last); RACE.last = now;
+    RACE.t = Math.min(n, RACE.t + dt * RACE.speed / 700);      // 0.7 s per day at 1x
+    raceDraw();
+    if (RACE.t >= n) return raceStop();
+    RACE.raf = requestAnimationFrame(step);
+  };
+  RACE.raf = requestAnimationFrame(step);
+}
+
+function raceDraw(){
+  const d = RACE.data, ui = RACE.ui, R = raceR();
+  if (!d || !ui) return;
+  const n = R.dates.length;
+  if (RACE.t === Infinity) raceClamp();
+  RACE.t = Math.max(0, Math.min(RACE.t, n - 1));
+  raceCtl();
+  ui.range.max = n - 1; ui.range.value = RACE.t;
+
+  // interpolate between the two archived days either side of t
+  const i0 = Math.floor(RACE.t), i1 = Math.min(n - 1, i0 + 1), f = RACE.t - i0;
+  const iNear = f < 0.5 ? i0 : i1, day = R.dates[iNear];
+  const list = [];
+  d.heroes.forEach((h, j) => {
+    const a = raceVal(i0, j), b = raceVal(i1, j);
+    let v = null;
+    if (a != null && b != null) v = a + (b - a) * f;
+    else if (a != null && f < 0.5) v = a;
+    else if (b != null && f >= 0.5) v = b;
+    if (v != null) list.push({j, h, v});
+  });
+  // place = each day's finishing place, eased between the two days, so bars
+  // cross smoothly instead of jumping when their values pass each other
+  const oa = raceOrder(i0), ob = raceOrder(i1), N = d.heroes.length;
+  const ef = f * f * (3 - 2 * f);
+  for (const o of list){
+    const a = oa.has(o.j) ? oa.get(o.j) : N, b = ob.has(o.j) ? ob.get(o.j) : N;
+    o.p = a + (b - a) * ef;
+  }
+  list.sort((p, q) => p.p - q.p || q.v - p.v);
+  const dt = new Date(day + 'T00:00:00Z');
+  ui.date.textContent = dt.toLocaleDateString('en-US', {month:'short', day:'numeric', timeZone:'UTC'});
+
+  const nwo = d.net_wins_ordering, byNetWins = nwo && day >= nwo[0] && day <= nwo[1], ranked = day <= RACE_COHORT_END;
+  let note, warn;
+  if (RACE.metric === 'score' || RACE.metric === 'points'){
+    warn = byNetWins; note = byNetWins ? 'List ordered by ranked net wins this day (Aug 8 – Sep 2)' : 'List ordered by the best player\'s ladder position';
+  } else {
+    warn = ranked;
+    note = ranked ? 'Ranked-only player sample until Sep 2' + (RACE.metric === 'winrate' ? ': runs about 4 points high' : '')
+                  : 'All standard play' + (RACE.metric === 'net_wins' ? ', last 90 days' : '');
+    note += ' · both regions pooled';
+  }
+  ui.note.textContent = note; ui.note.classList.toggle('warn', !!warn);
+
+  const shown = list.filter(o => o.p < RACE.top - 0.01).slice(0, RACE.top + 2);
+  const W = Math.max(280, ui.svg.parentNode.clientWidth - 28);
+  const small = RACE.top > 20, bh = small ? 15 : 22, gap = small ? 4 : 6, mt = 20;
+  const H = mt + Math.max(1, Math.min(RACE.top, list.length)) * (bh + gap);
+  ui.svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H); ui.svg.setAttribute('height', H);
+
+  const vals = list.map(o => o.v);
+  let lo = RACE.metric === 'winrate' ? 40 : Math.min(0, ...vals);
+  let hi = RACE.metric === 'score' ? 100 : Math.max(...vals, lo + 1);
+  const nameW = Math.max(0, ...shown.map(o => textW(o.h, '12px Archivo, sans-serif'))) + 8;
+  const x0 = nameW + bh + 4, x1 = Math.max(x0 + 40, W - textW(raceFmt(hi), '11px "JetBrains Mono", monospace') - 10);
+  const X = v => x0 + (v - lo) / (hi - lo) * (x1 - x0);
+  const zero = X(lo > 0 ? lo : 0);
+
+  ui.axis.replaceChildren();
+  for (const v of niceTicks(lo, hi, Math.max(2, Math.floor((x1 - x0) / 90)))){
+    const g = svgEl('g', {class:'tick'});
+    g.append(svgEl('line', {x1:X(v), x2:X(v), y1:mt - 4, y2:H, ...(v === 0 && lo < 0 ? {style:'stroke:var(--dim)'} : {})}));
+    const t = svgEl('text', {x:X(v), y:mt - 8, 'text-anchor':'middle'}); t.textContent = raceFmt(v); g.append(t);
+    ui.axis.append(g);
+  }
+
+  const keep = new Set();
+  shown.forEach(o => {
+    keep.add(o.h);
+    let row = ui.rows[o.h];
+    if (!row){
+      row = ui.rows[o.h] = {g: svgEl('g', {style:'cursor:pointer'})};
+      row.bar = svgEl('rect', {rx:3}); row.img = svgEl('image', {preserveAspectRatio:'xMidYMid slice'});
+      row.nm = svgEl('text', {'text-anchor':'end'}); row.vl = svgEl('text', {class:'vl'});
+      if (d.icon[o.j]) row.img.setAttribute('href', d.icon[o.j]);
+      row.nm.textContent = o.h;
+      row.g.append(row.bar, row.img, row.nm, row.vl);
+      const show = ev => { RACE.hover = o.h; raceTip(ev); };
+      row.g.addEventListener('pointerenter', show); row.g.addEventListener('pointermove', show);
+      row.g.addEventListener('click', show);
+      row.g.addEventListener('pointerleave', () => { RACE.hover = null; ui.tip.hidden = true; });
+    }
+    if (!row.g.isConnected) ui.bars.append(row.g);
+    row.g.setAttribute('transform', 'translate(0,' + (mt + o.p * (bh + gap)).toFixed(1) + ')');
+    const tier = raceR().tier[iNear][o.j];
+    const xv = X(o.v);
+    row.bar.setAttribute('x', Math.min(zero, xv)); row.bar.setAttribute('width', Math.max(1, Math.abs(xv - zero)));
+    row.bar.setAttribute('height', bh);
+    row.bar.style.fill = 'var(' + (RACE_TIER_VAR[tier] || '--panel-2') + ')';
+    row.bar.style.stroke = tier === 'N' ? 'var(--accent)' : 'none';
+    row.bar.style.strokeDasharray = tier === 'N' ? '3 2' : '';
+    row.img.setAttribute('x', nameW); row.img.setAttribute('width', bh); row.img.setAttribute('height', bh);
+    row.nm.setAttribute('x', nameW - 4); row.nm.setAttribute('y', bh / 2 + 4);
+    row.vl.setAttribute('x', Math.max(zero, xv) + 5); row.vl.setAttribute('y', bh / 2 + 4);
+    row.vl.textContent = raceFmt(o.v);
+    row.o = o; row.tier = tier; row.day = day; row.i = iNear;
+  });
+  for (const [h, row] of Object.entries(ui.rows)) if (!keep.has(h) && row.g.isConnected) row.g.remove();
+  if (RACE.hover && !ui.tip.hidden) raceTip(null);
+}
+
+function raceTip(ev){
+  const ui = RACE.ui, row = ui.rows[RACE.hover];
+  if (!row || !row.o) { ui.tip.hidden = true; return; }
+  const d = RACE.data, R = raceR(), j = row.o.j, i = row.i, k = d.pooledAt[row.day];
+  const lines = [];
+  lines.push(row.tier === 'N' ? 'New: not placed' : 'Tier ' + row.tier + ' · #' + R.rank[i][j]);
+  const label = Object.fromEntries(RACE_METRICS);
+  lines.push(label[RACE.metric] + ': ' + raceFmt(row.o.v));
+  if (k != null){
+    const wr = d.pooled.winrate[k][j], nw = d.pooled.net_wins[k][j];
+    if (RACE.metric !== 'winrate' && wr != null) lines.push('Win rate: ' + wr.toFixed(1) + '%');
+    if (RACE.metric !== 'net_wins' && nw != null) lines.push('Net wins: ' + (nw > 0 ? '+' : '') + nw.toLocaleString('en-US'));
+  }
+  ui.tip.replaceChildren();
+  const b = el('b'); b.textContent = row.o.h; ui.tip.appendChild(b);
+  for (const l of lines){ const s = el('span'); s.textContent = l; ui.tip.appendChild(s); }
+  ui.tip.hidden = false;
+  if (ev){
+    const box = document.getElementById('race').getBoundingClientRect();
+    const w = ui.tip.offsetWidth, h = ui.tip.offsetHeight;
+    let x = ev.clientX - box.left + 12; if (x + w > box.width) x = ev.clientX - box.left - w - 12;
+    ui.tip.style.left = Math.max(0, x) + 'px';
+    ui.tip.style.top = Math.max(0, ev.clientY - box.top - h - 10) + 'px';
+  }
 }
 </script>
 </body>

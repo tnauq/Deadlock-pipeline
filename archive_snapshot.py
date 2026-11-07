@@ -354,6 +354,15 @@ def main():
                         gzip.open(dest, "wb", compresslevel=9) as dst:
                     shutil.copyfileobj(src, dst)
 
+    # The site's tier race (docs/archive/race.json), rebuilt from archive/ on
+    # every run, including runs that skipped today's snapshot. Never fatal: a
+    # failure here leaves yesterday's race.json in place and the refresh goes on.
+    try:
+        import build_race_data
+        build_race_data.build()
+    except (Exception, SystemExit) as e:
+        print("  [race] not rebuilt: %s" % e, file=sys.stderr)
+
 
 if __name__ == "__main__":
     main()
