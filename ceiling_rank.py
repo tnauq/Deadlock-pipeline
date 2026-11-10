@@ -156,6 +156,7 @@ import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
 
+import board_season   # which ranked season's boards (2026-11-10)
 import lake    # the orbit query runs on deadlock-api's data lake (2026-10-14)
 
 BASE = "https://api.deadlock-api.com"
@@ -498,6 +499,11 @@ def get(url):
         return json.loads(r.read().decode("utf-8"))
 
 
+# Set in main() by board_season.resolve(): "?leaderboard_id=N". The pipeline
+# decides first and caches it in output/, so both scripts read one season.
+LB_QS = ""
+
+
 def fetch_board(region):
     """Return (entries_by_name, depth, ordered) for one region's cross-hero board.
 
@@ -506,7 +512,7 @@ def fetch_board(region):
     shared by 14 players, but the list is monotonic in rank — so list order is
     the real ordering and 'rank' is a tied/rounded label.
     """
-    data = get("%s/v1/leaderboard/%s" % (BASE, region))
+    data = get("%s/v1/leaderboard/%s%s" % (BASE, region, LB_QS))
     entries = data.get("entries") if isinstance(data, dict) else data
     if not entries:
         raise SystemExit("no entries for %s; response keys: %s"
@@ -581,7 +587,7 @@ def fetch_board(region):
 def fetch_hero_board(region, hero_id):
     """One hero's board for one region. Position is the list index."""
     try:
-        data = get("%s/v1/leaderboard/%s/%d" % (BASE, region, hero_id))
+        data = get("%s/v1/leaderboard/%s/%d%s" % (BASE, region, hero_id, LB_QS))
     except Exception as e:
         print("  [hb] %s hero %d -> %s" % (region, hero_id, e), file=sys.stderr)
         return []
@@ -1013,6 +1019,11 @@ def main():
         print("[floor] minimum rank %s (index %d); unreadable rank -> %s"
               % (RANK_NAMES[floor_idx], floor_idx, CEILING_RANK_UNKNOWN.upper()),
               file=sys.stderr)
+
+    global LB_QS
+    _ids = sorted(int(t["hero_id"]) for t in tier.values()
+                  if str(t.get("hero_id") or "").strip().isdigit())
+    LB_QS = board_season.suffix(board_season.resolve(get, BASE, REGIONS, _ids))
 
     print("[1/4] leaderboards", file=sys.stderr)
     boards = {}

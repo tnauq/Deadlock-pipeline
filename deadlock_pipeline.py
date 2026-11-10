@@ -62,6 +62,7 @@ import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
 
+import board_season   # which ranked season's boards (2026-11-10)
 import lake
 
 BASE = "https://api.deadlock-api.com"
@@ -670,6 +671,11 @@ def _norm_name(s):
     return " ".join((s or "").split()).casefold()
 
 
+# Set in main() by board_season.resolve(): "?leaderboard_id=N", so every board
+# this run reads comes from one ranked season.
+LB_QS = ""
+
+
 def fetch_general_boards():
     """region -> {"by_name": {norm_name: entry}, "size": n}.
 
@@ -680,7 +686,7 @@ def fetch_general_boards():
     """
     out = {}
     for region in REGIONS:
-        url = "%s/v1/leaderboard/%s" % (BASE, urllib.parse.quote(region))
+        url = "%s/v1/leaderboard/%s%s" % (BASE, urllib.parse.quote(region), LB_QS)
         try:
             payload = _get(url)
         except urllib.error.HTTPError as e:
@@ -724,7 +730,8 @@ def fetch_ladders(heroes, general=None):
     for hid in sorted(heroes):
         total = 0
         for region in REGIONS:
-            url = "%s/v1/leaderboard/%s/%d" % (BASE, urllib.parse.quote(region), hid)
+            url = "%s/v1/leaderboard/%s/%d%s" % (BASE, urllib.parse.quote(region), hid,
+                                                 LB_QS)
             try:
                 payload = _get(url)
             except urllib.error.HTTPError as e:
@@ -1923,6 +1930,13 @@ def main():
              SELECTION_ORDER), file=sys.stderr)
     # The general board is fetched FIRST so the hero boards can be cross-
     # referenced against it as they arrive. Free bucket, one call per region.
+    # Pin every board to ONE ranked season (board_season.py). Since Season 2
+    # the API's default board changes at its own pace, and on 2026-11-10 it
+    # served a 1-entry board that turned every hero NEW. Stops the run if the
+    # chosen board is near-empty.
+    global LB_QS
+    LB_QS = board_season.suffix(
+        board_season.resolve(_get, BASE, REGIONS, sorted(heroes)))
     general = fetch_general_boards() if GENERAL_XREF else {}
     ladder = fetch_ladders(heroes, general)
     # A hero released hours ago has no per-hero board yet: Valve's board is
