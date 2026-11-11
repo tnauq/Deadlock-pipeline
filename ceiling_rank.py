@@ -6,11 +6,30 @@ The per-hero leaderboard gives position WITHIN a hero, so it cannot compare
 heroes against each other — every hero has a rank 1. A hero's ceiling is
 therefore its best board player's standing in the region as a whole.
 
-WHAT ORDERS THE CEILING — REVERTED 2026-09-02 to the cross-hero board
----------------------------------------------------------------------
-CEILING_METRIC=board (the default again) orders a hero by its best confirmed
-player's POSITION on the region's general leaderboard. CEILING_METRIC=net_wins
-restores the ranked ordering described below.
+WHAT ORDERS THE CEILING — 2026-11-10: Valve's rank while the board is frozen
+---------------------------------------------------------------------------
+CEILING_METRIC=auto is the default. Season 2 (2026-11-05) gave every season
+its own leaderboard, and a Season 2 spot takes 50 ranked matches, so
+board_season.py reads Season 1's frozen boards until Season 2's fill. A frozen
+board still says WHO plays a hero at the top; it no longer says where they
+stand. So while the board in use belongs to an ended season, "auto" orders
+the candidates by Valve's own rank in the running season instead
+(CEILING_METRIC=rank, valve_rank.py): each player's ladder progress after
+their newest ranked match, the number the leaderboard itself sorts by. Once
+the board in use is the running season's, "auto" is "board" again.
+
+This also retires the premise of the ranked-era text further down. The rating
+did not die on 2026-07-30. Valve stopped filling the team-average badge that
+day, and since then each ranked match carries every player's own rank
+instead (deadlock-api source, 110e282). This repo never read it. net_wins was
+built as a copy of the rank currency because the currency looked unreadable;
+it is readable.
+
+THE BOARD ORDERING — reverted to on 2026-09-02
+----------------------------------------------
+CEILING_METRIC=board orders a hero by its best confirmed player's POSITION on
+the region's general leaderboard. CEILING_METRIC=net_wins restores the ranked
+ordering described below.
 
 Why the revert: the ranked ordering rested on ranked play being a growing,
 representative slice. It is not. Ranked volume stalled and the ranked ladder
@@ -158,6 +177,7 @@ from collections import Counter, defaultdict
 
 import board_season   # which ranked season's boards (2026-11-10)
 import lake    # the orbit query runs on deadlock-api's data lake (2026-10-14)
+import valve_rank     # Valve's own per-player rank (2026-11-10)
 
 BASE = "https://api.deadlock-api.com"
 API_KEY = os.environ.get("DEADLOCK_API_KEY")
@@ -170,15 +190,45 @@ OUT_DIR = "output"
 MATCH_MODE = os.environ.get("MATCH_MODE") or ""
 
 # WHAT ORDERS THE CEILING.
-#   "board"     general-board position, ascending — the restored default
+#   "board"     general-board position, ascending
+#   "rank"      Valve's own rank for the player, from their newest ranked match
+#               in the running season (valve_rank.py): most ladder progress
+#               first. It is the number the leaderboard itself sorts by, and a
+#               player has one from their first match after placement, where a
+#               Season 2 board spot takes 50 matches.
+#   "auto"      the default since 2026-11-10: "rank" while the board being read
+#               belongs to a season that has ENDED (board_season.py pins the
+#               frozen Season 1 boards until Season 2's fill), "board" once it
+#               is the running season's. Falls back to "board" whenever the
+#               rank data does not cover enough heroes (RANK_MIN_COVERAGE).
 #   "net_wins"  ranked net wins, descending — the 2026-08-07 to 2026-09-02
-#               behaviour, kept for comparison and for if ranked recovers
+#               behaviour, kept for comparison
 # Whichever is not the key is still written to ceiling.csv as a reference
-# column, so one run produces both orderings' inputs and they can be diffed.
-CEILING_METRIC = (os.environ.get("CEILING_METRIC") or "board").strip().lower()
-if CEILING_METRIC not in ("board", "net_wins"):
-    raise SystemExit("CEILING_METRIC must be 'board' or 'net_wins', got %r"
-                     % CEILING_METRIC)
+# column, so one run produces every ordering's inputs and they can be diffed.
+CEILING_METRIC = (os.environ.get("CEILING_METRIC") or "auto").strip().lower()
+if CEILING_METRIC not in ("auto", "board", "rank", "net_wins"):
+    raise SystemExit("CEILING_METRIC must be 'auto', 'board', 'rank' or "
+                     "'net_wins', got %r" % CEILING_METRIC)
+# The ordering this run really uses: "board", "rank" or "net_wins". "auto" and
+# "rank" are settled in main() by pick_metric(), once the ranks are in.
+METRIC = CEILING_METRIC if CEILING_METRIC in ("board", "net_wins") else "board"
+# Share of hero-regions with a board candidate that must have one holding a
+# current rank before the ceiling is ordered by rank. Under it the whole run
+# stays on board order rather than mixing two scales.
+RANK_MIN_COVERAGE = float(os.environ.get("RANK_MIN_COVERAGE") or 0.9)
+# A SANITY CHECK ON THE RANKS THEMSELVES. The players on a region's top-1,000
+# board should hold high ranks. If the median tier of the confirmed players'
+# current ranks is under this (8 = Oracle; they should be Phantom and up), the
+# rank route is answering with something other than what it is read as, and
+# the run stays on board order. This repo has been burned twice by an endpoint
+# that answered plausibly while meaning something else (match_mode accepted
+# and ignored; average_badge populated and zero).
+RANK_MIN_MEDIAN_TIER = int(os.environ.get("RANK_MIN_MEDIAN_TIER", "8") or 0)
+# Under "rank", a ceiling player must also have this many games on the hero in
+# the last RECENT_DAYS days. A frozen board lists who qualified LAST season; a
+# player who has since dropped the hero is not its ceiling now. 0 = no check.
+# Skipped when the windowed hero-stats call returned nothing.
+RANK_MIN_RECENT_HERO_GAMES = int(os.environ.get("RANK_MIN_RECENT_HERO_GAMES", "3") or 0)
 MAX_URL = int(os.environ.get("MAX_URL") or 9000)
 
 # Shrinkage for the SECONDARY win-rate column. Not the ordering — kept so the
@@ -379,7 +429,7 @@ ETERNUS_WARN_SHARE = float(os.environ.get("ETERNUS_WARN_SHARE") or 0.02)
 # and applying an unreadable rank check on top of it can only drop good
 # candidates. Under net_wins the default is Phantom exactly as before.
 _MIN_RANK_ENV = os.environ.get("CEILING_MIN_RANK")
-_MIN_RANK_DEFAULT = "" if CEILING_METRIC == "board" else "Phantom"
+_MIN_RANK_DEFAULT = "Phantom" if CEILING_METRIC == "net_wins" else ""
 CEILING_MIN_RANK = (_MIN_RANK_DEFAULT if _MIN_RANK_ENV is None
                     else _MIN_RANK_ENV).strip()
 # What an unreadable rank means: "keep" (default, degrades to no floor when the
@@ -491,11 +541,11 @@ def passes_identity(cand, hero_id, rec, hero_records):
     return True, "pass", g
 
 
-def get(url):
+def get(url, timeout=120):
     req = urllib.request.Request(url, headers={"User-Agent": "deadlock-ceiling/1.0"})
     if API_KEY:
         req.add_header("X-API-Key", API_KEY)
-    with urllib.request.urlopen(req, timeout=120) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
@@ -738,6 +788,10 @@ def fetch_scoreboard_pairs(cands_by_hero):
     return pairs, checked
 
 
+# label -> the account ids whose hero-stats chunk failed in that pass.
+HS_FAILED = {}
+
+
 def fetch_ranked_records(account_ids, since=None, label="career"):
     """
     account_id -> {"games": n, "wins": n} over MATCH_MODE play, all heroes.
@@ -785,6 +839,8 @@ def fetch_ranked_records(account_ids, since=None, label="career"):
         except Exception as e:
             print("  [hs] chunk %d-%d failed: %s" % (i + 1, i + len(part), e),
                   file=sys.stderr)
+            # remembered, so "no row" for these ids is not read as "no games"
+            HS_FAILED.setdefault(label, set()).update(part)
             continue
         calls += 1
         for r in rows or []:
@@ -954,7 +1010,11 @@ def ceiling_key(rec, cand):
     """
     THE ORDERING, as a sort key: lower is better.
 
-    CEILING_METRIC=board (default) — the player's position on the region's
+    Which ordering applies is METRIC, settled in main() by pick_metric().
+
+    "rank" — see rank_key().
+
+    "board" — the player's position on the region's
     cross-hero leaderboard, ascending. Position 1 is the region's best player,
     so a hero whose best confirmed player sits at 7 outranks one whose best
     sits at 308. This is a RANKING published by Valve, not a quantity we
@@ -969,15 +1029,47 @@ def ceiling_key(rec, cand):
     with no confirmed board candidate at all — which is exactly the case the
     orbit fallback exists for.
 
-    CEILING_METRIC=net_wins — ranked net wins, descending, negated here so the
+    "net_wins" — ranked net wins, descending, negated here so the
     same "lower is better" convention holds. See the retained ranked-era
     reasoning in the module docstring; that ordering must not be decayed.
     """
-    if CEILING_METRIC == "board":
-        return (cand["pos"], hero_pct(cand), -ceiling_net_wins(rec),
-                cand["hero_pos"])
+    if METRIC == "rank":
+        return rank_key(rec, cand)
+    if METRIC == "board":
+        return board_key(rec, cand)
     return (-ceiling_net_wins(rec), cand["pos"], hero_pct(cand),
             cand["hero_pos"])
+
+
+def board_key(rec, cand):
+    """The "board" ordering: general-board position, then the tiebreaks."""
+    return (cand["pos"], hero_pct(cand), -ceiling_net_wins(rec),
+            cand["hero_pos"])
+
+
+def rank_key(rec, cand):
+    """The "rank" ordering (2026-11-10).
+
+    A player counts when they hold a rank in the running season and still play
+    the hero (rank_now, set in main). Among those, most ladder progress first:
+    flat progress is a total order within one season, Eternus included, where
+    it keeps growing past the last badge.
+
+        0  board players who count. A hero-board-only player competes on equal
+           terms: their censored board position stood in for this number.
+        1  orbit players who count. They are reached only where NO board
+           player does, and build_site_data.py lists an orbit ceiling as NEW
+           (not placed), which is what a hero without a ranked board player is.
+        2  board players who do not count, in board order, so a hero-region
+           never loses its row. Its ceiling then has no current rank and sorts
+           behind every hero that has one.
+        3  orbit players who do not count.
+    """
+    now = bool(cand.get("rank_now"))
+    orbit = cand["match"] == "orbit"
+    group = (1 if orbit else 0) if now else (3 if orbit else 2)
+    return ((group, -(cand.get("rank_progress") or 0) if now else 0)
+            + board_key(rec, cand))
 
 
 def ceiling_net_wins(rec):
@@ -1001,16 +1093,48 @@ def shrunk(rec, k=None):
     return (rec["wins"] + k * 0.5) / (rec["games"] + k)
 
 
+def pick_metric(setting, frozen, coverage, median_tier=None):
+    """(metric, why): the ordering this run uses. See CEILING_METRIC.
+
+    frozen       True when the board in use belongs to a season that is no
+                 longer running, False when it is the running season's, None
+                 when that could not be told (the season list was unreadable).
+    coverage     share of hero-regions with a board candidate where at least
+                 one holds a current rank and still plays the hero.
+    median_tier  median rank tier of the confirmed players' current ranks
+                 (None = not checked). See RANK_MIN_MEDIAN_TIER.
+    """
+    if setting in ("board", "net_wins"):
+        return setting, "CEILING_METRIC=%s" % setting
+    short = ("only %.0f%% of hero-regions have a board player with a current "
+             "rank (needs %.0f%%)" % (100 * coverage, 100 * RANK_MIN_COVERAGE))
+    enough = coverage >= RANK_MIN_COVERAGE
+    if enough and median_tier is not None and median_tier < RANK_MIN_MEDIAN_TIER:
+        enough = False
+        short = ("the board players' median rank is %s, under %s: the ranks do "
+                 "not look like the top of a ladder"
+                 % (valve_rank.TIERS[min(int(median_tier), 11)],
+                    valve_rank.TIERS[min(RANK_MIN_MEDIAN_TIER, 11)]))
+    if setting == "rank":
+        return (("rank", "CEILING_METRIC=rank") if enough
+                else ("board", "CEILING_METRIC=rank, but " + short))
+    if frozen is None:
+        return "board", "auto: could not tell which season the board in use belongs to"
+    if not frozen:
+        return "board", "auto: the board in use is the running season's"
+    return (("rank", "auto: the board in use is from a season that has ended")
+            if enough else ("board", "auto: the board is from an ended season, but " + short))
+
+
 # --------------------------------------------------------------------------
 
 
 def main():
     tier = {r["hero"]: r for r in csv.DictReader(open(os.path.join(OUT_DIR, "tierlist.csv")))}
 
-    print("[metric] ceiling ordered by %s; match_mode=%s"
-          % ("general-board position (ascending)" if CEILING_METRIC == "board"
-             else "ranked net wins (descending)",
-             MATCH_MODE or "standard (unfiltered)"), file=sys.stderr)
+    print("[metric] CEILING_METRIC=%s (the ordering used is printed once the "
+          "ranks are in); match_mode=%s"
+          % (CEILING_METRIC, MATCH_MODE or "standard (unfiltered)"), file=sys.stderr)
 
     floor_idx = _min_rank_index()
     if floor_idx is None:
@@ -1020,10 +1144,11 @@ def main():
               % (RANK_NAMES[floor_idx], floor_idx, CEILING_RANK_UNKNOWN.upper()),
               file=sys.stderr)
 
-    global LB_QS
+    global LB_QS, METRIC
     _ids = sorted(int(t["hero_id"]) for t in tier.values()
                   if str(t.get("hero_id") or "").strip().isdigit())
-    LB_QS = board_season.suffix(board_season.resolve(get, BASE, REGIONS, _ids))
+    lid = board_season.resolve(get, BASE, REGIONS, _ids)
+    LB_QS = board_season.suffix(lid)
 
     print("[1/4] leaderboards", file=sys.stderr)
     boards = {}
@@ -1142,6 +1267,101 @@ def main():
     recent, recent_hero = fetch_ranked_records(every_id, since=recent_since,
                                                label="%dd" % RECENT_DAYS)
 
+    # ---- Valve's own rank for every candidate (valve_rank.py) -------------
+    # Always fetched and always written to ceiling.csv. Whether it ORDERS the
+    # ceiling is pick_metric()'s call.
+    # A shorter wait than get()'s default: the API cuts its own queries off
+    # at 20 s, and this must not hold the run for minutes if the route hangs.
+    def rank_get(url):
+        return get(url, timeout=45)
+    ranks, rank_info = valve_rank.fetch_ranks(rank_get, BASE, every_id)
+    intervals = valve_rank.fetch_intervals(rank_get, BASE)
+    live_iv = valve_rank.running_interval(intervals)
+    board_iv = valve_rank.board_interval(intervals, lid)
+    cur_iv = (live_iv["interval"] if live_iv else
+              (max([r["interval"] for r in ranks.values() if r["interval"]] or [0])
+               or None))
+    frozen = (board_iv["interval"] != live_iv["interval"]
+              if (board_iv and live_iv) else None)
+
+    recent_failed = HS_FAILED.get("%dd" % RECENT_DAYS, set())
+
+    def attach_rank(c, hid):
+        r = ranks.get(c["account_id"])
+        c["rank_badge"] = r["badge"] if r else None
+        c["rank_progress"] = r["progress"] if r else None
+        c["rank_interval"] = r["interval"] if r else None
+        # a placed rank from a match that counted for the running season
+        c["rank_current"] = valve_rank.is_current(r, cur_iv)
+        # no windowed row only means "no recent games" when the account's
+        # chunk of that call came back
+        plays = (RANK_MIN_RECENT_HERO_GAMES <= 0 or not recent_hero or
+                 c["account_id"] in recent_failed or
+                 recent_hero.get((c["account_id"], hid), {}).get("games", 0)
+                 >= RANK_MIN_RECENT_HERO_GAMES)
+        c["rank_now"] = c["rank_current"] and plays
+
+    n_board = n_now = 0
+    for (_rg, hid), (cands, _n) in confirmed.items():
+        for c in cands:
+            attach_rank(c, hid)
+        if cands:
+            n_board += 1
+            n_now += any(c["rank_now"] for c in cands)
+    coverage = n_now / float(n_board) if n_board else 0.0
+    # one rank per confirmed account, however many hero boards they are on
+    conf_badge = {c["account_id"]: c["rank_badge"]
+                  for (cands, _n) in confirmed.values() for c in cands
+                  if c["match"] == "confirmed" and c["rank_current"]}
+    median_tier = (sorted(b // 10 for b in conf_badge.values())[len(conf_badge) // 2]
+                   if conf_badge else None)
+    METRIC, why = pick_metric(CEILING_METRIC, frozen, coverage, median_tier)
+
+    n_cur = sum(1 for r in ranks.values() if valve_rank.is_current(r, cur_iv))
+    n_old = sum(1 for r in ranks.values() if r["badge"] > 0 and r["interval"] != cur_iv)
+    print("  [valve] %d of %d candidates answered over %d calls: %d hold a rank in "
+          "interval %s (the running season), %d only in an older one, %d none; "
+          "%d not fetched"
+          % (rank_info["answered"], rank_info["asked"], rank_info["calls"], n_cur,
+             cur_iv, n_old, rank_info["answered"] - n_cur - n_old,
+             rank_info["failed"]), file=sys.stderr)
+    print("  [valve] board in use: %s (%s); %d of %d hero-regions with a board "
+          "candidate have one with a current rank%s (%.0f%%, needs %.0f%%)"
+          % (lid, "season unknown" if frozen is None else
+             "its season has ended" if frozen else "the running season's",
+             n_now, n_board,
+             (" and %d+ games on the hero in %d days"
+              % (RANK_MIN_RECENT_HERO_GAMES, RECENT_DAYS))
+             if RANK_MIN_RECENT_HERO_GAMES > 0 and recent_hero else "",
+             100 * coverage, 100 * RANK_MIN_COVERAGE), file=sys.stderr)
+    if conf_badge:
+        tiers = Counter(valve_rank.TIERS[min(b // 10, 11)] for b in conf_badge.values())
+        print("  [valve] current ranks of the %d confirmed board players: %s "
+              "(median %s)"
+              % (len(conf_badge),
+                 ", ".join("%s %d" % (t, tiers[t]) for t in reversed(valve_rank.TIERS)
+                           if tiers[t]),
+                 valve_rank.TIERS[min(median_tier, 11)]), file=sys.stderr)
+    # How far last season's board order and this season's rank agree, over the
+    # dual-confirmed players: +1 = the same order, 0 = unrelated.
+    for rg in REGIONS:
+        seen = {}
+        for (r, _h), (cands, _n) in confirmed.items():
+            if r == rg:
+                for c in cands:
+                    if c["match"] == "confirmed" and c["rank_current"]:
+                        seen[c["account_id"]] = (-c["pos"], c["rank_progress"])
+        rho = valve_rank.spearman([v[0] for v in seen.values()],
+                                  [v[1] for v in seen.values()])
+        print("  [valve] %-9s board position vs current rank over %d confirmed "
+              "players: rho %s" % (rg, len(seen), "n/a" if rho is None else rho),
+              file=sys.stderr)
+    print("[metric] ceiling ordered by %s (%s)"
+          % ({"board": "general-board position (ascending)",
+              "rank": "Valve rank in the running season (most progress first)",
+              "net_wins": "ranked net wins (descending)"}[METRIC], why),
+          file=sys.stderr)
+
     # third channel: does the scoreboard, which publishes real account ids,
     # independently agree that this account plays this hero?
     sb_pairs, sb_checked = set(), set()
@@ -1190,14 +1410,16 @@ def main():
                 hrec = hero_records.get((aid, hid))
                 if not hrec or hrec["games"] < ORBIT_MIN_HERO_GAMES:
                     continue
-                pool.append({"name": "", "account_id": aid,
-                             # no board position: they were not on it
-                             "pos": NO_BOARD_POS, "hero_pos": NO_BOARD_POS,
-                             "badge": None, "ranked_rank": None,
-                             "top_heroes": [], "match": "orbit", "board_size": 0,
-                             "seeds_met": prox["seeds_met"],
-                             "shared": prox["shared"],
-                             "hero_games": hrec["games"]})
+                oc = {"name": "", "account_id": aid,
+                      # no board position: they were not on it
+                      "pos": NO_BOARD_POS, "hero_pos": NO_BOARD_POS,
+                      "badge": None, "ranked_rank": None,
+                      "top_heroes": [], "match": "orbit", "board_size": 0,
+                      "seeds_met": prox["seeds_met"],
+                      "shared": prox["shared"],
+                      "hero_games": hrec["games"]}
+                attach_rank(oc, hid)
+                pool.append(oc)
                 from_orbit += 1
         if not pool:
             continue
@@ -1265,6 +1487,14 @@ def main():
         # tiebreaks, so this sort is total and never depends on pool order.
         scored.sort(key=lambda t: t[0])
         _key, rec, c = scored[0]
+        # Would board order and rank order name the same player here? Blank
+        # when no candidate holds a current rank, so there is nothing to compare.
+        if any(t[2].get("rank_now") for t in scored):
+            by_board = min(scored, key=lambda t: board_key(t[1], t[2]))[2]
+            by_rank = min(scored, key=lambda t: rank_key(t[1], t[2]))[2]
+            agree = "YES" if by_board["account_id"] == by_rank["account_id"] else "NO"
+        else:
+            agree = ""
         net = ceiling_net_wins(rec)
         t = tier.get(hero, {})
         per_region[rg].append({
@@ -1295,7 +1525,20 @@ def main():
             # which ordering produced ceiling_rank in THIS file. build_site_data
             # sorts on ceiling_rank and cannot otherwise tell the two apart, so
             # a file is never ambiguous about what it was ranked by.
-            "ceiling_metric": CEILING_METRIC,
+            "ceiling_metric": METRIC,
+            # Valve's own rank for the ceiling player, from their newest ranked
+            # match (valve_rank.py). valve_current = that match counted for
+            # the running season and they are out of placement. Written under
+            # every ordering; under "rank" valve_progress IS the ordering.
+            "valve_badge": c.get("rank_badge") or "",
+            "valve_rank": valve_rank.badge_name(c.get("rank_badge")),
+            "valve_progress": (c["rank_progress"]
+                               if c.get("rank_progress") is not None else ""),
+            "valve_interval": c.get("rank_interval") or "",
+            "valve_current": "YES" if c.get("rank_current") else "",
+            # YES/NO: do board order and rank order pick the same player for
+            # this hero-region? Blank when no candidate has a current rank.
+            "rank_board_agree": agree,
             "region_depth": depth[rg],
             "pct": (round(100.0 * c["pos"] / max(depth[rg], 1), 3)
                     if c["match"] == "confirmed" else ""),
@@ -1378,7 +1621,16 @@ def main():
         # hero name last so the order is TOTAL — two heroes can otherwise tie
         # on every term (same censored position, same board size, same record)
         # and fall back to dict insertion order, which is not reproducible
-        if CEILING_METRIC == "board":
+        if METRIC == "rank":
+            # Ceilings holding a current rank first, most progress first. The
+            # rest follow in board order: a ceiling with no current rank (all
+            # of that hero's players still in placement) and orbit ceilings,
+            # which build_site_data.py lists as NEW wherever they sort.
+            def key(d):
+                placed = d["valve_current"] == "YES" and d["match"] != "orbit"
+                return (0 if placed else 1, -d["valve_progress"] if placed else 0,
+                        _pos(d), _hpct(d), -d["net_wins"], -_wr(d), d["hero"])
+        elif METRIC == "board":
             key = lambda d: (_pos(d), _hpct(d), -d["net_wins"], -_wr(d), d["hero"])
         else:
             key = lambda d: (-d["net_wins"], _pos(d), _hpct(d), -_wr(d), d["hero"])
@@ -1410,13 +1662,29 @@ def main():
             "scored_candidates", "floored_out", "rank_unknown", "min_rank",
             "from_orbit", "ceiling_from_orbit",
             "orbit_seeds_met", "orbit_hero_games", "board_size", "winrate_rank",
-            "elite_winrate"]
+            "elite_winrate",
+            "valve_badge", "valve_rank", "valve_progress", "valve_interval",
+            "valve_current", "rank_board_agree"]
     path = os.path.join(OUT_DIR, "ceiling.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         w.writerows(out)
     print("  -> %s (%d hero-region rows)" % (path, len(out)), file=sys.stderr)
+
+    if ranks:
+        ag = Counter(d["rank_board_agree"] for d in out)
+        print("\n  [valve] board order and rank order name the same ceiling player "
+              "in %d of %d hero-regions; they differ in %d, and %d have no "
+              "candidate with a current rank"
+              % (ag["YES"], len(out), ag["NO"], ag[""]), file=sys.stderr)
+        if METRIC == "rank":
+            behind = sorted("%s/%s" % (d["region"], d["hero"]) for d in out
+                            if d["valve_current"] != "YES" and d["match"] != "orbit")
+            if behind:
+                print("  [valve] %d ceilings hold no current rank and sort behind "
+                      "the rest in board order: %s"
+                      % (len(behind), ", ".join(behind[:20])), file=sys.stderr)
 
     # ---- hero-play validation: did it bite, and on whom? ------------------
     if VALIDATE_HERO_PLAY:
@@ -1569,21 +1837,32 @@ def main():
             continue
         print("\n  %s — top 10 by ceiling (%d heroes ranked)"
               % (region, sum(1 for d in out if d["region"] == region)), file=sys.stderr)
-        print("  %-4s %-12s %-16s %6s %7s %8s %s" %
-              ("#", "hero", "ceiling player", "net", "games", "shrunk", "boardpos"),
-              file=sys.stderr)
+        print("  %-4s %-12s %-16s %6s %7s %8s %-8s %s" %
+              ("#", "hero", "ceiling player", "net", "games", "shrunk", "boardpos",
+               "rank now"), file=sys.stderr)
         for d in rows:
-            print("  %-4d %-12s %-16s %6d %7d %8.3f %s" %
+            print("  %-4d %-12s %-16s %6d %7d %8.3f %-8s %s" %
                   (d["ceiling_rank"], d["hero"][:12], (d["ceiling_player"] or "?")[:16],
                    d["net_wins"], d["ranked_games"], d["shrunk_winrate"],
-                   d["global_pos"] or "orbit"), file=sys.stderr)
+                   d["global_pos"] or "orbit",
+                   (d["valve_rank"] if d["valve_current"] == "YES" else "") or "-"),
+                  file=sys.stderr)
 
     # ---- Eternus watch, at the level that actually matters -----------------
     # The board-wide share is the early signal; THIS is the one that expires
     # the metric, because the ordering only breaks once the CEILING PLAYERS
     # themselves are percentile-ranked.
-    named = [d for d in out if d.get("rank_name")]
-    et = [d for d in named if d["rank_name"] == "Eternus"]
+    def _tier(d):
+        # the board's own field has been unreadable since 2026-08-18; the
+        # ceiling player's rank from their matches is not
+        if d.get("rank_name"):
+            return d["rank_name"]
+        b = d.get("valve_badge") or 0
+        return (valve_rank.TIERS[b // 10]
+                if d.get("valve_current") == "YES" and 0 < b // 10 < len(valve_rank.TIERS)
+                else "")
+    named = [d for d in out if _tier(d)]
+    et = [d for d in named if _tier(d) == "Eternus"]
     if named:
         print("\n  [eternus] %d of %d ceiling players carry a readable rank; "
               "%d at Eternus" % (len(named), len(out), len(et)), file=sys.stderr)
@@ -1591,7 +1870,7 @@ def main():
             print("    %-9s %-12s %-16s net %d"
                   % (d["region"], d["hero"], d["ceiling_player"], d["net_wins"]),
                   file=sys.stderr)
-        if et and CEILING_METRIC != "board":
+        if et and METRIC == "net_wins":
             print("  [eternus] net wins tracks rank only while the ladder is "
                   "progression-based. Once a meaningful share of CEILING "
                   "players sit at Eternus, the top of the ordering is "
@@ -1606,6 +1885,10 @@ def main():
     # NAME, which is the very thing that cannot be trusted here. The
     # [identity] report above groups by resolved account_id and shows the
     # per-hero games that tell the two cases apart.)
+
+    # Season 2 probe: once a day, in its own process, never fatal. It reads
+    # the CSVs this run just wrote. See board_season.run_probe().
+    board_season.run_probe("end of ceiling_rank")
 
 
 if __name__ == "__main__":
