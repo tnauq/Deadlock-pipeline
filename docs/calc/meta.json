@@ -262,8 +262,8 @@
  },
  "items_kb": 156.8,
  "items_gz_kb": 16.0,
- "heroes_kb": 467.2,
- "heroes_gz_kb": 16.9,
+ "heroes_kb": 467.1,
+ "heroes_gz_kb": 16.8,
  "slot_model": {
   "total": 12,
   "unlocked_at_start": 9,
@@ -296,5 +296,5 @@
  "abilities_kb": 438.1,
  "abilities_gz_kb": 62.4,
  "dps_checked": 44,
- "dps_failed": 0
+ "dps_failed": 4
 }
