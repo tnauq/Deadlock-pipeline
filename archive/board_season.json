@@ -1,0 +1,18 @@
+{
+ "evidence": {
+  "Europe": {
+   "general": 1000,
+   "hero_empty": 1,
+   "hero_median": 23.5
+  },
+  "NAmerica": {
+   "general": 930,
+   "hero_empty": 2,
+   "hero_median": 20.0
+  }
+ },
+ "leaderboard_id": 1002,
+ "previous": 1001,
+ "rule": "general >= 900, hero-board median >= 20, every region",
+ "switched_at": "2026-11-21T15:43:46Z"
+}
