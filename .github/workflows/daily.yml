@@ -200,3 +200,29 @@ jobs:
             output/identity_summary.csv
             output/pool_audit.csv
             output/items_manifest.json
+
+      # Master build image (make_master.py): every hero's 12-slot elite build,
+      # EU beside NA, fitted to a 4 MiB / 10000 px PNG for image boards. Zero
+      # API calls. Its own artifact, so it downloads on its own.
+      #
+      # continue-on-error: a broken image must never block the data refresh.
+      # A failure still shows as a red annotation on the (green) run, and the
+      # upload step below then warns that there is no file.
+      - name: Build master image
+        continue-on-error: true
+        run: |
+          pip install --quiet pillow numpy opencv-python-headless
+          python3 make_master.py
+
+      # compression-level 0: the PNG is already compressed, re-zipping it only
+      # costs time. GitHub still delivers every artifact as a .zip.
+      - name: Upload master image
+        uses: actions/upload-artifact@v4
+        with:
+          name: deadlock-master-builds
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: warn
+          path: output/images/master_builds.png
+
+
