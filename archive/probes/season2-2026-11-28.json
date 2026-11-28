@@ -1,0 +1,1069 @@
+{
+ "at": "2026-11-28T00:09:13Z",
+ "boards": {
+  "default_is": {
+   "Europe": 1002,
+   "NAmerica": 1002
+  },
+  "general": {
+   "1001": {
+    "Europe": 1015,
+    "NAmerica": 1001
+   },
+   "1002": {
+    "Europe": 1000,
+    "NAmerica": 1000
+   },
+   "default": {
+    "Europe": 1000,
+    "NAmerica": 1000
+   }
+  },
+  "hero_sample": {
+   "1001": {
+    "Europe": {
+     "1": 107,
+     "50": 88,
+     "88": 1
+    },
+    "NAmerica": {
+     "1": 100,
+     "50": 68,
+     "88": 3
+    }
+   },
+   "1002": {
+    "Europe": {
+     "1": 58,
+     "50": 67,
+     "88": 3
+    },
+    "NAmerica": {
+     "1": 45,
+     "50": 65,
+     "88": 5
+    }
+   },
+   "default": {
+    "Europe": {
+     "1": 58,
+     "50": 67,
+     "88": 3
+    },
+    "NAmerica": {
+     "1": 45,
+     "50": 65,
+     "88": 5
+    }
+   }
+  },
+  "intervals": [
+   {
+    "end": 1793908800,
+    "interval": 1,
+    "leaderboard_id": 1001,
+    "season": "Beta Season 1",
+    "start": 1785430800
+   },
+   {
+    "end": 1804802400,
+    "interval": 2,
+    "leaderboard_id": 1002,
+    "season": "Beta Season 2",
+    "start": 1793908800
+   }
+  ],
+  "running_interval": 2,
+  "sample_heroes": [
+   1,
+   50,
+   88
+  ],
+  "seconds": 9.9
+ },
+ "compare": {
+  "ceiling": {
+   "board_and_rank_agree": {
+    "NO": 17,
+    "YES": 71
+   },
+   "metric": {
+    "board": 88
+   },
+   "place_in_native_list": {
+    "absent": 8,
+    "below 20": 6,
+    "first": 4,
+    "hero not listed": 38,
+    "top 20": 20,
+    "top 5": 12
+   },
+   "rows": 88,
+   "with_current_rank": 82
+  },
+  "pool_Europe": {
+   "hero_regions": 25,
+   "native_top20_median_badge": "Eternus 3",
+   "pool_in_native_top20_median": 3,
+   "pool_median_badge": "Ascendant 4",
+   "pool_share_listed_at_all_median": 0.6,
+   "pool_share_with_current_rank_median": 0.95
+  },
+  "pool_NAmerica": {
+   "hero_regions": 25,
+   "native_top20_median_badge": "Eternus 2",
+   "pool_in_native_top20_median": 4,
+   "pool_median_badge": "Ascendant 3",
+   "pool_share_listed_at_all_median": 0.5,
+   "pool_share_with_current_rank_median": 0.9
+  },
+  "pool_ranks": {
+   "answered": 1276,
+   "asked": 1276,
+   "calls": 3,
+   "failed": 0,
+   "ranked": 1136
+  },
+  "pool_region_check": {
+   "other": 1,
+   "same": 637
+  },
+  "seconds": 8.3
+ },
+ "lake": {
+  "board_snapshots": [
+   {
+    "day": "2026-11-20",
+    "n": 2559,
+    "region": "Asia"
+   },
+   {
+    "day": "2026-11-20",
+    "n": 21150,
+    "region": "Europe"
+   },
+   {
+    "day": "2026-11-20",
+    "n": 18761,
+    "region": "NAmerica"
+   },
+   {
+    "day": "2026-11-20",
+    "n": 1340,
+    "region": "Oceania"
+   },
+   {
+    "day": "2026-11-20",
+    "n": 1142,
+    "region": "SAmerica"
+   },
+   {
+    "day": "2026-11-21",
+    "n": 2973,
+    "region": "Asia"
+   },
+   {
+    "day": "2026-11-21",
+    "n": 23415,
+    "region": "Europe"
+   },
+   {
+    "day": "2026-11-21",
+    "n": 21241,
+    "region": "NAmerica"
+   },
+   {
+    "day": "2026-11-21",
+    "n": 1530,
+    "region": "Oceania"
+   },
+   {
+    "day": "2026-11-21",
+    "n": 1314,
+    "region": "SAmerica"
+   },
+   {
+    "day": "2026-11-22",
+    "n": 3344,
+    "region": "Asia"
+   },
+   {
+    "day": "2026-11-22",
+    "n": 24011,
+    "region": "Europe"
+   },
+   {
+    "day": "2026-11-22",
+    "n": 23090,
+    "region": "NAmerica"
+   },
+   {
+    "day": "2026-11-22",
+    "n": 1784,
+    "region": "Oceania"
+   },
+   {
+    "day": "2026-11-22",
+    "n": 1480,
+    "region": "SAmerica"
+   },
+   {
+    "day": "2026-11-23",
+    "n": 3694,
+    "region": "Asia"
+   },
+   {
+    "day": "2026-11-23",
+    "n": 24149,
+    "region": "Europe"
+   },
+   {
+    "day": "2026-11-23",
+    "n": 24085,
+    "region": "NAmerica"
+   },
+   {
+    "day": "2026-11-23",
+    "n": 2058,
+    "region": "Oceania"
+   },
+   {
+    "day": "2026-11-23",
+    "n": 1735,
+    "region": "SAmerica"
+   },
+   {
+    "day": "2026-11-24",
+    "n": 4206,
+    "region": "Asia"
+   },
+   {
+    "day": "2026-11-24",
+    "n": 24077,
+    "region": "Europe"
+   },
+   {
+    "day": "2026-11-24",
+    "n": 24032,
+    "region": "NAmerica"
+   },
+   {
+    "day": "2026-11-24",
+    "n": 2209,
+    "region": "Oceania"
+   },
+   {
+    "day": "2026-11-24",
+    "n": 2015,
+    "region": "SAmerica"
+   },
+   {
+    "day": "2026-11-25",
+    "n": 4711,
+    "region": "Asia"
+   },
+   {
+    "day": "2026-11-25",
+    "n": 24081,
+    "region": "Europe"
+   },
+   {
+    "day": "2026-11-25",
+    "n": 24071,
+    "region": "NAmerica"
+   },
+   {
+    "day": "2026-11-25",
+    "n": 2416,
+    "region": "Oceania"
+   },
+   {
+    "day": "2026-11-25",
+    "n": 2268,
+    "region": "SAmerica"
+   },
+   {
+    "day": "2026-11-26",
+    "n": 5973,
+    "region": "Asia"
+   },
+   {
+    "day": "2026-11-26",
+    "n": 24000,
+    "region": "Europe"
+   },
+   {
+    "day": "2026-11-26",
+    "n": 24042,
+    "region": "NAmerica"
+   },
+   {
+    "day": "2026-11-26",
+    "n": 3114,
+    "region": "Oceania"
+   },
+   {
+    "day": "2026-11-26",
+    "n": 3270,
+    "region": "SAmerica"
+   },
+   {
+    "day": "2026-11-27",
+    "n": 7063,
+    "region": "Asia"
+   },
+   {
+    "day": "2026-11-27",
+    "n": 24053,
+    "region": "Europe"
+   },
+   {
+    "day": "2026-11-27",
+    "n": 24042,
+    "region": "NAmerica"
+   },
+   {
+    "day": "2026-11-27",
+    "n": 3987,
+    "region": "Oceania"
+   },
+   {
+    "day": "2026-11-27",
+    "n": 3948,
+    "region": "SAmerica"
+   }
+  ],
+  "columns": {
+   "accolades": [
+    "class_name",
+    "description",
+    "enabled_game_modes",
+    "flavor_name",
+    "id",
+    "threshold_type",
+    "tracked_stat_name"
+   ],
+   "build_tags": [
+    "class_name",
+    "icon",
+    "id",
+    "label"
+   ],
+   "client_versions": [
+    "client_version"
+   ],
+   "colors": [
+    "alpha",
+    "blue",
+    "green",
+    "name",
+    "red"
+   ],
+   "convars": [
+    "default_value",
+    "description",
+    "flags",
+    "name",
+    "type"
+   ],
+   "fonts": [
+    "path",
+    "url"
+   ],
+   "hero_leaderboard": [
+    "account_name",
+    "fetched_at",
+    "hero_id",
+    "leaderboard_position",
+    "rank",
+    "region",
+    "top_hero_ids"
+   ],
+   "heroes": [
+    "assigned_players_only",
+    "class_name",
+    "complexity",
+    "development_state",
+    "disabled",
+    "gender",
+    "gun_tag",
+    "hero_type",
+    "id",
+    "in_development",
+    "limited_testing",
+    "name",
+    "needs_testing",
+    "player_selectable",
+    "prerelease_only"
+   ],
+   "icons": [
+    "path",
+    "url"
+   ],
+   "images": [
+    "path",
+    "url"
+   ],
+   "items": [
+    "ability_type",
+    "activation",
+    "class_name",
+    "component_items",
+    "cost",
+    "disabled",
+    "hero",
+    "heroes",
+    "id",
+    "image",
+    "imbue",
+    "is_active_item",
+    "item_slot_type",
+    "item_tier",
+    "name",
+    "shopable",
+    "type"
+   ],
+   "leaderboard": [
+    "account_name",
+    "fetched_at",
+    "leaderboard_position",
+    "rank",
+    "region",
+    "top_hero_ids"
+   ],
+   "match_player_latest": [
+    "abandon_match_time_s",
+    "ability_points",
+    "ability_stats",
+    "accolades.accolade_id",
+    "accolades.accolade_stat_value",
+    "accolades.accolade_threshold_achieved",
+    "account_id",
+    "assigned_lane",
+    "assists",
+    "average_badge",
+    "average_badge_team0",
+    "average_badge_team1",
+    "banned_hero_ids",
+    "book_reward.book_id",
+    "book_reward.starting_xp",
+    "book_reward.xp_amount",
+    "bot_difficulty",
+    "corrupted_penalty_seed",
+    "created_at",
+    "custom_user_stats_deltas",
+    "death_details.death_duration_s",
+    "death_details.death_pos",
+    "death_details.game_time_s",
+    "death_details.killer_player_slot",
+    "death_details.killer_pos",
+    "death_details.time_to_kill_s",
+    "deaths",
+    "demo_processed",
+    "denies",
+    "duration_s",
+    "earned_holiday_award_2025",
+    "game_mode",
+    "game_mode_version",
+    "hero_build_id",
+    "hero_equips",
+    "hero_id",
+    "hero_release_votes.category",
+    "hero_release_votes.hero_id",
+    "hero_release_votes.vote_count",
+    "hero_xp",
+    "hero_xp_rewards.hero_id",
+    "hero_xp_rewards.reason",
+    "hero_xp_rewards.xp_grant",
+    "is_high_skill_range_parties",
+    "items.flags",
+    "items.game_time_s",
+    "items.imbued_ability_id",
+    "items.item_id",
+    "items.sold_time_s",
+    "items.upgrade_id",
+    "items.upgrade_info",
+    "kills",
+    "last_hits",
+    "low_pri_pool",
+    "match_id",
+    "match_mode",
+    "match_outcome",
+    "match_tracked_stats",
+    "mid_boss.destroyed_time_s",
+    "mid_boss.team_claimed",
+    "mid_boss.team_killed",
+    "mvp_rank",
+    "net_worth",
+    "new_player_pool",
+    "not_scored",
+    "objectives.creep_damage",
+    "objectives.creep_damage_mitigated",
+    "objectives.destroyed_time_s",
+    "objectives.first_damage_time_s",
+    "objectives.player_damage",
+    "objectives.player_damage_mitigated",
+    "objectives.player_spirit_damage",
+    "objectives.team",
+    "objectives.team_objective",
+    "objectives_mask_team0",
+    "objectives_mask_team1",
+    "party",
+    "player_level",
+    "player_match_outcome",
+    "player_rank_consumed_demotion_protection",
+    "player_rank_desired_progress_change",
+    "player_rank_final_flat_progress",
+    "player_rank_initial_calibration_games",
+    "player_rank_initial_demotion_protection_games",
+    "player_rank_initial_display_rank",
+    "player_rank_initial_flat_progress",
+    "player_rank_initial_win_streak",
+    "player_slot",
+    "player_tracked_stats",
+    "power_up_buffs.is_permanent",
+    "power_up_buffs.pickup_stat_values",
+    "power_up_buffs.pickup_times_s",
+    "power_up_buffs.type",
+    "power_up_buffs.value",
+    "pregame_hero_id",
+    "rank_interval",
+    "ranked_type",
+    "rewards_eligible",
+    "start_time",
+    "stats.ability_kills",
+    "stats.ability_points",
+    "stats.absorption_provided",
+    "stats.assists",
+    "stats.boss_damage",
+    "stats.bullet_kills",
+    "stats.creep_damage",
+    "stats.creep_kills",
+    "stats.damage_absorbed",
+    "stats.damage_mitigated",
+    "stats.deaths",
+    "stats.denies",
+    "stats.gold_boss",
+    "stats.gold_boss_orb",
+    "stats.gold_death_loss",
+    "stats.gold_denied",
+    "stats.gold_lane_creep",
+    "stats.gold_lane_creep_orbs",
+    "stats.gold_neutral_creep",
+    "stats.gold_neutral_creep_orbs",
+    "stats.gold_player",
+    "stats.gold_player_orbs",
+    "stats.gold_source_ability_assassinate_gold",
+    "stats.gold_source_assists_gold",
+    "stats.gold_source_breakable_gold",
+    "stats.gold_source_item_cultist_sacrifice_gold",
+    "stats.gold_source_item_goose_egg_gold",
+    "stats.gold_source_item_trophy_collector_gold",
+    "stats.gold_source_team_bonus_gold",
+    "stats.gold_treasure",
+    "stats.headshot_kills",
+    "stats.heal_lost",
+    "stats.heal_prevented",
+    "stats.hero_bullets_hit",
+    "stats.hero_bullets_hit_crit",
+    "stats.kills",
+    "stats.level",
+    "stats.max_health",
+    "stats.melee_kills",
+    "stats.net_worth",
+    "stats.neutral_damage",
+    "stats.neutral_kills",
+    "stats.player_barriering",
+    "stats.player_damage",
+    "stats.player_damage_taken",
+    "stats.player_healing",
+    "stats.possible_creeps",
+    "stats.self_damage",
+    "stats.self_healing",
+    "stats.shots_hit",
+    "stats.shots_missed",
+    "stats.teammate_barriering",
+    "stats.teammate_healing",
+    "stats.tech_power",
+    "stats.time_stamp_s",
+    "stats.weapon_power",
+    "stats_type_stat",
+    "street_brawl_rounds.round_duration_s",
+    "street_brawl_rounds.winning_team",
+    "team",
+    "team0_tracked_stats",
+    "team1_tracked_stats",
+    "team_score",
+    "winning_team",
+    "won"
+   ],
+   "match_salts": [
+    "cluster_id",
+    "created_at",
+    "match_id",
+    "metadata_salt",
+    "replay_salt"
+   ],
+   "misc_entities": [
+    "class_name",
+    "id",
+    "name"
+   ],
+   "models": [
+    "path",
+    "url"
+   ],
+   "modifiers": [
+    "base",
+    "class",
+    "class_name",
+    "folder",
+    "id"
+   ],
+   "npc_units": [
+    "class_name",
+    "gold_reward",
+    "id",
+    "max_health",
+    "name",
+    "neutral_type"
+   ],
+   "player_cluster_matches": [
+    "account_id",
+    "cluster_id",
+    "matches",
+    "month"
+   ],
+   "ranked_seasons": [
+    "calibration_matches",
+    "calibration_max_rank",
+    "class_name",
+    "intervals",
+    "min_hero_unlocks",
+    "min_hero_wins",
+    "min_wins",
+    "name",
+    "ranked_type",
+    "valid_party_sizes"
+   ],
+   "ranks": [
+    "color",
+    "name",
+    "tier"
+   ],
+   "server_clusters": [
+    "cluster_id",
+    "datacenter",
+    "first_match_id",
+    "last_match_id",
+    "matches",
+    "region"
+   ],
+   "sounds": [
+    "path",
+    "url"
+   ],
+   "steam_info": [
+    "app_id",
+    "client_version",
+    "product_name",
+    "server_app_id",
+    "server_version",
+    "source_revision",
+    "version_datetime"
+   ],
+   "steam_profile_observed_names": [
+    "account_id",
+    "match_id",
+    "observed_at",
+    "observed_name"
+   ],
+   "steam_profiles": [
+    "account_id",
+    "avatar",
+    "avatarfull",
+    "avatarmedium",
+    "countrycode",
+    "friends.account_id",
+    "friends.friend_since",
+    "last_updated",
+    "personaname",
+    "personastate",
+    "profileurl",
+    "realname"
+   ]
+  },
+  "match_player_rank_columns": {
+   "average_badge": "UINTEGER",
+   "average_badge_team0": "UINTEGER",
+   "player_match_outcome": "VARCHAR",
+   "player_rank_desired_progress_change": "INTEGER",
+   "player_rank_final_flat_progress": "UINTEGER",
+   "player_rank_initial_display_rank": "UINTEGER",
+   "player_rank_initial_flat_progress": "UINTEGER",
+   "rank_interval": "UINTEGER",
+   "ranked_type": "VARCHAR"
+  },
+  "ranked_rows_3_days": {
+   "accounts": 222312,
+   "eternus_rows": 3784,
+   "highest_progress": 97615,
+   "matches": 84835,
+   "newest_interval": 2,
+   "placed": 966986,
+   "ranked_rows": 1063412,
+   "with_average_badge": 1063388,
+   "with_final_progress": 1045408,
+   "with_interval": 1063412,
+   "with_team_badge": 1063412
+  },
+  "seconds": 6.4,
+  "server_clusters": [
+   {
+    "clusters": 4,
+    "matches": 298761,
+    "region": "us_south_central"
+   },
+   {
+    "clusters": 3,
+    "matches": 274595,
+    "region": "us_north_central"
+   },
+   {
+    "clusters": 2,
+    "matches": 264297,
+    "region": "us_southeast"
+   },
+   {
+    "clusters": 4,
+    "matches": 230883,
+    "region": "us_east"
+   },
+   {
+    "clusters": 1,
+    "matches": 172340,
+    "region": "dpkt-stockholm"
+   },
+   {
+    "clusters": 1,
+    "matches": 171619,
+    "region": "us_southwest"
+   },
+   {
+    "clusters": 7,
+    "matches": 163284,
+    "region": "eu_north"
+   },
+   {
+    "clusters": 3,
+    "matches": 160579,
+    "region": "hong_kong"
+   },
+   {
+    "clusters": 1,
+    "matches": 139770,
+    "region": "dpkt-frankfurt"
+   },
+   {
+    "clusters": 2,
+    "matches": 135564,
+    "region": "us_west"
+   },
+   {
+    "clusters": 4,
+    "matches": 131966,
+    "region": "asia"
+   },
+   {
+    "clusters": 10,
+    "matches": 112265,
+    "region": "eu_west"
+   },
+   {
+    "clusters": 2,
+    "matches": 96380,
+    "region": "south_america"
+   },
+   {
+    "clusters": 1,
+    "matches": 93726,
+    "region": "london"
+   },
+   {
+    "clusters": 3,
+    "matches": 87403,
+    "region": "australia"
+   },
+   {
+    "clusters": 1,
+    "matches": 86762,
+    "region": "helsinki"
+   },
+   {
+    "clusters": 1,
+    "matches": 82038,
+    "region": "dpkt-london"
+   },
+   {
+    "clusters": 4,
+    "matches": 81194,
+    "region": "poland"
+   },
+   {
+    "clusters": 1,
+    "matches": 75562,
+    "region": "dpkt-vienna"
+   },
+   {
+    "clusters": 1,
+    "matches": 58277,
+    "region": "eu_east"
+   },
+   {
+    "clusters": 1,
+    "matches": 52956,
+    "region": "argentina"
+   },
+   {
+    "clusters": 1,
+    "matches": 46551,
+    "region": "falkenstein"
+   },
+   {
+    "clusters": 2,
+    "matches": 41942,
+    "region": "japan"
+   },
+   {
+    "clusters": 2,
+    "matches": 39111,
+    "region": "spain"
+   },
+   {
+    "clusters": 1,
+    "matches": 30214,
+    "region": "dubai"
+   },
+   {
+    "clusters": 1,
+    "matches": 23879,
+    "region": "chile"
+   },
+   {
+    "clusters": 1,
+    "matches": 18448,
+    "region": "peru"
+   },
+   {
+    "clusters": 1,
+    "matches": 10486,
+    "region": "seoul"
+   },
+   {
+    "clusters": 1,
+    "matches": 7559,
+    "region": "south_africa"
+   },
+   {
+    "clusters": 1,
+    "matches": 4617,
+    "region": "dpkt-fujairah"
+   }
+  ],
+  "tables": {
+   "accolades": 7,
+   "build_tags": 4,
+   "client_versions": 1,
+   "colors": 5,
+   "convars": 5,
+   "fonts": 2,
+   "hero_leaderboard": 7,
+   "heroes": 15,
+   "icons": 2,
+   "images": 2,
+   "items": 17,
+   "leaderboard": 6,
+   "match_player": 164,
+   "match_player_latest": 164,
+   "match_salts": 5,
+   "misc_entities": 3,
+   "models": 2,
+   "modifiers": 5,
+   "npc_units": 6,
+   "player_cluster_matches": 4,
+   "ranked_seasons": 10,
+   "ranks": 3,
+   "server_clusters": 6,
+   "sounds": 2,
+   "steam_info": 7,
+   "steam_profile_observed_names": 4,
+   "steam_profiles": 12
+  }
+ },
+ "native": {
+  "Europe": {
+   "first_badge_lowest": "Eternus 5",
+   "first_badge_median": "Eternus 6",
+   "heroes": 25,
+   "min_10_matches": {
+    "heroes_with_1": 25,
+    "heroes_with_10": 25,
+    "heroes_with_20": 25,
+    "players_median": 46
+   },
+   "min_3_matches": {
+    "heroes_with_1": 25,
+    "heroes_with_10": 25,
+    "heroes_with_20": 25,
+    "players_median": 87
+   },
+   "min_5_matches": {
+    "heroes_with_1": 25,
+    "heroes_with_10": 25,
+    "heroes_with_20": 25,
+    "players_median": 73
+   },
+   "twentieth_badge_median": "Eternus 1"
+  },
+  "NAmerica": {
+   "first_badge_lowest": "Eternus 2",
+   "first_badge_median": "Eternus 6",
+   "heroes": 25,
+   "min_10_matches": {
+    "heroes_with_1": 25,
+    "heroes_with_10": 25,
+    "heroes_with_20": 25,
+    "players_median": 38
+   },
+   "min_3_matches": {
+    "heroes_with_1": 25,
+    "heroes_with_10": 25,
+    "heroes_with_20": 25,
+    "players_median": 77
+   },
+   "min_5_matches": {
+    "heroes_with_1": 25,
+    "heroes_with_10": 25,
+    "heroes_with_20": 25,
+    "players_median": 60
+   },
+   "twentieth_badge_median": "Ascendant 6"
+  },
+  "board_regions": {
+   "(unknown)": 165,
+   "Asia": 118,
+   "Europe": 943,
+   "NAmerica": 939,
+   "Oceania": 89
+  },
+  "call_seconds_max": 12.49,
+  "call_seconds_median": 4.72,
+  "distinct_players": 2254,
+  "errors": {},
+  "heroes_answered": 25,
+  "heroes_asked": 44,
+  "heroes_skipped_for_time": 19,
+  "limit": 200,
+  "min_matches": 3,
+  "players_per_hero_median": 200,
+  "region_route_vs_board": {
+   "different": 5,
+   "same": 814
+  },
+  "region_source": {
+   "board": 55,
+   "route": 2034,
+   "unknown": 165
+  },
+  "regions": {
+   "answered": 2250,
+   "asked": 2254,
+   "calls": 4,
+   "failed": 0,
+   "known": 2250
+  },
+  "seconds": 167.9,
+  "server_regions": {
+   "argentina": 30,
+   "asia": 3,
+   "australia": 89,
+   "dpkt-frankfurt": 417,
+   "dpkt-london": 5,
+   "dpkt-stockholm": 82,
+   "dubai": 1,
+   "eu_east": 1,
+   "eu_north": 266,
+   "eu_west": 200,
+   "helsinki": 8,
+   "hong_kong": 115,
+   "london": 51,
+   "peru": 3,
+   "poland": 4,
+   "south_america": 40,
+   "us_east": 17,
+   "us_north_central": 253,
+   "us_south_central": 312,
+   "us_southeast": 325,
+   "us_southwest": 22,
+   "us_west": 6
+  },
+  "server_regions_unmapped": [
+   "argentina",
+   "dpkt-london",
+   "dpkt-stockholm",
+   "dubai",
+   "london",
+   "peru",
+   "poland",
+   "south_america"
+  ],
+  "since": 1793908800,
+  "unranked_control_rows": 0
+ },
+ "ranks": {
+  "Europe": {
+   "answered": 214,
+   "asked": 214,
+   "asked_among_top_50": 23,
+   "board": 1001,
+   "current": 204,
+   "current_among_top_50": 23,
+   "current_interval": 2,
+   "failed": 0,
+   "ids_from": "unambiguous names",
+   "median_badge": "Ascendant 4",
+   "no_rank": 2,
+   "ranked_in_an_older_interval": 8,
+   "spearman_board_vs_progress": 0.516,
+   "tiers": {
+    "Ascendant": 136,
+    "Eternus": 49,
+    "Phantom": 19
+   }
+  },
+  "NAmerica": {
+   "answered": 192,
+   "asked": 192,
+   "asked_among_top_50": 22,
+   "board": 1001,
+   "current": 186,
+   "current_among_top_50": 21,
+   "current_interval": 2,
+   "failed": 0,
+   "ids_from": "unambiguous names",
+   "median_badge": "Ascendant 4",
+   "no_rank": 0,
+   "ranked_in_an_older_interval": 6,
+   "spearman_board_vs_progress": 0.591,
+   "tiers": {
+    "Ascendant": 121,
+    "Eternus": 47,
+    "Phantom": 18
+   }
+  },
+  "seconds": 5.8
+ },
+ "reason": "end of ceiling_rank",
+ "seconds": 198,
+ "version": 1
+}
